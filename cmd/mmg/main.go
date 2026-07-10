@@ -267,10 +267,28 @@ func main() {
 		if bs.TurnPnL < 0 {
 			turnPnlColor = red
 		}
-		fmt.Printf("  Net fill cash: %s | Storage: %s | %sTurn P&L: %s%s\n\n",
+		fmt.Printf("  Net fill cash: %s | Storage: %s | %sTurn P&L: %s%s\n",
 			formatMoney(bs.NetFillCash),
 			formatMoney(bs.StorageCost),
 			turnPnlColor, formatMoney(bs.TurnPnL), reset,
+		)
+
+		// Educational P&L attribution for market makers
+		// Realized ≈ what you captured from spreads minus storage drag
+		// MTM ≈ how the market move affected the value of your ending inventory
+		realized := bs.NetFillCash - bs.StorageCost
+		mtmImpact := bs.TurnPnL - realized
+		realColor := green
+		if realized < 0 {
+			realColor = red
+		}
+		mtmColor := green
+		if mtmImpact < 0 {
+			mtmColor = red
+		}
+		fmt.Printf("  Attribution: %sRealized %s%s | %sMTM from price move %s%s\n\n",
+			realColor, formatMoney(realized), reset,
+			mtmColor, formatMoney(mtmImpact), reset,
 		)
 	}
 
