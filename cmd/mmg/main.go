@@ -258,7 +258,21 @@ func main() {
 			}
 			// Net inventory impact from this turn's flow (positive = you got longer)
 			netInvFromFlow := bs.SellVolume - bs.BuyVolume
-			fmt.Printf("  Net inventory from flow this turn: %+.2f units\n", netInvFromFlow)
+			totalFlow := bs.BuyVolume + bs.SellVolume
+			sellPct := 0.0
+			if totalFlow > 0 {
+				sellPct = (bs.SellVolume / totalFlow) * 100
+			}
+			fmt.Printf("  Net inventory from flow this turn: %+.2f units  |  Sell-side flow: %.0f%%\n", netInvFromFlow, sellPct)
+
+			// Quick market condition signal for the MM
+			if sellPct > 70 {
+				fmt.Printf("  %sMarket tone:%s Heavy selling pressure (sellers hitting your bid). Watch for short build.\n", yellow, reset)
+			} else if sellPct < 30 {
+				fmt.Printf("  %sMarket tone:%s Heavy buying pressure (buyers hitting your ask). Watch for long build.\n", yellow, reset)
+			} else {
+				fmt.Printf("  %sMarket tone:%s Two-way flow.\n", cyan, reset)
+			}
 		} else {
 			fmt.Println("  Flow: No orders hit your quotes this turn.")
 		}
