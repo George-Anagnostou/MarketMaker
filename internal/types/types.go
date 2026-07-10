@@ -81,4 +81,9 @@ type TurnSummary struct {
 
 	StorageCost float64 `json:"storage_cost"`
 	TurnPnL     float64 `json:"turn_pnl"` // change in equity this turn
+
+	// BuyVolume: market buy orders that hit your ask (you sold to aggressive buyers)
+	BuyVolume float64 `json:"buy_volume"`
+	// SellVolume: market sell orders that hit your bid (you bought from aggressive sellers)
+	SellVolume float64 `json:"sell_volume"`
 }

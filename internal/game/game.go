@@ -106,29 +106,32 @@ func (g *Game) SubmitTurn(bid, ask float64) (types.TurnResult, error) {
 	// 2. Execute fills against player's quotes
 	var unitsTraded float64
 	var realizedCash float64 // net cash from fills (positive = received from sells)
+	var buyVol, sellVol float64
 
 	for _, ord := range flow {
 		if ord.IsBuy {
-			// Market buy hits ask: player sells
+			// Market buy hits ask: player sells to aggressive buyers
 			notional := ask * ord.Qty
 			g.state.Cash += notional
 			g.state.Inventory -= ord.Qty
 			unitsTraded += ord.Qty
 			realizedCash += notional
+			buyVol += ord.Qty
 			events = append(events, types.Event{
 				Type:    "fill",
-				Message: fmt.Sprintf("Sold %.2f units at $%.2f (market buy hit ask)", ord.Qty, ask),
+				Message: fmt.Sprintf("MARKET BUY %.2f @ your ASK $%.2f → you SOLD (aggressive buyers hit you)", ord.Qty, ask),
 			})
 		} else {
-			// Market sell hits bid: player buys
+			// Market sell hits bid: player buys from aggressive sellers
 			notional := bid * ord.Qty
 			g.state.Cash -= notional
 			g.state.Inventory += ord.Qty
 			unitsTraded += ord.Qty
 			realizedCash -= notional
+			sellVol += ord.Qty
 			events = append(events, types.Event{
 				Type:    "fill",
-				Message: fmt.Sprintf("Bought %.2f units at $%.2f (market sell hit bid)", ord.Qty, bid),
+				Message: fmt.Sprintf("MARKET SELL %.2f @ your BID $%.2f → you BOUGHT (aggressive sellers hit you)", ord.Qty, bid),
 			})
 		}
 	}
@@ -207,6 +210,8 @@ func (g *Game) SubmitTurn(bid, ask float64) (types.TurnResult, error) {
 		NetFillCash:    realizedCash,
 		StorageCost:    storage,
 		TurnPnL:        turnPnL,
+		BuyVolume:      buyVol,
+		SellVolume:     sellVol,
 	}
 
 	result := types.TurnResult{
