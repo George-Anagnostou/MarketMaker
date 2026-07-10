@@ -1,0 +1,5 @@
+*.log
+market-maker
+tmp/
+*.test
+.DS_Store
