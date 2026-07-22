@@ -96,13 +96,25 @@ func (l *ledger) entriesCopy() []LedgerEntry {
 
 func (l *ledger) balance(account LedgerAccount) Posting { return l.balances[account] }
 
+func (l *ledger) clone() ledger {
+	clone := newLedger()
+	clone.nextID = l.nextID
+	clone.entries = l.entriesCopy()
+	for account, balance := range l.balances {
+		clone.balances[account] = balance
+	}
+	return clone
+}
+
 func cashAvailable(id string) LedgerAccount       { return LedgerAccount("cash/available/" + id) }
 func cashReserved(id string) LedgerAccount        { return LedgerAccount("cash/reserved/" + id) }
 func instrumentAvailable(id string) LedgerAccount { return LedgerAccount("instrument/available/" + id) }
 func instrumentReserved(id string) LedgerAccount  { return LedgerAccount("instrument/reserved/" + id) }
+func openingCashAccount(id string) LedgerAccount  { return LedgerAccount("cash/external/opening/" + id) }
+func openingInstrumentAccount(id string) LedgerAccount {
+	return LedgerAccount("instrument/external/opening/" + id)
+}
 
 const (
-	openingCashAccount       LedgerAccount = "cash/external/opening"
-	openingInstrumentAccount LedgerAccount = "instrument/external/opening"
-	storageAccount           LedgerAccount = "cash/venue/storage"
+	storageAccount LedgerAccount = "cash/venue/storage"
 )

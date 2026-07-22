@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 
 	"market-maker/internal/fixed"
 	"market-maker/internal/orderbook"
@@ -88,6 +89,9 @@ func (c Config) Validate() error {
 	}
 	if _, err := fixed.Notional(c.StartingMark, c.MaxPosition); err != nil {
 		return errors.New("position and mark exceed supported range")
+	}
+	if _, err := fixed.Notional(c.StoragePerUnit, c.MaxPosition); err != nil {
+		return errors.New("storage and position exceed supported range")
 	}
 	if c.Seed == 0 {
 		return errors.New("resolved seed must be non-zero")
@@ -177,9 +181,10 @@ type State struct {
 }
 
 type Result struct {
-	State   State   `json:"state"`
-	Summary Summary `json:"summary"`
-	Events  []Event `json:"events"`
+	State   State         `json:"state"`
+	Summary Summary       `json:"summary"`
+	Events  []Event       `json:"events"`
+	Ledger  []LedgerEntry `json:"ledger,omitempty"`
 }
 
 // Command is persisted verbatim before its result is acknowledged. IDs are
@@ -215,6 +220,7 @@ const (
 type Engine struct {
 	cfg       Config
 	rng       *rand.Rand
+	pcg       *rand.PCG
 	accounts  map[string]*Account
 	book      *orderbook.Book
 	ledger    ledger
@@ -232,7 +238,8 @@ func New(cfg Config) (*Engine, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	e := &Engine{cfg: cfg, rng: rand.New(rand.NewPCG(cfg.Seed, cfg.Seed>>1)), accounts: map[string]*Account{}, book: orderbook.New(), ledger: newLedger(), mark: cfg.StartingMark}
+	pcg := rand.NewPCG(cfg.Seed, cfg.Seed>>1)
+	e := &Engine{cfg: cfg, rng: rand.New(pcg), pcg: pcg, accounts: map[string]*Account{}, book: orderbook.New(), ledger: newLedger(), mark: cfg.StartingMark}
 	e.accounts[PlayerAccount] = &Account{ID: PlayerAccount, Cash: cfg.StartingCash, Position: cfg.StartingPosition}
 	e.accounts[FlowAccount] = &Account{ID: FlowAccount, External: true}
 	if err := e.postOpening(PlayerAccount, cfg.StartingCash, cfg.StartingPosition); err != nil {
@@ -245,6 +252,42 @@ func New(cfg Config) (*Engine, error) {
 }
 
 func (e *Engine) Config() Config { return e.cfg }
+
+// transact applies a command to an isolated copy, committing only after every
+// book, settlement, reservation, and journal operation has succeeded.
+func (e *Engine) transact(apply func(*Engine) (Result, error)) (Result, error) {
+	ledgerStart := len(e.ledger.entries)
+	candidate := e.clone()
+	result, err := apply(candidate)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	journal := candidate.ledger.entriesCopy()
+	result.Ledger = journal[ledgerStart:]
+	*e = *candidate
+	return result, nil
+}
+
+func (e *Engine) clone() *Engine {
+	clone := *e
+	rngState, err := e.pcg.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	clone.pcg = &rand.PCG{}
+	if err := clone.pcg.UnmarshalBinary(rngState); err != nil {
+		panic(err)
+	}
+	clone.rng = rand.New(clone.pcg)
+	clone.accounts = make(map[string]*Account, len(e.accounts))
+	for id, account := range e.accounts {
+		copy := *account
+		clone.accounts[id] = &copy
+	}
+	clone.book = e.book.Clone()
+	clone.ledger = e.ledger.clone()
+	return &clone
+}
 
 func (e *Engine) State() State {
 	a := e.accounts[PlayerAccount]
@@ -302,6 +345,10 @@ func (e *Engine) AddAccount(id string, cash fixed.Money, position fixed.Qty) err
 // caller that authorizes this command belongs outside the venue; the venue
 // only enforces its financial invariants.
 func (e *Engine) OpenAccount(id string, cash fixed.Money, position fixed.Qty) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) { return candidate.openAccount(id, cash, position) })
+}
+
+func (e *Engine) openAccount(id string, cash fixed.Money, position fixed.Qty) (Result, error) {
 	if err := e.AddAccount(id, cash, position); err != nil {
 		return Result{State: e.State()}, err
 	}
@@ -315,7 +362,7 @@ func (e *Engine) Execute(command Command) (Result, error) {
 	case CommandSubmitQuote:
 		return e.SubmitQuote(command.Bid, command.Ask)
 	case CommandQuit:
-		return e.Quit(), nil
+		return e.Quit()
 	case CommandOpenAccount:
 		return e.OpenAccount(command.AccountID, command.InitialCash, command.InitialPosition)
 	case CommandPlaceOrder:
@@ -332,6 +379,10 @@ func (e *Engine) Execute(command Command) (Result, error) {
 // PlaceLimit submits an order to the price-time-priority book. It is exposed
 // now so bot accounts can use the same matching kernel as simulated flow.
 func (e *Engine) PlaceLimit(accountID string, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) { return candidate.placeLimit(accountID, side, price, qty, tif) })
+}
+
+func (e *Engine) placeLimit(accountID string, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) (Result, error) {
 	if e.isOver {
 		return Result{State: e.State()}, errors.New("game is over")
 	}
@@ -362,6 +413,10 @@ func (e *Engine) PlaceLimit(accountID string, side Side, price fixed.Price, qty 
 }
 
 func (e *Engine) Cancel(accountID string, orderID uint64) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) { return candidate.cancel(accountID, orderID) })
+}
+
+func (e *Engine) cancel(accountID string, orderID uint64) (Result, error) {
 	if e.isOver {
 		return Result{State: e.State()}, errors.New("game is over")
 	}
@@ -383,6 +438,12 @@ func (e *Engine) Cancel(accountID string, orderID uint64) (Result, error) {
 // plus a new order for an intentional side change. A replacement always gets
 // a new sequence and loses its prior queue position.
 func (e *Engine) ReplaceLimit(accountID string, oldOrderID uint64, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		return candidate.replaceLimit(accountID, oldOrderID, side, price, qty, tif)
+	})
+}
+
+func (e *Engine) replaceLimit(accountID string, oldOrderID uint64, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) (Result, error) {
 	if e.isOver {
 		return Result{State: e.State()}, errors.New("game is over")
 	}
@@ -426,6 +487,10 @@ func (e *Engine) ReplaceLimit(accountID string, oldOrderID uint64, side Side, pr
 }
 
 func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) { return candidate.submitQuote(bid, ask) })
+}
+
+func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
 	if e.isOver {
 		return Result{State: e.State()}, errors.New("game is over")
 	}
@@ -452,21 +517,25 @@ func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
 	if err := e.reconcileReservations(); err != nil {
 		return Result{State: e.State()}, err
 	}
-	summary := e.advance(&events)
+	summary, err := e.advance(&events)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
 	after, _ := e.equity(e.accounts[PlayerAccount])
 	summary.TurnPnL = after - before
 	e.version++
 	return Result{State: e.State(), Summary: summary, Events: events}, nil
 }
 
-func (e *Engine) Quit() Result {
-	if !e.isOver {
-		e.isOver = true
-		e.reason = PlayerQuit
-		e.version++
+func (e *Engine) Quit() (Result, error) {
+	if e.isOver {
+		return Result{State: e.State()}, errors.New("game is over")
 	}
+	e.isOver = true
+	e.reason = PlayerQuit
+	e.version++
 	events := []Event{e.emit(Event{Type: "game_ended", Reason: e.reason})}
-	return Result{State: e.State(), Events: events}
+	return Result{State: e.State(), Events: events}, nil
 }
 
 func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
@@ -646,7 +715,13 @@ func (e *Engine) reconcileReservations() error {
 		desired[order.OwnerID] = current
 	}
 	postings := make([]Posting, 0)
-	for id, account := range e.accounts {
+	accountIDs := make([]string, 0, len(e.accounts))
+	for id := range e.accounts {
+		accountIDs = append(accountIDs, id)
+	}
+	sort.Strings(accountIDs)
+	for _, id := range accountIDs {
+		account := e.accounts[id]
 		if account.External {
 			continue
 		}
@@ -705,7 +780,7 @@ func (e *Engine) accountWithinLimits(accountID string, maintenance bool) bool {
 	return err == nil && eq >= required
 }
 
-func (e *Engine) advance(events *[]Event) Summary {
+func (e *Engine) advance(events *[]Event) (Summary, error) {
 	s := Summary{}
 	if e.cfg.MaxOrdersPerTurn > 0 {
 		n := 1 + e.rng.IntN(e.cfg.MaxOrdersPerTurn)
@@ -716,12 +791,15 @@ func (e *Engine) advance(events *[]Event) Summary {
 				side = Sell
 			}
 			qty := fixed.Qty(1 + e.rng.Int64N(int64(e.cfg.MaxOrderQty)))
-			price := e.flowLimit(side)
+			price, err := e.flowLimit(side)
+			if err != nil {
+				return Summary{}, err
+			}
 			order := e.newOrder(FlowAccount, side, price, qty, IOC)
 			*events = append(*events, e.emit(Event{Type: "flow_order", Order: copyOrder(order)}))
 			trades, lifecycle, err := e.submitBookOrder(order)
 			if err != nil {
-				panic(err)
+				return Summary{}, err
 			}
 			for _, trade := range trades {
 				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
@@ -739,18 +817,24 @@ func (e *Engine) advance(events *[]Event) Summary {
 			}
 			*events = append(*events, e.emitLifecycle(lifecycle)...)
 			if err := e.reconcileReservations(); err != nil {
-				panic(err)
+				return Summary{}, err
 			}
 		}
 	}
 	player := e.accounts[PlayerAccount]
-	storage, _ := fixed.Notional(e.cfg.StoragePerUnit, fixed.AbsQty(player.Position))
+	storage, err := fixed.Notional(e.cfg.StoragePerUnit, fixed.AbsQty(player.Position))
+	if err != nil {
+		return Summary{}, err
+	}
 	if storage > 0 {
 		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(PlayerAccount), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
-			panic(err)
+			return Summary{}, err
 		}
 	}
-	player.Cash -= storage
+	player.Cash, err = fixed.AddMoney(player.Cash, -storage)
+	if err != nil {
+		return Summary{}, err
+	}
 	s.StorageCost = storage
 	if storage > 0 {
 		*events = append(*events, e.emit(Event{Type: "storage_charged", Amount: storage}))
@@ -761,7 +845,11 @@ func (e *Engine) advance(events *[]Event) Summary {
 	if e.cfg.MaxMoveBps > e.cfg.MinMoveBps {
 		move += e.rng.Int64N(e.cfg.MaxMoveBps - e.cfg.MinMoveBps + 1)
 	}
-	e.mark = fixed.Price(int64(e.mark) * (10_000 + move) / 10_000)
+	nextMark, err := fixed.ScalePrice(e.mark, 10_000+move, 10_000)
+	if err != nil || !nextMark.Positive() {
+		return Summary{}, errors.New("mark movement produced invalid price")
+	}
+	e.mark = nextMark
 	*events = append(*events, e.emit(Event{Type: "mark_updated", Mark: e.mark, Message: fmt.Sprintf("previous=%s", previous)}))
 	if !e.accountWithinLimits(PlayerAccount, true) {
 		e.isOver = true
@@ -777,10 +865,10 @@ func (e *Engine) advance(events *[]Event) Summary {
 		e.reason = TurnsComplete
 		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
 	}
-	return s
+	return s, nil
 }
 
-func (e *Engine) flowLimit(side Side) fixed.Price {
+func (e *Engine) flowLimit(side Side) (fixed.Price, error) {
 	slip := int64(0)
 	if e.cfg.MaxFlowSlippageBps > 0 {
 		slip = e.rng.Int64N(e.cfg.MaxFlowSlippageBps + 1)
@@ -789,11 +877,14 @@ func (e *Engine) flowLimit(side Side) fixed.Price {
 	if side == Sell {
 		factor = 10_000 - slip
 	}
-	p := fixed.Price(int64(e.mark) * factor / 10_000)
-	if p < 1 {
-		return 1
+	p, err := fixed.ScalePrice(e.mark, factor, 10_000)
+	if err != nil {
+		return 0, err
 	}
-	return p
+	if p < 1 {
+		return 1, nil
+	}
+	return p, nil
 }
 
 func (e *Engine) newOrder(accountID string, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) *Order {
@@ -896,7 +987,7 @@ func toBookOrder(order Order) orderbook.Order {
 }
 
 func (e *Engine) postOpening(id string, cash fixed.Money, position fixed.Qty) error {
-	postings := []Posting{{Account: cashAvailable(id), Money: cash}, {Account: openingCashAccount, Money: -cash}, {Account: instrumentAvailable(id), Instrument: position}, {Account: openingInstrumentAccount, Instrument: -position}}
+	postings := []Posting{{Account: cashAvailable(id), Money: cash}, {Account: openingCashAccount(id), Money: -cash}, {Account: instrumentAvailable(id), Instrument: position}, {Account: openingInstrumentAccount(id), Instrument: -position}}
 	return e.ledger.append(LedgerEntry{Type: "account_opened", Postings: postings})
 }
 func fromBookOrder(order orderbook.Order) Order {

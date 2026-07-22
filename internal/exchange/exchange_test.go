@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"market-maker/internal/fixed"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -346,7 +347,7 @@ func TestDeterministicResults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r1.State != r2.State || r1.Summary != r2.Summary || !reflect.DeepEqual(r1.Events, r2.Events) {
+		if r1.State != r2.State || r1.Summary != r2.Summary || !reflect.DeepEqual(r1.Events, r2.Events) || !reflect.DeepEqual(r1.Ledger, r2.Ledger) {
 			t.Fatal("same scenario diverged")
 		}
 	}
@@ -387,5 +388,105 @@ func TestPriceTimePriorityAndSelfTradePrevention(t *testing.T) {
 	}
 	if e.State().Version != before.Version {
 		t.Fatal("rejected self trade changed state")
+	}
+}
+
+func TestRejectedSelfTradeDoesNotConsumeCountersOrEvents(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "101"), mustQty(t, "1"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err == nil {
+		t.Fatal("expected self-trade rejection")
+	}
+	canceled, err := e.Cancel(PlayerAccount, placed.Events[0].Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.Events[0].Sequence != 3 {
+		t.Fatalf("failed command consumed event sequence: %d", canceled.Events[0].Sequence)
+	}
+	if canceled.State.Version != 2 {
+		t.Fatalf("failed command consumed version: %d", canceled.State.Version)
+	}
+}
+
+func TestSettlementOverflowLeavesLiveVenueUntouched(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingCash = mustMoney(t, "10")
+	cfg.StartingMark = mustPrice(t, "1")
+	cfg.MaxPosition = mustQty(t, "1")
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps, cfg.MaxOrdersPerTurn = 0, 0, 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAccount("seller", fixed.Money(math.MaxInt64), 0); err != nil {
+		t.Fatal(err)
+	}
+	sell, err := e.PlaceLimit("seller", Sell, mustPrice(t, "1"), mustQty(t, "1"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeState, beforeLedger := e.State(), len(e.LedgerEntries())
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "1"), mustQty(t, "1"), IOC); err == nil {
+		t.Fatal("expected settlement overflow")
+	}
+	if e.State() != beforeState || len(e.LedgerEntries()) != beforeLedger {
+		t.Fatal("overflowing settlement changed live venue")
+	}
+	if _, ok := e.book.Order(sell.Events[0].Order.ID); !ok {
+		t.Fatal("overflowing settlement consumed maker order")
+	}
+}
+
+func TestQuitRejectsSecondDistinctCommand(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(Command{ID: "first", Type: CommandQuit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(Command{ID: "second", Type: CommandQuit}); err == nil {
+		t.Fatal("expected second quit rejection")
+	}
+	if e.State().Version != 1 {
+		t.Fatalf("second quit changed version=%d", e.State().Version)
+	}
+}
+
+func TestInvalidMarkMovementRollsBackTurn(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	cfg.StartingMark = mustPrice(t, "0.0001")
+	cfg.MinMoveBps, cfg.MaxMoveBps = -9999, -9999
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := e.State()
+	if _, err := e.SubmitQuote(mustPrice(t, "0.0001"), mustPrice(t, "0.0002")); err == nil {
+		t.Fatal("expected invalid mark rejection")
+	}
+	if e.State() != before || len(e.OpenOrders(PlayerAccount)) != 0 {
+		t.Fatal("invalid mark movement changed venue")
+	}
+}
+
+func TestConfigRejectsUnrepresentableStorage(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxPosition = mustQty(t, "1")
+	cfg.StoragePerUnit = fixed.Price(math.MaxInt64)
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected storage overflow rejection")
 	}
 }

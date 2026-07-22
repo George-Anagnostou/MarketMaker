@@ -339,7 +339,7 @@ func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.En
 		for i := range result.Events {
 			result.Events[i].CommandID = record.Command.ID
 		}
-		if result.State != record.Result.State || result.Summary != record.Result.Summary || !reflect.DeepEqual(result.Events, record.Result.Events) {
+		if result.State != record.Result.State || result.Summary != record.Result.Summary || !reflect.DeepEqual(result.Events, record.Result.Events) || !reflect.DeepEqual(result.Ledger, record.Result.Ledger) {
 			return nil, nil, fmt.Errorf("replay result mismatch at version %d", record.Version)
 		}
 		commands[record.Command.ID] = record

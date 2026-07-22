@@ -100,12 +100,25 @@ func (b *Book) Len() int             { return len(b.orders) }
 func (b *Book) Bids() []Level        { return b.bids.snapshot(true) }
 func (b *Book) Asks() []Level        { return b.asks.snapshot(false) }
 
+// Clone returns an independent copy that preserves every live order's queue
+// position. Venue commands use it to validate mutations before committing.
+func (b *Book) Clone() *Book {
+	clone := New()
+	for _, order := range b.Orders("") {
+		clone.rest(order)
+	}
+	return clone
+}
+
 func (b *Book) Submit(order Order, policy SelfTradePolicy) (Report, error) {
 	if err := validate(order); err != nil {
 		return Report{}, err
 	}
 	if b.orders[order.ID] != nil {
 		return Report{}, errors.New("duplicate order id")
+	}
+	if order.Sequence <= b.maxSequence() {
+		return Report{}, errors.New("order sequence must increase monotonically")
 	}
 	if policy != RejectTaker {
 		return Report{}, errors.New("unsupported self-trade policy")
@@ -166,6 +179,12 @@ func (b *Book) Cancel(orderID uint64) (Order, bool) {
 // PreviewReplace validates replacement against a copy of the current book.
 // The old order is absent from matching and self-trade checks in the preview.
 func (b *Book) PreviewReplace(oldOrderID uint64, replacement Order, policy SelfTradePolicy) (Report, error) {
+	if _, ok := b.Order(oldOrderID); !ok {
+		return Report{}, errors.New("order not found")
+	}
+	if replacement.ID == oldOrderID || replacement.Sequence <= b.maxSequence() || b.sequenceUsed(replacement.Sequence, oldOrderID) {
+		return Report{}, errors.New("replacement must have a unique newer sequence")
+	}
 	clone, err := b.without(oldOrderID)
 	if err != nil {
 		return Report{}, err
@@ -176,12 +195,15 @@ func (b *Book) PreviewReplace(oldOrderID uint64, replacement Order, policy SelfT
 // Replace atomically swaps a resting order for a new order. The replacement
 // receives a new ID/sequence from the caller and therefore loses time priority.
 func (b *Book) Replace(oldOrderID uint64, replacement Order, policy SelfTradePolicy) (Report, error) {
+	report, err := b.PreviewReplace(oldOrderID, replacement, policy)
+	if err != nil {
+		return Report{}, err
+	}
 	clone, err := b.without(oldOrderID)
 	if err != nil {
 		return Report{}, err
 	}
-	report, err := clone.Submit(replacement, policy)
-	if err != nil {
+	if _, err := clone.Submit(replacement, policy); err != nil {
 		return Report{}, err
 	}
 	*b = *clone
@@ -285,6 +307,25 @@ func (b *Book) without(orderID uint64) (*Book, error) {
 		clone.rest(order)
 	}
 	return clone, nil
+}
+
+func (b *Book) sequenceUsed(sequence, exceptOrderID uint64) bool {
+	for id, node := range b.orders {
+		if id != exceptOrderID && node.order.Sequence == sequence {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Book) maxSequence() uint64 {
+	max := uint64(0)
+	for _, node := range b.orders {
+		if node.order.Sequence > max {
+			max = node.order.Sequence
+		}
+	}
+	return max
 }
 
 func (b *Book) forSide(side Side) *side {

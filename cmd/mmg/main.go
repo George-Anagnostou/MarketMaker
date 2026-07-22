@@ -50,7 +50,11 @@ func main() {
 		}
 		line = strings.TrimSpace(line)
 		if line == "q" || line == "quit" || line == "exit" {
-			result := engine.Quit()
+			result, err := engine.Quit()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "quit rejected:", err)
+				return
+			}
 			printResult(result)
 			break
 		}

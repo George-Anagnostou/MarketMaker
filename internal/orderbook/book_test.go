@@ -134,3 +134,20 @@ func TestReplacePreviewsAndCommitsWithoutOldOrder(t *testing.T) {
 		t.Fatalf("book len=%d", b.Len())
 	}
 }
+
+func TestReplaceRejectsStaleSequenceWithoutReorderingBook(t *testing.T) {
+	b := New()
+	if _, err := b.Submit(order(1, 1, "a", Sell, "100", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Submit(order(2, 2, "b", Sell, "100", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.PreviewReplace(1, order(3, 1, "a", Sell, "100", "1", GTC, t), RejectTaker); err == nil {
+		t.Fatal("expected stale sequence rejection")
+	}
+	report, err := b.Submit(order(3, 3, "buyer", Buy, "100", "1", IOC, t), RejectTaker)
+	if err != nil || len(report.Fills) != 1 || report.Fills[0].Maker.ID != 1 {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+}

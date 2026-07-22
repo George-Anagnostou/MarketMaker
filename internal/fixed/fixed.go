@@ -108,6 +108,25 @@ func ScaleMoney(amount Money, numerator, denominator int64) (Money, error) {
 	return Money(quotient*numerator + remainder*numerator/denominator), nil
 }
 
+// ScalePrice returns price * numerator / denominator without an overflowing
+// intermediate product.
+func ScalePrice(price Price, numerator, denominator int64) (Price, error) {
+	if denominator <= 0 || numerator < 0 {
+		return 0, errors.New("invalid price scale")
+	}
+	if numerator == 0 {
+		return 0, nil
+	}
+	quotient, remainder := int64(price)/denominator, int64(price)%denominator
+	if quotient != 0 && (quotient > math.MaxInt64/numerator || quotient < math.MinInt64/numerator) {
+		return 0, errors.New("price scale overflows range")
+	}
+	if remainder != 0 && (remainder > math.MaxInt64/numerator || remainder < math.MinInt64/numerator) {
+		return 0, errors.New("price scale overflows range")
+	}
+	return Price(quotient*numerator + remainder*numerator/denominator), nil
+}
+
 func AbsQty(v Qty) Qty {
 	if v < 0 {
 		return -v
