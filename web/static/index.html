@@ -551,6 +551,9 @@ async function quitSession() {
   const msg = (eq !== undefined) ? 'Final MTM Equity ≈ ' + fmtMoney(eq) : 'Game ended.';
   alert('Session ended.\n' + msg);
   gameId = null; isOver = true;
+  if (finalState) {
+    showGameSummary(finalState, null);
+  }
   document.getElementById('submitbtn').disabled = true;
   document.getElementById('bid').disabled = true;
   document.getElementById('ask').disabled = true;
