@@ -236,6 +236,16 @@ let gameId = null;
 let isOver = false;
 let startingEquity = 100000;
 let history = []; // [{turn, price, equity, inventory, netfill, storage, turnpnl, units}]
+let version = 0;
+let pendingCommand = null;
+let retryCommand = null;
+
+function number(v) { return Number(v); }
+function uiState(state) {
+  return {turn: state.turn, cash: number(state.cash), inventory: number(state.position),
+    last_price: number(state.mark), is_over: state.is_over, reason: state.reason};
+}
+function newID() { return crypto.randomUUID(); }
 
 function fmtMoney(n) {
   const s = Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -432,19 +442,20 @@ function renderResult(result) {
   const events = result.events || [];
 
   for (const ev of events) {
-    if (ev.type !== 'fill') continue;
-    const m = ev.message.match(/MARKET (BUY|SELL) ([0-9.]+) @ your (ASK|BID) \$([0-9.]+)/);
-    if (m) {
-      const side = m[1], qty = parseFloat(m[2]), price = parseFloat(m[4]);
-      const cash = (side === 'BUY') ? +(price * qty) : -(price * qty);
+    if (ev.type !== 'trade' || !ev.trade) continue;
+    const trade = ev.trade;
+    const side = trade.buyer_id === 'player' ? 'BUY' : 'SELL';
+    const qty = number(trade.quantity), price = number(trade.price);
+    if (Number.isFinite(qty) && Number.isFinite(price)) {
+      const cash = side === 'BUY' ? -(price * qty) : +(price * qty);
       addFill(side, qty, price, cash);
     }
   }
 
-  const net = (bs.net_fill_cash || 0) - (bs.storage_cost || 0);
-  const mtm = (bs.turn_pnl || 0) - net;
+  const net = Number(bs.net_fill_cash || 0);
+  const pnl = Number(bs.turn_pnl || 0);
   document.getElementById('attr').innerHTML =
-    `Realized: <span class="${net>=0?'pos':'neg'}">${fmtMoney(net)}</span> &nbsp; MTM: <span class="${mtm>=0?'pos':'neg'}">${fmtMoney(mtm)}</span>`;
+    `Net fill cash: <span class="${net>=0?'pos':'neg'}">${fmtMoney(net)}</span> (cash flow, not P&amp;L) &nbsp; Turn P&amp;L: <span class="${pnl>=0?'pos':'neg'}">${fmtMoney(pnl)}</span>`;
 
   const buyV = bs.buy_volume || 0, sellV = bs.sell_volume || 0, tot = buyV + sellV;
   let tone = '';
@@ -456,44 +467,54 @@ function renderResult(result) {
   setText('tone', tone);
 
   // push turn snapshot using real summary
-  const st = result.state;
+  const st = uiState(result.state);
   const eq = st.cash + st.inventory * st.last_price;
   const units = (bs.buy_volume || 0) + (bs.sell_volume || 0);
   pushHistory(st.turn, st.last_price, eq, st.inventory, bs.net_fill_cash||0, bs.storage_cost||0, bs.turn_pnl||0, units);
 }
 
 async function startNewGame() {
+  const turns = Number(document.getElementById('turns').value);
+  const seed = Number(document.getElementById('seed').value);
+  const cash = document.getElementById('startcash').value.trim();
+  const position = document.getElementById('startinv').value.trim();
+  const mark = document.getElementById('startprice').value.trim();
+  const storage = document.getElementById('storage').value.trim();
+  const minMove = Number(document.getElementById('volmin').value);
+  const maxMove = Number(document.getElementById('volmax').value);
+  if (!Number.isInteger(turns) || turns < 0 || !Number.isFinite(seed) || !Number.isFinite(minMove) || !Number.isFinite(maxMove) || !cash || !position || !mark || !storage) {
+    alert('Enter valid game configuration values.'); return;
+  }
+  const requestedID = newID();
   const body = {
-    num_turns: parseInt(document.getElementById('turns').value) || 0,
-    seed: parseInt(document.getElementById('seed').value) || 0,
-    starting_cash: parseFloat(document.getElementById('startcash').value) || 100000,
-    starting_inventory: parseFloat(document.getElementById('startinv').value) || 0,
-    starting_price: parseFloat(document.getElementById('startprice').value) || 100,
-    storage_cost_per_unit: parseFloat(document.getElementById('storage').value) || 1,
-    vol_min_pct: parseFloat(document.getElementById('volmin').value) || -0.5,
-    vol_max_pct: parseFloat(document.getElementById('volmax').value) || 3
+    game_id: requestedID, command_id: newID(), config: {
+      num_turns: turns, seed: Math.trunc(seed), starting_cash: cash, starting_position: position,
+      starting_mark: mark, storage_per_unit: storage, initial_margin_bps: 5000,
+      maintenance_margin_bps: 2500, max_position: '1000', max_orders_per_turn: 5,
+      max_order_qty: '10', max_flow_slippage_bps: 200,
+      min_move_bps: Math.round(minMove * 100), max_move_bps: Math.round(maxMove * 100)
+    }
   };
-  const res = await fetch('/api/game', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const res = await fetch('/api/v2/games', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   if (!res.ok) { alert('Failed to create game'); return; }
   const data = await res.json();
-  gameId = data.game_id; isOver = false;
-  if (typeof data.starting_equity === 'number') {
-    startingEquity = data.starting_equity;
-  } else {
-    startingEquity = data.state.cash + data.state.inventory * data.state.last_price;
-  }
+  gameId = data.game_id; version = data.version; isOver = false; pendingCommand = null;
+  const state = uiState(data.state);
+  startingEquity = state.cash + state.inventory * state.last_price;
+  localStorage.setItem('mmg.game_id', gameId);
+  localStorage.setItem('mmg.starting_equity', String(startingEquity));
   setText('gid', gameId);
-  setText('turn', data.state.turn);
+  setText('turn', state.turn);
   document.getElementById('submitbtn').disabled = false;
   document.getElementById('bid').disabled = false;
   document.getElementById('ask').disabled = false;
   clearFills();
   clearHistory();
   document.getElementById('gamesummary').style.display = 'none';
-  updateUI(data.state);
+  updateUI(state);
 
   // initial history entry (turn 0)
-  const s0 = data.state;
+  const s0 = state;
   const eq0 = startingEquity;
   pushHistory(0, s0.last_price, eq0, s0.inventory, 0, 0, 0, 0);
 }
@@ -511,20 +532,32 @@ function startDefault() {
 }
 
 async function submitTurn() {
-  if (!gameId || isOver) return;
+  if (!gameId || isOver || pendingCommand) return;
   const bid = parseFloat(document.getElementById('bid').value);
   const ask = parseFloat(document.getElementById('ask').value);
   if (!isFinite(bid) || !isFinite(ask) || bid <= 0 || ask <= 0 || bid >= ask) {
     alert('Invalid bid/ask');
     return;
   }
-  const res = await fetch('/api/game/' + gameId + '/turn', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({bid, ask})
-  });
-  if (!res.ok) { alert('Error: ' + await res.text()); return; }
-  const data = await res.json();
-  renderResult(data);
-  updateUI(data.state, data.summary);
+  const command = retryCommand || {id: newID(), type: 'submit_quote', expected_version: version, bid: document.getElementById('bid').value, ask: document.getElementById('ask').value};
+  pendingCommand = command;
+  document.getElementById('submitbtn').disabled = true;
+  try {
+    const res = await fetch('/api/v2/games/' + gameId + '/commands', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(command)});
+    if (!res.ok) { alert('Error: ' + await res.text()); retryCommand = null; return; }
+    const data = await res.json();
+    version = data.version;
+    retryCommand = null;
+    renderResult(data);
+    updateUI(uiState(data.state), data.summary);
+    localStorage.setItem('mmg.game_id', gameId);
+  } catch (error) {
+    retryCommand = command;
+    alert('Network error. Retry the same quote to safely recover its result.');
+  } finally {
+    pendingCommand = null;
+    if (!isOver) document.getElementById('submitbtn').disabled = false;
+  }
 }
 
 async function quitSession() {
@@ -532,14 +565,16 @@ async function quitSession() {
   let eq;
   let finalState = null;
   try {
-    const res = await fetch('/api/game/' + gameId + '/quit', {method: 'POST'});
+    const command = {id: newID(), type: 'quit', expected_version: version};
+    const res = await fetch('/api/v2/games/' + gameId + '/commands', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(command)});
     if (res.ok) {
       const data = await res.json();
       // /quit returns TurnResult {state, ...} or similar
       const st = data.state || data;
       if (st) {
-        finalState = st;
-        eq = (st.cash || 0) + (st.inventory || 0) * (st.last_price || 0);
+        finalState = uiState(st);
+        version = data.version;
+        eq = finalState.cash + finalState.inventory * finalState.last_price;
       }
     }
   } catch (e) {
@@ -550,7 +585,8 @@ async function quitSession() {
   }
   const msg = (eq !== undefined) ? 'Final MTM Equity ≈ ' + fmtMoney(eq) : 'Game ended.';
   alert('Session ended.\n' + msg);
-  gameId = null; isOver = true;
+  if (!finalState) return;
+  gameId = null; isOver = true; localStorage.removeItem('mmg.game_id');
   if (finalState) {
     showGameSummary(finalState, null);
   }
@@ -579,9 +615,9 @@ function showGameSummary(state, lastSummary) {
   html += `<div><span class="k">Reason:</span> <span class="v">${state.reason || 'ended'}</span> &nbsp; <span class="k">Final Equity:</span> <span class="v">${fmtMoney(finalEq)}</span></div>`;
   html += `<div><span class="k">Cash:</span> <span class="v">${fmtMoney(state.cash)}</span> &nbsp; <span class="k">Inv:</span> <span class="v">${fmtNum(state.inventory)}</span> &nbsp; <span class="k">Price:</span> <span class="v">${fmtMoney(state.last_price)}</span></div>`;
   html += `<div><span class="k">Total P&amp;L:</span> <span class="${totalPnl>=0?'pos':'neg'}">${fmtMoney(totalPnl)}</span> <span class="${totalPnl>=0?'pos':'neg'}">(${pnlPct.toFixed(2)}%)</span></div>`;
-  html += `<div style="margin-top:4px;"><span class="k">Session:</span> max|inv|=${fmtNum(maxAbs)} &nbsp; units≈${fmtNum(totalUnits)} &nbsp; storage=${fmtMoney(totalStorage)} &nbsp; net spread=${fmtMoney(netSpread)}</div>`;
+  html += `<div style="margin-top:4px;"><span class="k">Session:</span> max|inv|=${fmtNum(maxAbs)} &nbsp; units≈${fmtNum(totalUnits)} &nbsp; storage=${fmtMoney(totalStorage)} &nbsp; net fill cash=${fmtMoney(netSpread)}</div>`;
   if (lastSummary) {
-    html += `<div><span class="k">Last turn realized:</span> ${fmtMoney((lastSummary.net_fill_cash||0)-(lastSummary.storage_cost||0))} &nbsp; <span class="k">MTM:</span> ${fmtMoney((lastSummary.turn_pnl||0) - ((lastSummary.net_fill_cash||0)-(lastSummary.storage_cost||0)))}</div>`;
+    html += `<div><span class="k">Last turn fill cash:</span> ${fmtMoney(lastSummary.net_fill_cash||0)} &nbsp; <span class="k">Turn P&amp;L:</span> ${fmtMoney(lastSummary.turn_pnl||0)}</div>`;
   }
   c.innerHTML = html;
   el.style.display = 'block';
@@ -620,9 +656,23 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+async function resumeGame() {
+  const savedID = localStorage.getItem('mmg.game_id');
+  if (!savedID) return;
+  try {
+    const res = await fetch('/api/v2/games/' + savedID);
+    if (!res.ok) { localStorage.removeItem('mmg.game_id'); return; }
+    const data = await res.json();
+    gameId = data.game_id; version = data.version;
+    startingEquity = Number(localStorage.getItem('mmg.starting_equity')) || number(data.state.cash) + number(data.state.position) * number(data.state.mark);
+    updateUI(uiState(data.state));
+  } catch (_) { /* Keep the ID for a later reconnect. */ }
+}
+
 // init defaults
 document.getElementById('volmin').value = -0.5;
 document.getElementById('volmax').value = 3;
+resumeGame();
 </script>
 </body>
 </html>

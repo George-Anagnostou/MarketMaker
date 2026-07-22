@@ -1,100 +1,95 @@
 # market-maker
 
-A fast, simple, single-player market making game / trading simulation engine.
+`market-maker` is a deterministic, single-instrument market-making simulation built around a fixed-point central limit order book. It is a local-first foundation for a future real-time bot arena, not a production trading venue.
 
-You act as a market maker. Each turn you post a bid and ask. Pseudo-random market orders (aggressive flow) hit your quotes. You capture spread but take on inventory risk. Price walks randomly. You pay storage on your position. Go bankrupt or survive the turns.
+The web application is the primary interface. The CLI runs the identical exchange kernel for quick deterministic scenarios.
 
-Built in Go with zero non-stdlib dependencies. Designed to be extended into a full multiplayer real-time exchange simulator later.
+## Run
 
-## Quick Start
+```sh
+go run ./cmd/server
+# Open http://127.0.0.1:8080
 
-```bash
-# Build the CLI
-go build -o market-maker ./cmd/mmg
-
-# Play a 10-turn game with a fixed seed (reproducible)
-./market-maker -turns 10 -seed 42
-
-# Unlimited practice mode
-./market-maker -turns 0
-
-# Tune parameters
-./market-maker -cash 50000 -storage 2 -vol "-1,4" -turns 15
+go run ./cmd/mmg -seed 42 -turns 10
 ```
 
-In-game:
-- Enter `bid ask` (e.g. `99.5 100.5`)
-- `q` to quit early
+The server intentionally binds only to loopback. Durable game records are stored under `data/games/` and are excluded from Git.
 
-## Core Rules (Phase 1)
+## Mechanics
 
-- You post prices only. Size is implicit ("at size").
-- Market buys hit your ask → you sell.
-- Market sells hit your bid → you buy.
-- Price does a uniform random walk after execution.
-- Storage cost = `storage_cost_per_unit * |inventory|` each turn.
-- Equity (MTM) = `cash + inventory * current_reference_price`
-- Game ends on `cash <= 0` (bankrupt) or after N turns (or never if unlimited).
-- Goal: maximize P&L while managing inventory risk. Wide spreads = less volume, less risk. Tight spreads = more volume, more risk.
+- One simulated instrument, `SIM`, has a server-owned reference mark.
+- The player maintains one bid and one ask, each with a configured quote size.
+- Simulated customers submit deterministic IOC limit orders around the reference mark. An order executes only when its limit crosses a resting quote.
+- The book is price-time priority. Execution occurs at the resting maker price. Partial fills and residual GTC quotes are explicit.
+- Cash, quantity, price, and execution notional use fixed-point integers. API decimal values are serialized as strings, never JSON floating-point values.
+- The engine reserves full cash for a resting buy quote and applies configurable initial and maintenance margin to gross exposure. Position limits are enforced before quotes are accepted.
+- Storage is charged against absolute inventory each simulation turn. Insolvency and maintenance-margin failure end the game; there is no forced liquidation yet.
 
-The reference price used for marking inventory is an exogenous simulated market price (the random walk), not your own fill prices. This is the standard way to teach the inventory risk lesson in market making simulations.
+`net_fill_cash` is cash movement, not realized P&L. Equity is marked as `cash + position * reference_mark`.
 
-## Flags
+## Durable API
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `-turns` | 10 | Number of turns. 0 = unlimited |
-| `-cash` | 100000 | Starting cash |
-| `-inventory` | 0 | Starting inventory (can be negative) |
-| `-price` | 100 | Starting reference price |
-| `-storage` | 1 | Storage cost per unit per turn |
-| `-seed` | 0 | RNG seed (0 = random, non-reproducible) |
-| `-vol` | "-0.5,3" | Price move range per turn in percent, "min,max" |
+All mutating v2 requests are versioned and idempotent. IDs are UUIDs.
 
-## Determinism
-
-If you provide `-seed`, the same sequence of bids/asks will produce the exact same outcome every time. This is extremely useful for testing, teaching, and later for bot strategy development.
-
-## Architecture (for future you)
-
-```
-cmd/mmg          - CLI entrypoint (thin)
-internal/
-  engine/        - Pure market-making simulation (no lifecycle). Step(bid,ask) -> TurnResult. Deterministic, reusable for sims/bots/MC.
-  game/          - Session/game layer on top of engine. Owns IsOver, Quit(), EndReason (bankrupt/turns_complete/player_quit), lifecycle.
-  market/        - Flow gen + price walk (used by engine).
-  types/         - Shared: GameConfig, GameState (with IsOver/EndReason), TurnResult, EndReason consts, etc.
+```text
+POST /api/v2/games
+GET  /api/v2/games/{game_id}
+POST /api/v2/games/{game_id}/commands
+GET  /api/v2/games/{game_id}/events?after={sequence}
 ```
 
-The simulation (engine) has no I/O or session concepts. Game wraps it for playable sessions. Both are deterministic. Reusable for:
-- Web single-player (Phase 3+)
-- Multiplayer exchange (later)
-- Bot arena / strategy backtesting (later)
-- Monte Carlo parameter tuning
+Create a game with a client-generated `game_id` and `command_id`. The response preserves the resolved non-zero seed. Submit a quote with an idempotency key and the last observed version:
 
-## Roadmap (high level)
+```json
+{
+  "id": "33333333-3333-4333-8333-333333333333",
+  "type": "submit_quote",
+  "expected_version": 4,
+  "bid": "99.5000",
+  "ask": "100.5000"
+}
+```
 
-1. ✅ Phase 1: Playable CLI, correct mechanics, deterministic, tested.
-2. CLI polish + scenarios + better end-of-game analytics.
-3. Web single-player (pure stdlib net/http first).
-4. Web polish, charts, config UI.
-5. Multiplayer + real matching engine + quote allocation.
-6. Real-time, bots, informed flow, historical replay, etc.
+Retrying the same command returns its original result without advancing the market. Reusing a command ID with another payload and submitting a stale version both return `409`.
+
+Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. Restarting the server replays that log from the persisted scenario configuration; a partial final write is ignored.
+
+## Venue Boundary
+
+The matching foundation has three deliberate layers:
+
+- `orderbook.Book` is pure price-level/FIFO matching. It knows only orders, prices, quantities, time-in-force, and an explicit self-trade policy.
+- `exchange.Engine` is the single-instrument venue adapter. It owns accounts, live reservations, risk admission, settlement, trade IDs, and exchange events.
+- Scenario code submits quotes and synthetic flow through venue commands. It does not implement matching or mutate balances directly.
+
+Venue account state separates settled cash from `reserved_cash`, and reports open buy/sell quantity plus available cash. Live orders derive reservations, so cancellation and partial/full fill release the correct amount automatically.
+
+The current durable venue commands are `open_account`, `place_order`, `cancel_order`, and `replace_order`. A replacement atomically removes one live order and accepts a new same-side order after risk and self-trade checks against a preview without the old order. It receives a new order ID and loses queue priority.
+
+The venue also has an append-only double-entry journal. Opening balances, reservation movements, settled trades, and storage charges each balance independently in cash and instrument units. Account fields remain verified projections during this transition; deposits, withdrawals, fees, and liquidation remain deferred until ledger persistence and authorization are introduced. `submit_quote` and `quit` are temporary scenario commands, not part of the future bot-facing venue contract.
+
+## Architecture
+
+```text
+cmd/server                 Local web/API process
+cmd/mmg                    Local CLI adapter
+internal/fixed             Exact decimal parsing and arithmetic
+internal/orderbook         Pure price-level FIFO matching and depth snapshots
+internal/exchange          Account/risk, settlement, scenario policy, event projection
+internal/eventlog          Durable committed-command JSONL store
+web/static                 Browser projection of structured API events
+```
+
+There is no v1 game or API compatibility layer. All new work targets `internal/exchange` and `/api/v2`.
+
+## Roadmap
+
+The detailed current status and next-wave sequencing is in [ROADMAP.md](ROADMAP.md).
 
 ## Development
 
-```bash
-go test ./...          # all tests
-go test -race ./...    # with race detector
-go build ./cmd/mmg     # build CLI
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
 ```
-
-Golden deterministic test (`internal/game/golden_test.go`) locks exact outcomes for a known seed + strategy. Change core logic only if you intend to change behavior.
-
-## Notes on Money and Floats
-
-Prices, quantities, and cash are `float64`. This is intentional for speed and simplicity in a teaching simulation. It is not intended for production settlement or real money movement. If we ever need exact decimal arithmetic, we will introduce a dependency then.
-
-## License
-
-Unlicensed / throwaway for now. Rewrite aggressively.
