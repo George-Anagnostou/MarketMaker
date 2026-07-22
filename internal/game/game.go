@@ -33,6 +33,8 @@ type Game struct {
 }
 
 // NewGame creates a new game session (engine + lifecycle rules).
+// Note: if cfg.StartingCash <= 0, the session starts not-over; first SubmitTurn will end it bankrupt.
+// (This matches historical behavior and is accepted by server create.)
 func NewGame(cfg types.GameConfig) *Game {
 	eng := engine.NewEngine(cfg)
 	g := &Game{
