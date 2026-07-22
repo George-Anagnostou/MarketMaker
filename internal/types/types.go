@@ -12,7 +12,7 @@ type GameConfig struct {
 	// StartingPrice is the initial market reference price used for MTM and first display.
 	StartingPrice float64 `json:"starting_price"`
 
-	// NumTurns is the number of turns in a finite game. 0 means unlimited (play until bankrupt or quit).
+	// NumTurns is the number of turns in a finite game. 0 means unlimited (play until bankrupt or explicit quit via game layer).
 	NumTurns int `json:"num_turns"`
 
 	// StorageCostPerUnit is the cash cost deducted each turn per unit of absolute inventory.
@@ -34,6 +34,17 @@ type GameConfig struct {
 	Seed int64 `json:"seed"`
 }
 
+// EndReason describes why a game/session ended. Empty means not over.
+// These are first-class and used by game layer (on top of engine).
+type EndReason string
+
+const (
+	EndReasonNotOver      EndReason = ""
+	EndReasonBankrupt     EndReason = "bankrupt"
+	EndReasonTurnsComplete EndReason = "turns_complete"
+	EndReasonPlayerQuit   EndReason = "player_quit"
+)
+
 // GameState is the observable state after each turn (or at start).
 type GameState struct {
 	Turn      int     `json:"turn"` // current turn number (0 before first turn)
@@ -41,7 +52,7 @@ type GameState struct {
 	Inventory float64 `json:"inventory"`
 	LastPrice float64 `json:"last_price"` // reference market price for display and MTM
 	IsOver    bool    `json:"is_over"`
-	Reason    string  `json:"reason"` // "", "turns_complete", "bankrupt"
+	Reason    EndReason `json:"reason"` // one of the EndReason* constants
 }
 
 // Equity computes mark-to-market equity using the current LastPrice.
