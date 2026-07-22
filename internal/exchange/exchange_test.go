@@ -160,6 +160,66 @@ func TestTradesConserveCashAndPosition(t *testing.T) {
 	}
 }
 
+func TestAccountReservationsFollowOrderLifecycle(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, ok := e.Account(PlayerAccount)
+	if !ok || state.ReservedCash != mustMoney(t, "198") || state.AvailableCash != mustMoney(t, "99802") || state.OpenBuyQuantity != mustQty(t, "2") {
+		t.Fatalf("reserved account=%+v", state)
+	}
+	if _, err := e.Cancel(PlayerAccount, placed.Events[0].Order.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = e.Account(PlayerAccount)
+	if state.ReservedCash != 0 || state.OpenBuyQuantity != 0 || state.AvailableCash != mustMoney(t, "100000") {
+		t.Fatalf("released account=%+v", state)
+	}
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = e.Account(PlayerAccount)
+	if state.Cash != mustMoney(t, "99900") || state.Position != mustQty(t, "1") || state.ReservedCash != 0 {
+		t.Fatalf("filled account=%+v", state)
+	}
+}
+
+func TestOpenAccountIsAVersionedVenueCommand(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.Execute(Command{ID: "open-seller", Type: CommandOpenAccount, AccountID: "seller", InitialCash: mustMoney(t, "250"), InitialPosition: mustQty(t, "2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State.Version != 1 || len(result.Events) != 1 || result.Events[0].Type != "account_opened" || result.Events[0].Account == nil {
+		t.Fatalf("result=%+v", result)
+	}
+	account, ok := e.Account("seller")
+	if !ok || account.Cash != mustMoney(t, "250") || account.Position != mustQty(t, "2") {
+		t.Fatalf("account=%+v", account)
+	}
+	if _, err := e.Execute(Command{ID: "duplicate", Type: CommandOpenAccount, AccountID: "seller"}); err == nil {
+		t.Fatal("expected duplicate account rejection")
+	}
+}
+
 func TestDeterministicResults(t *testing.T) {
 	e1, err := New(config(t))
 	if err != nil {

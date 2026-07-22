@@ -96,10 +96,26 @@ func (c Config) Validate() error {
 }
 
 type Account struct {
-	ID       string      `json:"id"`
-	Cash     fixed.Money `json:"cash"`
-	Position fixed.Qty   `json:"position"`
-	External bool        `json:"external"`
+	ID               string      `json:"id"`
+	Cash             fixed.Money `json:"cash"`
+	ReservedCash     fixed.Money `json:"reserved_cash"`
+	Position         fixed.Qty   `json:"position"`
+	OpenBuyQuantity  fixed.Qty   `json:"open_buy_quantity"`
+	OpenSellQuantity fixed.Qty   `json:"open_sell_quantity"`
+	External         bool        `json:"external"`
+}
+
+// AccountState is the read model exposed by the venue. Cash remains total
+// settled cash; AvailableCash excludes cash reserved by live buy orders.
+type AccountState struct {
+	ID               string      `json:"id"`
+	Cash             fixed.Money `json:"cash"`
+	ReservedCash     fixed.Money `json:"reserved_cash"`
+	AvailableCash    fixed.Money `json:"available_cash"`
+	Position         fixed.Qty   `json:"position"`
+	OpenBuyQuantity  fixed.Qty   `json:"open_buy_quantity"`
+	OpenSellQuantity fixed.Qty   `json:"open_sell_quantity"`
+	Equity           fixed.Money `json:"equity"`
 }
 
 type Order struct {
@@ -124,15 +140,16 @@ type Trade struct {
 }
 
 type Event struct {
-	Sequence  uint64      `json:"sequence"`
-	CommandID string      `json:"command_id,omitempty"`
-	Type      string      `json:"type"`
-	Order     *Order      `json:"order,omitempty"`
-	Trade     *Trade      `json:"trade,omitempty"`
-	Amount    fixed.Money `json:"amount,omitempty"`
-	Mark      fixed.Price `json:"mark,omitempty"`
-	Reason    EndReason   `json:"reason,omitempty"`
-	Message   string      `json:"message,omitempty"`
+	Sequence  uint64        `json:"sequence"`
+	CommandID string        `json:"command_id,omitempty"`
+	Type      string        `json:"type"`
+	Order     *Order        `json:"order,omitempty"`
+	Trade     *Trade        `json:"trade,omitempty"`
+	Account   *AccountState `json:"account,omitempty"`
+	Amount    fixed.Money   `json:"amount,omitempty"`
+	Mark      fixed.Price   `json:"mark,omitempty"`
+	Reason    EndReason     `json:"reason,omitempty"`
+	Message   string        `json:"message,omitempty"`
 }
 
 type Summary struct {
@@ -179,7 +196,17 @@ type Command struct {
 	Quantity        fixed.Qty   `json:"quantity,omitempty"`
 	TIF             TimeInForce `json:"time_in_force,omitempty"`
 	OrderID         uint64      `json:"order_id,omitempty"`
+	InitialCash     fixed.Money `json:"initial_cash,omitempty"`
+	InitialPosition fixed.Qty   `json:"initial_position,omitempty"`
 }
+
+const (
+	CommandOpenAccount = "open_account"
+	CommandPlaceOrder  = "place_order"
+	CommandCancelOrder = "cancel_order"
+	CommandSubmitQuote = "submit_quote" // scenario adapter, not a venue primitive
+	CommandQuit        = "quit"         // scenario adapter, not a venue primitive
+)
 
 // Engine owns the authoritative account state and price-time-priority book.
 // It is deliberately single-writer; callers serialize it per game/market.
@@ -228,6 +255,22 @@ func (e *Engine) OpenOrders(accountID string) []Order {
 	return result
 }
 
+func (e *Engine) Account(accountID string) (AccountState, bool) {
+	account := e.accounts[accountID]
+	if account == nil {
+		return AccountState{}, false
+	}
+	available, err := fixed.AddMoney(account.Cash, -account.ReservedCash)
+	if err != nil {
+		return AccountState{}, false
+	}
+	equity, err := e.equity(account)
+	if err != nil {
+		return AccountState{}, false
+	}
+	return AccountState{ID: account.ID, Cash: account.Cash, ReservedCash: account.ReservedCash, AvailableCash: available, Position: account.Position, OpenBuyQuantity: account.OpenBuyQuantity, OpenSellQuantity: account.OpenSellQuantity, Equity: equity}, true
+}
+
 // AddAccount creates a real account. It is the in-process primitive used by
 // future authenticated account provisioning; the local game only creates player.
 func (e *Engine) AddAccount(id string, cash fixed.Money, position fixed.Qty) error {
@@ -242,15 +285,29 @@ func (e *Engine) AddAccount(id string, cash fixed.Money, position fixed.Qty) err
 	return nil
 }
 
+// OpenAccount is the durable venue command for provisioning an account. The
+// caller that authorizes this command belongs outside the venue; the venue
+// only enforces its financial invariants.
+func (e *Engine) OpenAccount(id string, cash fixed.Money, position fixed.Qty) (Result, error) {
+	if err := e.AddAccount(id, cash, position); err != nil {
+		return Result{State: e.State()}, err
+	}
+	e.version++
+	account, _ := e.Account(id)
+	return Result{State: e.State(), Events: []Event{e.emit(Event{Type: "account_opened", Account: &account})}}, nil
+}
+
 func (e *Engine) Execute(command Command) (Result, error) {
 	switch command.Type {
-	case "submit_quote":
+	case CommandSubmitQuote:
 		return e.SubmitQuote(command.Bid, command.Ask)
-	case "quit":
+	case CommandQuit:
 		return e.Quit(), nil
-	case "place_order":
+	case CommandOpenAccount:
+		return e.OpenAccount(command.AccountID, command.InitialCash, command.InitialPosition)
+	case CommandPlaceOrder:
 		return e.PlaceLimit(command.AccountID, command.Side, command.Price, command.Quantity, command.TIF)
-	case "cancel_order":
+	case CommandCancelOrder:
 		return e.Cancel(command.AccountID, command.OrderID)
 	default:
 		return Result{State: e.State()}, fmt.Errorf("unsupported command type %q", command.Type)
@@ -278,6 +335,9 @@ func (e *Engine) PlaceLimit(accountID string, side Side, price fixed.Price, qty 
 	if err != nil {
 		return Result{State: e.State()}, err
 	}
+	if err := e.reconcileReservations(); err != nil {
+		return Result{State: e.State()}, err
+	}
 	for _, trade := range trades {
 		events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
 	}
@@ -295,6 +355,9 @@ func (e *Engine) Cancel(accountID string, orderID uint64) (Result, error) {
 		return Result{State: e.State()}, errors.New("order not found")
 	}
 	order, _ := e.book.Cancel(orderID)
+	if err := e.reconcileReservations(); err != nil {
+		return Result{State: e.State()}, err
+	}
 	e.version++
 	exchangeOrder := fromBookOrder(order)
 	return Result{State: e.State(), Events: []Event{e.emit(Event{Type: "order_canceled", Order: copyOrder(&exchangeOrder)})}}, nil
@@ -323,6 +386,9 @@ func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
 			events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
 		}
 		events = append(events, e.emitLifecycle(lifecycle)...)
+	}
+	if err := e.reconcileReservations(); err != nil {
+		return Result{State: e.State()}, err
 	}
 	summary := e.advance(&events)
 	after, _ := e.equity(e.accounts[PlayerAccount])
@@ -467,6 +533,44 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 	return err == nil && equity >= required
 }
 
+// reconcileReservations derives all reservation balances from the live book.
+// Keeping reservations derived for now avoids a second mutable source of truth
+// while giving account consumers explicit available and committed balances.
+func (e *Engine) reconcileReservations() error {
+	for _, account := range e.accounts {
+		account.ReservedCash = 0
+		account.OpenBuyQuantity = 0
+		account.OpenSellQuantity = 0
+	}
+	for _, order := range e.book.Orders("") {
+		account := e.accounts[order.OwnerID]
+		if account == nil {
+			return errors.New("book references unknown account")
+		}
+		if order.Side == orderbook.Buy {
+			notional, err := fixed.Notional(order.Price, order.Remaining)
+			if err != nil {
+				return err
+			}
+			account.ReservedCash, err = fixed.AddMoney(account.ReservedCash, notional)
+			if err != nil {
+				return err
+			}
+			account.OpenBuyQuantity, err = fixed.AddQty(account.OpenBuyQuantity, order.Remaining)
+			if err != nil {
+				return err
+			}
+		} else {
+			var err error
+			account.OpenSellQuantity, err = fixed.AddQty(account.OpenSellQuantity, order.Remaining)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Engine) accountWithinLimits(accountID string, maintenance bool) bool {
 	a := e.accounts[accountID]
 	if a.External {
@@ -524,6 +628,9 @@ func (e *Engine) advance(events *[]Event) Summary {
 				}
 			}
 			*events = append(*events, e.emitLifecycle(lifecycle)...)
+			if err := e.reconcileReservations(); err != nil {
+				panic(err)
+			}
 		}
 	}
 	player := e.accounts[PlayerAccount]

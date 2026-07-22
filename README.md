@@ -54,6 +54,18 @@ Retrying the same command returns its original result without advancing the mark
 
 Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. Restarting the server replays that log from the persisted scenario configuration; a partial final write is ignored.
 
+## Venue Boundary
+
+The matching foundation has three deliberate layers:
+
+- `orderbook.Book` is pure price-level/FIFO matching. It knows only orders, prices, quantities, time-in-force, and an explicit self-trade policy.
+- `exchange.Engine` is the single-instrument venue adapter. It owns accounts, live reservations, risk admission, settlement, trade IDs, and exchange events.
+- Scenario code submits quotes and synthetic flow through venue commands. It does not implement matching or mutate balances directly.
+
+Venue account state separates settled cash from `reserved_cash`, and reports open buy/sell quantity plus available cash. Live orders derive reservations, so cancellation and partial/full fill release the correct amount automatically.
+
+The current durable venue commands are `open_account`, `place_order`, and `cancel_order`. Funding, withdrawals, replace, fees, and liquidation remain deferred until the double-entry ledger exists. `submit_quote` and `quit` are temporary scenario commands, not part of the future bot-facing venue contract.
+
 ## Architecture
 
 ```text

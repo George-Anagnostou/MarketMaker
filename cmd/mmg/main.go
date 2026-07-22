@@ -65,7 +65,7 @@ func main() {
 			fmt.Println("Quotes must be finite decimal prices with at most four decimal places.")
 			continue
 		}
-		result, err := engine.Execute(exchange.Command{ID: fmt.Sprintf("cli-turn-%d", engine.State().Version+1), Type: "submit_quote", Bid: bid, Ask: ask})
+		result, err := engine.Execute(exchange.Command{ID: fmt.Sprintf("cli-turn-%d", engine.State().Version+1), Type: exchange.CommandSubmitQuote, Bid: bid, Ask: ask})
 		if err != nil {
 			fmt.Println("Rejected:", err)
 			continue

@@ -46,11 +46,11 @@ func TestAppendAndOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := e.Execute(exchange.Command{ID: "c-1", Type: "submit_quote", Bid: price(t, "99"), Ask: price(t, "101")})
+	result, err := e.Execute(exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: "submit_quote", Bid: price(t, "99"), Ask: price(t, "101")}, Result: result}); err != nil {
+	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: result}); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err := Open(root, "game-1")
