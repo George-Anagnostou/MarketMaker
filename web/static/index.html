@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>market-maker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #0b0d11;
+  --panel: #14171c;
+  --panel2: #1a1f26;
+  --border: #252a33;
+  --text: #e6e8eb;
+  --muted: #8a8f99;
+  --accent: #3a7bd5;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); }
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px; background: #080a0d; border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 600; letter-spacing: 0.5px; }
+.brand .sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+main { max-width: 1040px; margin: 0 auto; padding: 14px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  padding: 11px 13px; margin-bottom: 12px;
+}
+.panel h3 {
+  margin: 0 0 6px 0; font-size: 11px; font-weight: 600; letter-spacing: .5px;
+  text-transform: uppercase; color: var(--muted);
+}
+.metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; }
+.metric { display: flex; justify-content: space-between; align-items: baseline; font-variant-numeric: tabular-nums; }
+.metric .label { color: var(--muted); font-size: 12px; }
+.metric .val { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 15px; }
+.metric .val.lg { font-size: 19px; font-weight: 600; }
+.val.pos { color: var(--green); } .val.neg { color: var(--red); }
+
+.config { display: flex; gap: 6px; align-items: flex-end; flex-wrap: wrap; }
+.config label { font-size: 10px; color: var(--muted); display: block; margin-bottom: 1px; }
+.config input {
+  width: 78px; background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  padding: 4px 5px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 12px;
+}
+.config input:focus { outline: none; border-color: var(--accent); }
+
+.quote {
+  display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px;
+}
+.quote .field { min-width: 110px; }
+.quote .field label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px; }
+.quote input {
+  width: 128px; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  padding: 7px 9px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 16px;
+}
+.quote input:focus { outline: none; border-color: var(--accent); }
+.quote input:disabled { opacity: .6; }
+.spread { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.spread .w { font-family: ui-monospace, monospace; color: var(--text); }
+
+button {
+  background: var(--accent); color: white; border: none; padding: 8px 14px;
+  border-radius: 4px; font-weight: 600; font-size: 13px; cursor: pointer; height: 34px;
+}
+button.secondary { background: #2a3038; color: var(--text); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+.fills table, .history table { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 12px; }
+.fills th, .fills td, .history th, .history td { padding: 4px 5px; text-align: left; border-bottom: 1px solid var(--border); }
+.fills th, .history th { font-weight: 600; font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.fills tr:last-child td, .history tr:last-child td { border-bottom: none; }
+.side-buy { color: var(--green); font-weight: 600; }
+.side-sell { color: var(--red); font-weight: 600; }
+
+.attribution { margin-top: 8px; font-size: 12px; }
+.hint { font-size: 11px; color: var(--muted); margin-top: 5px; line-height: 1.3; }
+
+.status { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+.pill { background: var(--panel2); border: 1px solid var(--border); padding: 1px 7px; border-radius: 999px; font-family: ui-monospace, monospace; }
+
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 700px) { .two { grid-template-columns: 1fr; } }
+
+.charts { display: grid; gap: 6px; }
+canvas { background: var(--panel2); border: 1px solid var(--border); border-radius: 3px; display: block; width: 100%; }
+.summary {
+  border: 2px solid var(--accent); background: #101317;
+}
+.summary .k { color: var(--muted); font-size: 11px; }
+.summary .v { font-family: ui-monospace, monospace; }
+.history td.pos, .history td.neg { font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">market-maker <span class="sub">single asset market making</span></div>
+  <div class="status">
+    <div>Game <span id="gid" class="pill">—</span></div>
+    <div>Turn <span id="turn" class="pill">—</span></div>
+  </div>
+</header>
+
+<main>
+  <!-- New Game Config -->
+  <div class="panel">
+    <h3>New Game</h3>
+    <div class="config">
+      <div><label>Turns</label><input id="turns" type="number" value="10" min="0"></div>
+      <div><label>Seed</label><input id="seed" type="number" value="42"></div>
+      <div><label>Start Cash</label><input id="startcash" type="number" value="100000" step="1000"></div>
+      <div><label>Start Inv</label><input id="startinv" type="number" value="0" step="1"></div>
+      <div><label>Start Price</label><input id="startprice" type="number" value="100" step="0.5"></div>
+      <div><label>Storage $/u</label><input id="storage" type="number" value="1" step="0.1"></div>
+      <div><label>Vol Min %</label><input id="volmin" type="number" value="-0.5" step="0.1"></div>
+      <div><label>Vol Max %</label><input id="volmax" type="number" value="3" step="0.1"></div>
+      <div><button onclick="startNewGame()">New Game</button></div>
+      <div><button class="secondary" onclick="startDefault()">Default</button></div>
+    </div>
+    <div class="hint">0 = unlimited turns. Seed = deterministic replay. <span title="MTM marks inventory to the exogenous simulated market price (random walk), separating spread capture from directional risk.">MTM uses exogenous price</span>.</div>
+  </div>
+
+  <div class="two">
+    <!-- Portfolio -->
+    <div class="panel">
+      <h3>Portfolio</h3>
+      <div class="metrics">
+        <div class="metric"><span class="label">Cash</span><span id="cash" class="val lg">$0.00</span></div>
+        <div class="metric"><span class="label">Inventory</span><span id="inv" class="val">0.00</span></div>
+        <div class="metric"><span class="label">Equity (MTM)</span><span id="equity" class="val lg">$0.00</span></div>
+        <div class="metric"><span class="label">P&amp;L</span><span id="pnl" class="val">$0.00</span></div>
+        <div class="metric"><span class="label">Start Equity</span><span id="startequity" class="val">$100,000.00</span></div>
+        <div class="metric"><span class="label">P&amp;L %</span><span id="pnlpct" class="val">0.00%</span></div>
+      </div>
+      <div class="hint">Start Equity = Cash + Inv × Start Price (fixed reference for all P&amp;L). <span title="P&amp;L = (Current MTM Equity − Starting Equity) / Starting Equity">P&amp;L% is vs start equity.</span></div>
+    </div>
+ 
+    <!-- Market + Position -->
+    <div class="panel">
+      <h3>Market &amp; Position</h3>
+      <div class="metrics">
+        <div class="metric"><span class="label">Mid Price</span><span id="mid" class="val lg">$0.00</span></div>
+        <div class="metric"><span class="label">Move this turn</span><span id="move" class="val">—</span></div>
+        <div class="metric"><span class="label">Direction</span><span id="posdir" class="val">FLAT</span></div>
+        <div class="metric"><span class="label">$1 mid impact</span><span id="exposure" class="val">$0.00</span></div>
+      </div>
+      <div class="hint">Marked to the exogenous market price (random walk). Inventory risk is separate from spread P&amp;L.</div>
+    </div>
+  </div>
+
+  <!-- Quote Ticket -->
+  <div class="panel">
+    <h3>Quote for this turn</h3>
+    <div class="quote">
+      <div class="field">
+        <label>Bid</label>
+        <input id="bid" type="number" step="0.01" value="99.50">
+      </div>
+      <div class="field">
+        <label>Ask</label>
+        <input id="ask" type="number" step="0.01" value="100.50">
+      </div>
+      <div>
+        <button id="submitbtn" onclick="submitTurn()">Submit Turn</button>
+      </div>
+      <div>
+        <button class="secondary" onclick="quitSession()">Quit</button>
+      </div>
+    </div>
+    <div class="spread">Spread width: <span id="spread" class="w">$1.00</span></div>
+    <div class="hint">Market buys hit your Ask (you sell). Market sells hit your Bid (you buy). <span title="Inputs disabled after game over.">Disabled when over.</span></div>
+  </div>
+ 
+  <!-- Fills -->
+  <div class="panel">
+    <h3>Fills this turn</h3>
+    <table class="fills">
+      <thead>
+        <tr>
+          <th style="width:70px">Side</th>
+          <th style="width:90px">Qty</th>
+          <th style="width:110px">Executed @</th>
+          <th>Cash Impact</th>
+        </tr>
+      </thead>
+      <tbody id="fillsbody"></tbody>
+    </table>
+    <div class="attribution" id="attr"></div>
+    <div class="hint" id="tone"></div>
+  </div>
+
+  <!-- Charts -->
+  <div class="panel">
+    <h3>Charts</h3>
+    <div class="charts">
+      <canvas id="chart-price" height="72"></canvas>
+      <canvas id="chart-equity" height="72"></canvas>
+      <canvas id="chart-inv" height="72"></canvas>
+    </div>
+    <div class="hint">Price (exog. random walk) • Equity (MTM line, green/red) • Inventory (w/ zero line). Updated live.</div>
+  </div>
+
+  <!-- Turn History -->
+  <div class="panel">
+    <h3>Turn History</h3>
+    <div class="history">
+      <table>
+        <thead><tr><th>Turn</th><th>Mid</th><th>Inv</th><th>Equity</th><th>NetFill</th><th>Storage</th><th>TurnPnL</th></tr></thead>
+        <tbody id="historybody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Game Summary -->
+  <div id="gamesummary" class="panel summary" style="display:none;">
+    <h3>Game Summary</h3>
+    <div id="summarycontent" style="font-size:12px; line-height:1.4;"></div>
+    <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button onclick="playAgain()">Play Again</button>
+      <button class="secondary" onclick="reviewHistory()">Review History</button>
+    </div>
+  </div>
+</main>
+
+<script>
+let gameId = null;
+let isOver = false;
+let startingEquity = 100000;
+let history = []; // [{turn, price, equity, inventory, netfill, storage, turnpnl, units}]
+
+function fmtMoney(n) {
+  const s = Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  return '$' + s;
+}
+function fmtNum(n, d=2) {
+  return Number(n).toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+}
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+
+function updateSpread() {
+  const bid = parseFloat(document.getElementById('bid').value) || 0;
+  const ask = parseFloat(document.getElementById('ask').value) || 0;
+  setText('spread', fmtMoney(Math.max(0, ask - bid)));
+}
+['bid','ask'].forEach(id => document.getElementById(id).addEventListener('input', updateSpread));
+updateSpread();
+
+function updateUI(state, summary) {
+  setText('gid', gameId || '—');
+  setText('turn', state.turn + (state.is_over ? ' (over)' : ''));
+  setText('cash', fmtMoney(state.cash));
+  setText('inv', fmtNum(state.inventory));
+  const equity = state.cash + state.inventory * state.last_price;
+  setText('equity', fmtMoney(equity));
+  const pnl = equity - startingEquity;
+  const pnlEl = document.getElementById('pnl');
+  pnlEl.textContent = fmtMoney(pnl);
+  pnlEl.className = 'val' + (pnl >= 0 ? ' pos' : ' neg');
+  const pct = startingEquity > 0 ? (pnl / startingEquity) * 100 : 0;
+  const pctEl = document.getElementById('pnlpct');
+  pctEl.textContent = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+  pctEl.className = 'val' + (pnl >= 0 ? ' pos' : ' neg');
+  setText('startequity', fmtMoney(startingEquity));
+  setText('mid', fmtMoney(state.last_price));
+
+  const inv = state.inventory;
+  let dir = 'FLAT', cls = '';
+  if (inv > 0.001) { dir = 'LONG'; cls = 'pos'; }
+  else if (inv < -0.001) { dir = 'SHORT'; cls = 'neg'; }
+  const dirEl = document.getElementById('posdir');
+  dirEl.textContent = dir + ' ' + fmtNum(inv);
+  dirEl.className = 'val ' + cls;
+  setText('exposure', fmtMoney(Math.abs(inv)));
+
+  if (state.is_over) {
+    isOver = true;
+    document.getElementById('submitbtn').disabled = true;
+    document.getElementById('bid').disabled = true;
+    document.getElementById('ask').disabled = true;
+    showGameSummary(state, summary);
+  } else {
+    document.getElementById('submitbtn').disabled = false;
+    document.getElementById('bid').disabled = false;
+    document.getElementById('ask').disabled = false;
+  }
+}
+
+function pushHistory(turn, price, equity, inventory, netfill, storage, turnpnl, units) {
+  history.push({turn, price, equity, inventory, netfill: netfill||0, storage: storage||0, turnpnl: turnpnl||0, units: units||0});
+  renderHistory();
+  drawCharts();
+}
+
+function renderHistory() {
+  const tbody = document.getElementById('historybody');
+  tbody.innerHTML = '';
+  for (const h of history) {
+    const tr = document.createElement('tr');
+    const tp = h.turnpnl;
+    tr.innerHTML = `<td>${h.turn}</td><td>${fmtMoney(h.price)}</td><td>${fmtNum(h.inventory)}</td><td>${fmtMoney(h.equity)}</td><td class="${h.netfill>=0?'pos':'neg'}">${fmtMoney(h.netfill)}</td><td class="neg">${fmtMoney(h.storage)}</td><td class="${tp>=0?'pos':'neg'}">${fmtMoney(tp)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function clearHistory() {
+  history = [];
+  document.getElementById('historybody').innerHTML = '';
+  const c1 = document.getElementById('chart-price'); if (c1) c1.getContext('2d').clearRect(0,0,c1.width,c1.height);
+  const c2 = document.getElementById('chart-equity'); if (c2) c2.getContext('2d').clearRect(0,0,c2.width,c2.height);
+  const c3 = document.getElementById('chart-inv'); if (c3) c3.getContext('2d').clearRect(0,0,c3.width,c3.height);
+}
+
+function drawCharts() {
+  if (!history.length) return;
+  const priceC = document.getElementById('chart-price');
+  const eqC = document.getElementById('chart-equity');
+  const invC = document.getElementById('chart-inv');
+  if (!priceC || !eqC || !invC) return;
+
+  const W = priceC.clientWidth || 600;
+  const H = 72;
+  [priceC, eqC, invC].forEach(c => { c.width = W; c.height = H; });
+
+  const turns = history.map(h => h.turn);
+  const prices = history.map(h => h.price);
+  const eqs = history.map(h => h.equity);
+  const invs = history.map(h => h.inventory);
+  const n = history.length;
+  if (n < 1) return;
+
+  const minT = Math.min(...turns), maxT = Math.max(...turns);
+  const minP = Math.min(...prices), maxP = Math.max(...prices);
+  const minE = Math.min(...eqs, startingEquity), maxE = Math.max(...eqs, startingEquity);
+  const minI = Math.min(...invs, 0), maxI = Math.max(...invs, 0);
+
+  const pad = 18, r = 3;
+  const gW = W - pad*2, gH = H - pad - 8;
+
+  function x(t) { return pad + (n>1 ? ((t - minT) / (maxT - minT || 1)) * gW : gW/2); }
+  function yP(p) { return pad + gH - ((p - minP) / (maxP - minP || 1)) * gH; }
+  function yE(e) { return pad + gH - ((e - minE) / (maxE - minE || 1)) * gH; }
+  function yI(i) { return pad + gH - ((i - minI) / (maxI - minI || 1)) * gH; }
+
+  const ctxP = priceC.getContext('2d');
+  const ctxE = eqC.getContext('2d');
+  const ctxI = invC.getContext('2d');
+
+  function grid(ctx, yf, minv, maxv, label) {
+    ctx.strokeStyle = '#252a33'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i=0; i<=4; i++) {
+      const yy = pad + (gH/4)*i;
+      ctx.moveTo(pad, yy); ctx.lineTo(W-pad, yy);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#8a8f99'; ctx.font = '9px ui-monospace,monospace';
+    ctx.fillText(label, 4, 10);
+    ctx.fillText(fmtMoney(minv), pad, H-2);
+    ctx.fillText(fmtMoney(maxv), W - 50, H-2);
+  }
+
+  // Price
+  ctxP.clearRect(0,0,W,H);
+  grid(ctxP, yP, minP, maxP, 'Price');
+  ctxP.strokeStyle = '#3a7bd5'; ctxP.lineWidth = 1.5; ctxP.beginPath();
+  for (let i=0; i<n; i++) {
+    const xx = x(turns[i]), yy = yP(prices[i]);
+    if (i===0) ctxP.moveTo(xx,yy); else ctxP.lineTo(xx,yy);
+  }
+  ctxP.stroke();
+  ctxP.fillStyle = '#3a7bd5';
+  for (let i=0; i<n; i++) ctxP.fillRect(x(turns[i])-r, yP(prices[i])-r, r*2, r*2);
+
+  // Equity (colored)
+  ctxE.clearRect(0,0,W,H);
+  grid(ctxE, yE, minE, maxE, 'Equity');
+  ctxE.lineWidth = 1.5;
+  for (let i=1; i<n; i++) {
+    const col = (eqs[i] - eqs[i-1] >= 0) ? '#3fb950' : '#f85149';
+    ctxE.strokeStyle = col;
+    ctxE.beginPath();
+    ctxE.moveTo(x(turns[i-1]), yE(eqs[i-1]));
+    ctxE.lineTo(x(turns[i]), yE(eqs[i]));
+    ctxE.stroke();
+  }
+  ctxE.fillStyle = '#3fb950';
+  for (let i=0; i<n; i++) ctxE.fillRect(x(turns[i])-r, yE(eqs[i])-r, r*2, r*2);
+
+  // Inventory
+  ctxI.clearRect(0,0,W,H);
+  grid(ctxI, yI, minI, maxI, 'Inv');
+  // zero line
+  const zeroY = yI(0);
+  ctxI.strokeStyle = '#3a3f47'; ctxI.lineWidth = 1;
+  ctxI.beginPath(); ctxI.moveTo(pad, zeroY); ctxI.lineTo(W-pad, zeroY); ctxI.stroke();
+  ctxI.strokeStyle = '#d29922'; ctxI.lineWidth = 1.5; ctxI.beginPath();
+  for (let i=0; i<n; i++) {
+    const xx = x(turns[i]), yy = yI(invs[i]);
+    if (i===0) ctxI.moveTo(xx,yy); else ctxI.lineTo(xx,yy);
+  }
+  ctxI.stroke();
+  ctxI.fillStyle = '#d29922';
+  for (let i=0; i<n; i++) ctxI.fillRect(x(turns[i])-r, yI(invs[i])-r, r*2, r*2);
+}
+
+function clearFills() {
+  document.getElementById('fillsbody').innerHTML = '';
+  setText('attr', '');
+  setText('tone', '');
+}
+
+function addFill(side, qty, price, cash) {
+  const tbody = document.getElementById('fillsbody');
+  const tr = document.createElement('tr');
+  const sc = side === 'BUY' ? 'side-buy' : 'side-sell';
+  tr.innerHTML = `<td class="${sc}">${side}</td><td>${fmtNum(qty)}</td><td>${fmtMoney(price)}</td><td class="${cash>=0?'pos':'neg'}">${fmtMoney(cash)}</td>`;
+  tbody.appendChild(tr);
+}
+
+function renderResult(result) {
+  clearFills();
+  const bs = result.summary || {};
+  const events = result.events || [];
+
+  for (const ev of events) {
+    if (ev.type !== 'fill') continue;
+    const m = ev.message.match(/MARKET (BUY|SELL) ([0-9.]+) @ your (ASK|BID) \$([0-9.]+)/);
+    if (m) {
+      const side = m[1], qty = parseFloat(m[2]), price = parseFloat(m[4]);
+      const cash = (side === 'BUY') ? +(price * qty) : -(price * qty);
+      addFill(side, qty, price, cash);
+    }
+  }
+
+  const net = (bs.net_fill_cash || 0) - (bs.storage_cost || 0);
+  const mtm = (bs.turn_pnl || 0) - net;
+  document.getElementById('attr').innerHTML =
+    `Realized: <span class="${net>=0?'pos':'neg'}">${fmtMoney(net)}</span> &nbsp; MTM: <span class="${mtm>=0?'pos':'neg'}">${fmtMoney(mtm)}</span>`;
+
+  const buyV = bs.buy_volume || 0, sellV = bs.sell_volume || 0, tot = buyV + sellV;
+  let tone = '';
+  if (tot > 0) {
+    const sp = (sellV / tot) * 100;
+    tone = sp > 70 ? 'Heavy sell pressure (sellers hitting your bid).' :
+           sp < 30 ? 'Heavy buy pressure (buyers hitting your ask).' : 'Two-way flow.';
+  }
+  setText('tone', tone);
+
+  // push turn snapshot using real summary
+  const st = result.state;
+  const eq = st.cash + st.inventory * st.last_price;
+  const units = (bs.buy_volume || 0) + (bs.sell_volume || 0);
+  pushHistory(st.turn, st.last_price, eq, st.inventory, bs.net_fill_cash||0, bs.storage_cost||0, bs.turn_pnl||0, units);
+}
+
+async function startNewGame() {
+  const body = {
+    num_turns: parseInt(document.getElementById('turns').value) || 0,
+    seed: parseInt(document.getElementById('seed').value) || 0,
+    starting_cash: parseFloat(document.getElementById('startcash').value) || 100000,
+    starting_inventory: parseFloat(document.getElementById('startinv').value) || 0,
+    starting_price: parseFloat(document.getElementById('startprice').value) || 100,
+    storage_cost_per_unit: parseFloat(document.getElementById('storage').value) || 1,
+    vol_min_pct: parseFloat(document.getElementById('volmin').value) || -0.5,
+    vol_max_pct: parseFloat(document.getElementById('volmax').value) || 3
+  };
+  const res = await fetch('/api/game', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!res.ok) { alert('Failed to create game'); return; }
+  const data = await res.json();
+  gameId = data.game_id; isOver = false;
+  if (typeof data.starting_equity === 'number') {
+    startingEquity = data.starting_equity;
+  } else {
+    startingEquity = data.state.cash + data.state.inventory * data.state.last_price;
+  }
+  setText('gid', gameId);
+  setText('turn', data.state.turn);
+  document.getElementById('submitbtn').disabled = false;
+  document.getElementById('bid').disabled = false;
+  document.getElementById('ask').disabled = false;
+  clearFills();
+  clearHistory();
+  document.getElementById('gamesummary').style.display = 'none';
+  updateUI(data.state);
+
+  // initial history entry (turn 0)
+  const s0 = data.state;
+  const eq0 = startingEquity;
+  pushHistory(0, s0.last_price, eq0, s0.inventory, 0, 0, 0, 0);
+}
+
+function startDefault() {
+  document.getElementById('turns').value = 10;
+  document.getElementById('seed').value = 42;
+  document.getElementById('startcash').value = 100000;
+  document.getElementById('startinv').value = 0;
+  document.getElementById('startprice').value = 100;
+  document.getElementById('storage').value = 1;
+  document.getElementById('volmin').value = -0.5;
+  document.getElementById('volmax').value = 3;
+  startNewGame();
+}
+
+async function submitTurn() {
+  if (!gameId || isOver) return;
+  const bid = parseFloat(document.getElementById('bid').value);
+  const ask = parseFloat(document.getElementById('ask').value);
+  if (!isFinite(bid) || !isFinite(ask) || bid <= 0 || ask <= 0 || bid >= ask) {
+    alert('Invalid bid/ask');
+    return;
+  }
+  const res = await fetch('/api/game/' + gameId + '/turn', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({bid, ask})
+  });
+  if (!res.ok) { alert('Error: ' + await res.text()); return; }
+  const data = await res.json();
+  renderResult(data);
+  updateUI(data.state, data.summary);
+}
+
+async function quitSession() {
+  if (!gameId) return;
+  let eq;
+  let finalState = null;
+  try {
+    const res = await fetch('/api/game/' + gameId + '/quit', {method: 'POST'});
+    if (res.ok) {
+      const data = await res.json();
+      // /quit returns TurnResult {state, ...} or similar
+      const st = data.state || data;
+      if (st) {
+        finalState = st;
+        eq = (st.cash || 0) + (st.inventory || 0) * (st.last_price || 0);
+      }
+    }
+  } catch (e) {
+    // already removed or network; use local if possible
+  }
+  if (eq === undefined && finalState) {
+    eq = finalState.cash + finalState.inventory * finalState.last_price;
+  }
+  const msg = (eq !== undefined) ? 'Final MTM Equity ≈ ' + fmtMoney(eq) : 'Game ended.';
+  alert('Session ended.\n' + msg);
+  gameId = null; isOver = true;
+  document.getElementById('submitbtn').disabled = true;
+  document.getElementById('bid').disabled = true;
+  document.getElementById('ask').disabled = true;
+}
+
+function showGameSummary(state, lastSummary) {
+  const el = document.getElementById('gamesummary');
+  const c = document.getElementById('summarycontent');
+  const finalEq = state.cash + state.inventory * state.last_price;
+  const totalPnl = finalEq - startingEquity;
+  const pnlPct = startingEquity > 0 ? (totalPnl / startingEquity * 100) : 0;
+
+  // compute session stats from history (use actual units traded, not cash)
+  let maxAbs = 0, totalUnits = 0, totalStorage = 0, netSpread = 0;
+  for (const h of history) {
+    maxAbs = Math.max(maxAbs, Math.abs(h.inventory));
+    totalUnits += (h.units || 0);
+    totalStorage += Math.abs(h.storage || 0);
+    netSpread += (h.netfill || 0);
+  }
+
+  let html = '';
+  html += `<div><span class="k">Reason:</span> <span class="v">${state.reason || 'ended'}</span> &nbsp; <span class="k">Final Equity:</span> <span class="v">${fmtMoney(finalEq)}</span></div>`;
+  html += `<div><span class="k">Cash:</span> <span class="v">${fmtMoney(state.cash)}</span> &nbsp; <span class="k">Inv:</span> <span class="v">${fmtNum(state.inventory)}</span> &nbsp; <span class="k">Price:</span> <span class="v">${fmtMoney(state.last_price)}</span></div>`;
+  html += `<div><span class="k">Total P&amp;L:</span> <span class="${totalPnl>=0?'pos':'neg'}">${fmtMoney(totalPnl)}</span> <span class="${totalPnl>=0?'pos':'neg'}">(${pnlPct.toFixed(2)}%)</span></div>`;
+  html += `<div style="margin-top:4px;"><span class="k">Session:</span> max|inv|=${fmtNum(maxAbs)} &nbsp; units≈${fmtNum(totalUnits)} &nbsp; storage=${fmtMoney(totalStorage)} &nbsp; net spread=${fmtMoney(netSpread)}</div>`;
+  if (lastSummary) {
+    html += `<div><span class="k">Last turn realized:</span> ${fmtMoney((lastSummary.net_fill_cash||0)-(lastSummary.storage_cost||0))} &nbsp; <span class="k">MTM:</span> ${fmtMoney((lastSummary.turn_pnl||0) - ((lastSummary.net_fill_cash||0)-(lastSummary.storage_cost||0)))}</div>`;
+  }
+  c.innerHTML = html;
+  el.style.display = 'block';
+}
+
+function playAgain() {
+  gameId = null; isOver = false;
+  document.getElementById('gamesummary').style.display = 'none';
+  clearFills();
+  clearHistory();
+  setText('gid', '—');
+  setText('turn', '—');
+  setText('cash', '$0.00');
+  setText('inv', '0.00');
+  setText('equity', '$0.00');
+  setText('pnl', '$0.00');
+  setText('pnlpct', '0.00%');
+  setText('mid', '$0.00');
+  setText('posdir', 'FLAT');
+  setText('exposure', '$0.00');
+  document.getElementById('submitbtn').disabled = false;
+  document.getElementById('bid').disabled = false;
+  document.getElementById('ask').disabled = false;
+  // keep config visible for new game
+}
+
+function reviewHistory() {
+  const h = document.getElementById('historybody');
+  if (h) h.scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && gameId && !isOver) {
+    const a = document.activeElement;
+    if (a && (a.id === 'bid' || a.id === 'ask')) { e.preventDefault(); submitTurn(); }
+  }
+});
+
+// init defaults
+document.getElementById('volmin').value = -0.5;
+document.getElementById('volmax').value = 3;
+</script>
+</body>
+</html>
