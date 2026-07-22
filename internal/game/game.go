@@ -228,7 +228,7 @@ func (g *Game) IsOver() bool {
 }
 
 // Reason returns the terminal reason if over, otherwise "".
-func (g *Game) Reason() string {
+func (g *Game) Reason() types.EndReason {
 	return g.state.Reason
 }
 
