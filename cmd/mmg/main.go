@@ -98,6 +98,7 @@ func main() {
 	if cfg.Seed != 0 {
 		fmt.Printf("Seed: %d (reproducible)\n", cfg.Seed)
 	}
+	fmt.Printf("Starting equity: %s (Cash + Inv × Start Price; fixed P&L reference)\n", formatMoney(types.StartingEquity(cfg)))
 	fmt.Println()
 
 	reader := bufio.NewReader(os.Stdin)
@@ -195,6 +196,7 @@ func main() {
 
 		if line == "q" || line == "quit" || line == "exit" {
 			fmt.Println("Quitting...")
+			g.Quit()
 			break
 		}
 		if line == "" {
@@ -235,7 +237,7 @@ func main() {
 			} else if ev.Type == "fill" {
 				// fills are already quite descriptive
 			} else if ev.Type == "price_update" {
-				msg = msg // could color green/red based on move, but keep simple
+				// price_update left plain; could color by sign of move
 			}
 			fmt.Printf("  %s\n", msg)
 		}
@@ -324,16 +326,17 @@ func main() {
 	}
 
 	fmt.Println(bold + "=== Game Over ===" + reset)
-	if st.Reason != "" {
-		reason := st.Reason
-		if reason == "bankrupt" {
-			reason = red + "BANKRUPT" + reset
+	if st.Reason != types.EndReasonNotOver {
+		reasonStr := string(st.Reason)
+		if st.Reason == types.EndReasonBankrupt {
+			reasonStr = red + "BANKRUPT" + reset
 		}
-		fmt.Printf("Reason: %s\n", reason)
+		fmt.Printf("Reason: %s\n", reasonStr)
 	}
 	fmt.Printf("Final Cash:      %s\n", formatMoney(st.Cash))
 	fmt.Printf("Final Inventory: %s units\n", formatNum(st.Inventory, 2))
 	fmt.Printf("Final Mid Price: %s\n", formatMoney(st.LastPrice))
+	fmt.Printf("Starting equity: %s\n", formatMoney(startEquity))
 	fmt.Printf("MTM Equity:      %s\n", formatMoney(finalEquity))
 	fmt.Printf("Total P&L:       %s%s (%+.2f%%)%s\n", finalPnlColor, formatMoney(totalPnL), pct, reset)
 
@@ -344,8 +347,10 @@ func main() {
 	fmt.Printf("Total storage paid:          %s\n", formatMoney(stats.TotalStoragePaid))
 	fmt.Printf("Net spread capture (pre-storage): %s\n", formatMoney(stats.TotalNetFillCash))
 
-	if st.Reason == "bankrupt" {
+	if st.Reason == types.EndReasonBankrupt {
 		fmt.Println("\n" + red + "You went bankrupt." + reset + " Market making is risk management first, spread capture second.")
+	} else if st.Reason == types.EndReasonPlayerQuit {
+		fmt.Println("\nSession ended by quit. Review your inventory discipline and how one-sided flow affected your position.")
 	} else {
 		fmt.Println("\nSession ended. Review your inventory discipline and how one-sided flow affected your position.")
 	}
