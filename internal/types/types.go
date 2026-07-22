@@ -98,3 +98,12 @@ type TurnSummary struct {
 	// SellVolume: market sell orders that hit your bid (you bought from aggressive sellers)
 	SellVolume float64 `json:"sell_volume"`
 }
+
+// GameStats holds lifetime aggregates for a session.
+// Promoted here so both engine (pure sim) and game (session) layers can use it.
+type GameStats struct {
+	MaxAbsInventory  float64 // maximum |inventory| reached at any point (risk metric)
+	TotalUnitsTraded float64 // sum of absolute units filled across all turns
+	TotalNetFillCash float64 // sum of net cash from fills (before storage) across turns
+	TotalStoragePaid float64 // sum of all storage costs deducted
+}
