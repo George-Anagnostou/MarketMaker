@@ -3,6 +3,8 @@ package game
 import (
 	"math"
 	"testing"
+
+	"market-maker/internal/types"
 )
 
 func TestNewGameDefaults(t *testing.T) {
@@ -206,5 +208,58 @@ func TestStorageIsChargedOnPostFillInventory(t *testing.T) {
 	wantCash := startCash + res.Summary.NetFillCash - res.Summary.StorageCost
 	if math.Abs(res.State.Cash-wantCash) > 1e-9 {
 		t.Errorf("cash = %v, want %v", res.State.Cash, wantCash)
+	}
+}
+
+// --- Quit lifecycle tests (new in split) ---
+
+func TestQuitAtStartSetsPlayerQuit(t *testing.T) {
+	g := NewGame(DefaultConfig())
+	res, err := g.Quit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.IsOver() || g.Reason() != types.EndReasonPlayerQuit {
+		t.Errorf("expected over with player_quit, got over=%v reason=%s", g.IsOver(), g.Reason())
+	}
+	if !res.State.IsOver || res.State.Reason != types.EndReasonPlayerQuit {
+		t.Error("Quit result should reflect ended state")
+	}
+	// can call again
+	_, _ = g.Quit()
+}
+
+func TestQuitAfterTurns(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumTurns = 0
+	g := NewGame(cfg)
+	_, _ = g.SubmitTurn(99, 101)
+	_, _ = g.SubmitTurn(99, 101)
+	_, err := g.Quit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Reason() != types.EndReasonPlayerQuit {
+		t.Errorf("quit reason = %s, want player_quit", g.Reason())
+	}
+}
+
+func TestSubmitAfterQuitErrors(t *testing.T) {
+	g := NewGame(DefaultConfig())
+	g.Quit()
+	_, err := g.SubmitTurn(99, 101)
+	if err == nil || g.Reason() != types.EndReasonPlayerQuit {
+		t.Error("expected error on submit after quit")
+	}
+}
+
+func TestNaturalEndReasonNotOverwrittenByQuit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.NumTurns = 1
+	g := NewGame(cfg)
+	_, _ = g.SubmitTurn(99, 101) // ends with turns_complete
+	g.Quit() // should be no-op
+	if g.Reason() != types.EndReasonTurnsComplete {
+		t.Errorf("reason after quit on ended = %s, want turns_complete", g.Reason())
 	}
 }
