@@ -60,12 +60,13 @@ If you provide `-seed`, the same sequence of bids/asks will produce the exact sa
 ```
 cmd/mmg          - CLI entrypoint (thin)
 internal/
-  game/          - Core engine. SubmitTurn, state, P&L, bankruptcy, lifetime stats.
-  market/        - Flow generation + price random walk.
-  types/         - GameConfig, GameState, TurnResult, Event, TurnSummary (JSON-ready).
+  engine/        - Pure market-making simulation (no lifecycle). Step(bid,ask) -> TurnResult. Deterministic, reusable for sims/bots/MC.
+  game/          - Session/game layer on top of engine. Owns IsOver, Quit(), EndReason (bankrupt/turns_complete/player_quit), lifecycle.
+  market/        - Flow gen + price walk (used by engine).
+  types/         - Shared: GameConfig, GameState (with IsOver/EndReason), TurnResult, EndReason consts, etc.
 ```
 
-The engine has no I/O. It is fully deterministic given config + player actions. This makes it reusable for:
+The simulation (engine) has no I/O or session concepts. Game wraps it for playable sessions. Both are deterministic. Reusable for:
 - Web single-player (Phase 3+)
 - Multiplayer exchange (later)
 - Bot arena / strategy backtesting (later)
