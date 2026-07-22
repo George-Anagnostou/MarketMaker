@@ -15,8 +15,10 @@ type Posting struct {
 }
 
 type LedgerReference struct {
-	OrderID uint64 `json:"order_id,omitempty"`
-	TradeID uint64 `json:"trade_id,omitempty"`
+	OrderID      uint64 `json:"order_id,omitempty"`
+	TradeID      uint64 `json:"trade_id,omitempty"`
+	MakerOrderID uint64 `json:"maker_order_id,omitempty"`
+	TakerOrderID uint64 `json:"taker_order_id,omitempty"`
 }
 
 // LedgerEntry is an immutable balanced journal entry. Money and instrument

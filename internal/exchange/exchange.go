@@ -914,7 +914,11 @@ func (e *Engine) settleReport(report orderbook.Report) ([]Trade, error) {
 		} else {
 			trade.BuyerID, trade.SellerID = fill.Maker.OwnerID, fill.Taker.OwnerID
 		}
-		if err := e.applyTrade(trade); err != nil {
+		buyerOrder, sellerOrder := fill.Taker, fill.Maker
+		if fill.Taker.Side == orderbook.Sell {
+			buyerOrder, sellerOrder = fill.Maker, fill.Taker
+		}
+		if err := e.applyTrade(trade, buyerOrder, sellerOrder); err != nil {
 			return nil, err
 		}
 		trades = append(trades, trade)
@@ -922,7 +926,7 @@ func (e *Engine) settleReport(report orderbook.Report) ([]Trade, error) {
 	return trades, nil
 }
 
-func (e *Engine) applyTrade(trade Trade) error {
+func (e *Engine) applyTrade(trade Trade, buyerOrder, sellerOrder orderbook.Order) error {
 	n, err := fixed.Notional(trade.Price, trade.Quantity)
 	if err != nil {
 		return err
@@ -944,11 +948,47 @@ func (e *Engine) applyTrade(trade Trade) error {
 	if err != nil {
 		return err
 	}
-	if err := e.ledger.append(LedgerEntry{Type: "trade_settled", Reference: LedgerReference{TradeID: trade.ID}, Postings: []Posting{
-		{Account: cashAvailable(trade.BuyerID), Money: -n}, {Account: cashAvailable(trade.SellerID), Money: n},
-		{Account: instrumentAvailable(trade.BuyerID), Instrument: trade.Quantity}, {Account: instrumentAvailable(trade.SellerID), Instrument: -trade.Quantity},
-	}}); err != nil {
+	postings := []Posting{{Account: cashAvailable(trade.SellerID), Money: n}, {Account: instrumentAvailable(trade.BuyerID), Instrument: trade.Quantity}}
+	buyerReserved := buyerOrder.ID == trade.MakerOrderID && !buyer.External
+	reservedBuyerCash := fixed.Money(0)
+	if buyerReserved {
+		limitNotional, err := fixed.Notional(buyerOrder.Price, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		refund, err := fixed.AddMoney(limitNotional, -n)
+		if err != nil {
+			return err
+		}
+		reservedBuyerCash = limitNotional
+		postings = append(postings, Posting{Account: cashReserved(trade.BuyerID), Money: -limitNotional}, Posting{Account: cashAvailable(trade.BuyerID), Money: refund})
+	} else {
+		postings = append(postings, Posting{Account: cashAvailable(trade.BuyerID), Money: -n})
+	}
+	sellerReserved := sellerOrder.ID == trade.MakerOrderID && !seller.External
+	if sellerReserved {
+		postings = append(postings, Posting{Account: instrumentReserved(trade.SellerID), Instrument: -trade.Quantity})
+	} else {
+		postings = append(postings, Posting{Account: instrumentAvailable(trade.SellerID), Instrument: -trade.Quantity})
+	}
+	if err := e.ledger.append(LedgerEntry{Type: "trade_settled", Reference: LedgerReference{TradeID: trade.ID, MakerOrderID: trade.MakerOrderID, TakerOrderID: trade.TakerOrderID}, Postings: postings}); err != nil {
 		return err
+	}
+	if buyerReserved {
+		buyer.ReservedCash, err = fixed.AddMoney(buyer.ReservedCash, -reservedBuyerCash)
+		if err != nil {
+			return err
+		}
+		buyer.OpenBuyQuantity, err = fixed.SubQty(buyer.OpenBuyQuantity, trade.Quantity)
+		if err != nil {
+			return err
+		}
+	}
+	if sellerReserved {
+		seller.OpenSellQuantity, err = fixed.SubQty(seller.OpenSellQuantity, trade.Quantity)
+		if err != nil {
+			return err
+		}
 	}
 	buyer.Cash, seller.Cash = buyerCash, sellerCash
 	buyer.Position, seller.Position = buyerPosition, sellerPosition

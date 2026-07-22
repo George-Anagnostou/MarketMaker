@@ -308,6 +308,52 @@ func TestLedgerEntriesBalanceAndMatchAccountProjections(t *testing.T) {
 	assertLedgerMatchesAccounts(t, e)
 }
 
+func TestMakerBuySettlementConsumesReservedCash(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	entries := e.LedgerEntries()
+	var entry LedgerEntry
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Type == "trade_settled" {
+			entry = entries[i]
+			break
+		}
+	}
+	if entry.Type != "trade_settled" {
+		t.Fatalf("entries=%+v", entries)
+	}
+	postings := make(map[LedgerAccount]Posting)
+	for _, posting := range entry.Postings {
+		postings[posting.Account] = posting
+	}
+	if postings[cashReserved(PlayerAccount)].Money != -mustMoney(t, "101") {
+		t.Fatalf("reserved posting=%+v", postings)
+	}
+	if postings[cashAvailable(PlayerAccount)].Money != 0 {
+		t.Fatalf("buyer available posting=%+v", postings)
+	}
+	if postings[cashAvailable("seller")].Money != mustMoney(t, "101") {
+		t.Fatalf("seller posting=%+v", postings)
+	}
+	if postings[instrumentAvailable(PlayerAccount)].Instrument != mustQty(t, "1") || postings[instrumentAvailable("seller")].Instrument != -mustQty(t, "1") {
+		t.Fatalf("instrument postings=%+v", postings)
+	}
+	assertLedgerMatchesAccounts(t, e)
+}
+
 func assertLedgerMatchesAccounts(t *testing.T, e *Engine) {
 	t.Helper()
 	for _, entry := range e.LedgerEntries() {
