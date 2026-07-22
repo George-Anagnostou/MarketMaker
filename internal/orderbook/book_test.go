@@ -106,3 +106,31 @@ func TestSelfTradeRejectedBeforeAnyFill(t *testing.T) {
 		t.Fatal("rejected order consumed third-party liquidity")
 	}
 }
+
+func TestReplacePreviewsAndCommitsWithoutOldOrder(t *testing.T) {
+	b := New()
+	if _, err := b.Submit(order(1, 1, "buyer", Buy, "99", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Submit(order(2, 2, "seller", Sell, "100", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	replacement := order(3, 3, "buyer", Buy, "101", "1", GTC, t)
+	preview, err := b.PreviewReplace(1, replacement, RejectTaker)
+	if err != nil || len(preview.Fills) != 1 {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	if _, ok := b.Order(1); !ok {
+		t.Fatal("preview changed book")
+	}
+	report, err := b.Replace(1, replacement, RejectTaker)
+	if err != nil || len(report.Fills) != 1 {
+		t.Fatalf("replace=%+v err=%v", report, err)
+	}
+	if _, ok := b.Order(1); ok {
+		t.Fatal("old order remains")
+	}
+	if b.Len() != 0 {
+		t.Fatalf("book len=%d", b.Len())
+	}
+}

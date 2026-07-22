@@ -163,6 +163,31 @@ func (b *Book) Cancel(orderID uint64) (Order, bool) {
 	return order, true
 }
 
+// PreviewReplace validates replacement against a copy of the current book.
+// The old order is absent from matching and self-trade checks in the preview.
+func (b *Book) PreviewReplace(oldOrderID uint64, replacement Order, policy SelfTradePolicy) (Report, error) {
+	clone, err := b.without(oldOrderID)
+	if err != nil {
+		return Report{}, err
+	}
+	return clone.Submit(replacement, policy)
+}
+
+// Replace atomically swaps a resting order for a new order. The replacement
+// receives a new ID/sequence from the caller and therefore loses time priority.
+func (b *Book) Replace(oldOrderID uint64, replacement Order, policy SelfTradePolicy) (Report, error) {
+	clone, err := b.without(oldOrderID)
+	if err != nil {
+		return Report{}, err
+	}
+	report, err := clone.Submit(replacement, policy)
+	if err != nil {
+		return Report{}, err
+	}
+	*b = *clone
+	return report, nil
+}
+
 func (b *Book) Order(orderID uint64) (Order, bool) {
 	n := b.orders[orderID]
 	if n == nil {
@@ -246,6 +271,20 @@ func (b *Book) wouldSelfTrade(order Order) bool {
 		}
 	}
 	return false
+}
+
+func (b *Book) without(orderID uint64) (*Book, error) {
+	if b.orders[orderID] == nil {
+		return nil, errors.New("order not found")
+	}
+	clone := New()
+	for _, order := range b.Orders("") {
+		if order.ID == orderID {
+			continue
+		}
+		clone.rest(order)
+	}
+	return clone, nil
 }
 
 func (b *Book) forSide(side Side) *side {

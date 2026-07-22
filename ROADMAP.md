@@ -7,7 +7,7 @@ The project now has a coherent local exchange foundation:
 - A fixed-point, deterministic, single-instrument CLOB with maker-price execution, price-time priority, partial fills, IOC/GTC behavior, self-trade prevention, and explicit order IDs.
 - Deterministic simulated limit flow. A customer trades only when its willingness price crosses a posted quote, so spread competitiveness now matters.
 - Cash reservations, position limits, configurable initial/maintenance margin, storage costs, and terminal margin/insolvency states.
-- A venue/account boundary with settled cash, book-derived reserved cash, position, open-order exposure, and durable account-open/order/cancel commands.
+- A venue/account boundary with settled cash, book-derived reserved cash, position, open-order exposure, durable account-open/order/cancel/replace commands, and balanced in-memory journal entries.
 - Versioned, idempotent commands and structured events. A retry never executes another turn.
 - A fsynced JSONL command/result record per local game, replay on restart, and retained terminal sessions.
 - A local-only v2 HTTP API, browser client, and CLI that all use the same exchange kernel.

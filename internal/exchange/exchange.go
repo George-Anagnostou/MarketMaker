@@ -140,16 +140,17 @@ type Trade struct {
 }
 
 type Event struct {
-	Sequence  uint64        `json:"sequence"`
-	CommandID string        `json:"command_id,omitempty"`
-	Type      string        `json:"type"`
-	Order     *Order        `json:"order,omitempty"`
-	Trade     *Trade        `json:"trade,omitempty"`
-	Account   *AccountState `json:"account,omitempty"`
-	Amount    fixed.Money   `json:"amount,omitempty"`
-	Mark      fixed.Price   `json:"mark,omitempty"`
-	Reason    EndReason     `json:"reason,omitempty"`
-	Message   string        `json:"message,omitempty"`
+	Sequence      uint64        `json:"sequence"`
+	CommandID     string        `json:"command_id,omitempty"`
+	Type          string        `json:"type"`
+	Order         *Order        `json:"order,omitempty"`
+	PreviousOrder *Order        `json:"previous_order,omitempty"`
+	Trade         *Trade        `json:"trade,omitempty"`
+	Account       *AccountState `json:"account,omitempty"`
+	Amount        fixed.Money   `json:"amount,omitempty"`
+	Mark          fixed.Price   `json:"mark,omitempty"`
+	Reason        EndReason     `json:"reason,omitempty"`
+	Message       string        `json:"message,omitempty"`
 }
 
 type Summary struct {
@@ -201,11 +202,12 @@ type Command struct {
 }
 
 const (
-	CommandOpenAccount = "open_account"
-	CommandPlaceOrder  = "place_order"
-	CommandCancelOrder = "cancel_order"
-	CommandSubmitQuote = "submit_quote" // scenario adapter, not a venue primitive
-	CommandQuit        = "quit"         // scenario adapter, not a venue primitive
+	CommandOpenAccount  = "open_account"
+	CommandPlaceOrder   = "place_order"
+	CommandCancelOrder  = "cancel_order"
+	CommandReplaceOrder = "replace_order"
+	CommandSubmitQuote  = "submit_quote" // scenario adapter, not a venue primitive
+	CommandQuit         = "quit"         // scenario adapter, not a venue primitive
 )
 
 // Engine owns the authoritative account state and price-time-priority book.
@@ -215,6 +217,7 @@ type Engine struct {
 	rng       *rand.Rand
 	accounts  map[string]*Account
 	book      *orderbook.Book
+	ledger    ledger
 	nextOrder uint64
 	nextTrade uint64
 	nextEvent uint64
@@ -229,9 +232,12 @@ func New(cfg Config) (*Engine, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	e := &Engine{cfg: cfg, rng: rand.New(rand.NewPCG(cfg.Seed, cfg.Seed>>1)), accounts: map[string]*Account{}, book: orderbook.New(), mark: cfg.StartingMark}
+	e := &Engine{cfg: cfg, rng: rand.New(rand.NewPCG(cfg.Seed, cfg.Seed>>1)), accounts: map[string]*Account{}, book: orderbook.New(), ledger: newLedger(), mark: cfg.StartingMark}
 	e.accounts[PlayerAccount] = &Account{ID: PlayerAccount, Cash: cfg.StartingCash, Position: cfg.StartingPosition}
 	e.accounts[FlowAccount] = &Account{ID: FlowAccount, External: true}
+	if err := e.postOpening(PlayerAccount, cfg.StartingCash, cfg.StartingPosition); err != nil {
+		return nil, err
+	}
 	if !e.accountWithinLimits(PlayerAccount, false) {
 		return nil, errors.New("starting account violates configured risk limits")
 	}
@@ -271,6 +277,9 @@ func (e *Engine) Account(accountID string) (AccountState, bool) {
 	return AccountState{ID: account.ID, Cash: account.Cash, ReservedCash: account.ReservedCash, AvailableCash: available, Position: account.Position, OpenBuyQuantity: account.OpenBuyQuantity, OpenSellQuantity: account.OpenSellQuantity, Equity: equity}, true
 }
 
+func (e *Engine) LedgerEntries() []LedgerEntry                { return e.ledger.entriesCopy() }
+func (e *Engine) LedgerBalance(account LedgerAccount) Posting { return e.ledger.balance(account) }
+
 // AddAccount creates a real account. It is the in-process primitive used by
 // future authenticated account provisioning; the local game only creates player.
 func (e *Engine) AddAccount(id string, cash fixed.Money, position fixed.Qty) error {
@@ -281,6 +290,10 @@ func (e *Engine) AddAccount(id string, cash fixed.Money, position fixed.Qty) err
 	if !e.accountWithinLimits(id, false) {
 		delete(e.accounts, id)
 		return errors.New("account violates configured risk limits")
+	}
+	if err := e.postOpening(id, cash, position); err != nil {
+		delete(e.accounts, id)
+		return err
 	}
 	return nil
 }
@@ -309,6 +322,8 @@ func (e *Engine) Execute(command Command) (Result, error) {
 		return e.PlaceLimit(command.AccountID, command.Side, command.Price, command.Quantity, command.TIF)
 	case CommandCancelOrder:
 		return e.Cancel(command.AccountID, command.OrderID)
+	case CommandReplaceOrder:
+		return e.ReplaceLimit(command.AccountID, command.OrderID, command.Side, command.Price, command.Quantity, command.TIF)
 	default:
 		return Result{State: e.State()}, fmt.Errorf("unsupported command type %q", command.Type)
 	}
@@ -361,6 +376,53 @@ func (e *Engine) Cancel(accountID string, orderID uint64) (Result, error) {
 	e.version++
 	exchangeOrder := fromBookOrder(order)
 	return Result{State: e.State(), Events: []Event{e.emit(Event{Type: "order_canceled", Order: copyOrder(&exchangeOrder)})}}, nil
+}
+
+// ReplaceLimit atomically removes a live order and submits its replacement.
+// The caller supplies a new price/quantity but cannot change side; use cancel
+// plus a new order for an intentional side change. A replacement always gets
+// a new sequence and loses its prior queue position.
+func (e *Engine) ReplaceLimit(accountID string, oldOrderID uint64, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) (Result, error) {
+	if e.isOver {
+		return Result{State: e.State()}, errors.New("game is over")
+	}
+	if side != Buy && side != Sell || !price.Positive() || !qty.Positive() || (tif != GTC && tif != IOC) {
+		return Result{State: e.State()}, errors.New("invalid replacement")
+	}
+	oldBookOrder, ok := e.book.Order(oldOrderID)
+	if !ok || oldBookOrder.OwnerID != accountID {
+		return Result{State: e.State()}, errors.New("order not found")
+	}
+	if Side(oldBookOrder.Side) != side {
+		return Result{State: e.State()}, errors.New("replacement side must match existing order")
+	}
+	if !e.canPlaceExcluding(accountID, side, price, qty, oldOrderID) {
+		return Result{State: e.State()}, errors.New("replacement would violate cash, position, or initial-margin limits")
+	}
+	replacement := &Order{ID: e.nextOrder + 1, Sequence: e.nextOrder + 1, AccountID: accountID, Side: side, Price: price, Quantity: qty, Remaining: qty, TIF: tif}
+	if _, err := e.book.PreviewReplace(oldOrderID, toBookOrder(*replacement), orderbook.RejectTaker); err != nil {
+		return Result{State: e.State()}, err
+	}
+	e.nextOrder++
+	report, err := e.book.Replace(oldOrderID, toBookOrder(*replacement), orderbook.RejectTaker)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	trades, err := e.settleReport(report)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	if err := e.reconcileReservations(); err != nil {
+		return Result{State: e.State()}, err
+	}
+	oldOrder := fromBookOrder(oldBookOrder)
+	events := []Event{e.emit(Event{Type: "order_replaced", PreviousOrder: copyOrder(&oldOrder), Order: copyOrder(replacement)})}
+	for _, trade := range trades {
+		events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
+	}
+	events = append(events, e.emitLifecycle(report)...)
+	e.version++
+	return Result{State: e.State(), Events: events}, nil
 }
 
 func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
@@ -457,6 +519,10 @@ func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
 }
 
 func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fixed.Qty) bool {
+	return e.canPlaceExcluding(accountID, side, price, qty, 0)
+}
+
+func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Price, qty fixed.Qty, excludedOrderID uint64) bool {
 	account := e.accounts[accountID]
 	if account.External {
 		return true
@@ -467,6 +533,9 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 	}
 	longWorst, shortWorst := account.Position, account.Position
 	for _, order := range e.book.Orders(accountID) {
+		if order.ID == excludedOrderID {
+			continue
+		}
 		var err error
 		if order.Side == orderbook.Buy {
 			longWorst, err = fixed.AddQty(longWorst, order.Remaining)
@@ -499,6 +568,9 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 	}
 	reservedBuy := fixed.Money(0)
 	for _, order := range e.book.Orders(accountID) {
+		if order.ID == excludedOrderID {
+			continue
+		}
 		if order.OwnerID == accountID {
 			n, err := fixed.Notional(order.Price, order.Remaining)
 			if err != nil {
@@ -537,36 +609,74 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 // Keeping reservations derived for now avoids a second mutable source of truth
 // while giving account consumers explicit available and committed balances.
 func (e *Engine) reconcileReservations() error {
-	for _, account := range e.accounts {
-		account.ReservedCash = 0
-		account.OpenBuyQuantity = 0
-		account.OpenSellQuantity = 0
+	type reservation struct {
+		cash      fixed.Money
+		buy, sell fixed.Qty
 	}
+	desired := make(map[string]reservation, len(e.accounts))
 	for _, order := range e.book.Orders("") {
 		account := e.accounts[order.OwnerID]
 		if account == nil {
 			return errors.New("book references unknown account")
 		}
+		if account.External {
+			continue
+		}
+		current := desired[order.OwnerID]
 		if order.Side == orderbook.Buy {
 			notional, err := fixed.Notional(order.Price, order.Remaining)
 			if err != nil {
 				return err
 			}
-			account.ReservedCash, err = fixed.AddMoney(account.ReservedCash, notional)
+			current.cash, err = fixed.AddMoney(current.cash, notional)
 			if err != nil {
 				return err
 			}
-			account.OpenBuyQuantity, err = fixed.AddQty(account.OpenBuyQuantity, order.Remaining)
+			current.buy, err = fixed.AddQty(current.buy, order.Remaining)
 			if err != nil {
 				return err
 			}
 		} else {
 			var err error
-			account.OpenSellQuantity, err = fixed.AddQty(account.OpenSellQuantity, order.Remaining)
+			current.sell, err = fixed.AddQty(current.sell, order.Remaining)
 			if err != nil {
 				return err
 			}
 		}
+		desired[order.OwnerID] = current
+	}
+	postings := make([]Posting, 0)
+	for id, account := range e.accounts {
+		if account.External {
+			continue
+		}
+		next := desired[id]
+		cashDelta, err := fixed.AddMoney(next.cash, -account.ReservedCash)
+		if err != nil {
+			return err
+		}
+		sellDelta, err := fixed.SubQty(next.sell, account.OpenSellQuantity)
+		if err != nil {
+			return err
+		}
+		if cashDelta != 0 {
+			postings = append(postings, Posting{Account: cashAvailable(id), Money: -cashDelta}, Posting{Account: cashReserved(id), Money: cashDelta})
+		}
+		if sellDelta != 0 {
+			postings = append(postings, Posting{Account: instrumentAvailable(id), Instrument: -sellDelta}, Posting{Account: instrumentReserved(id), Instrument: sellDelta})
+		}
+	}
+	if len(postings) > 0 {
+		if err := e.ledger.append(LedgerEntry{Type: "order_reservation_updated", Postings: postings}); err != nil {
+			return err
+		}
+	}
+	for id, account := range e.accounts {
+		if account.External {
+			continue
+		}
+		next := desired[id]
+		account.ReservedCash, account.OpenBuyQuantity, account.OpenSellQuantity = next.cash, next.buy, next.sell
 	}
 	return nil
 }
@@ -635,6 +745,11 @@ func (e *Engine) advance(events *[]Event) Summary {
 	}
 	player := e.accounts[PlayerAccount]
 	storage, _ := fixed.Notional(e.cfg.StoragePerUnit, fixed.AbsQty(player.Position))
+	if storage > 0 {
+		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(PlayerAccount), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
+			panic(err)
+		}
+	}
 	player.Cash -= storage
 	s.StorageCost = storage
 	if storage > 0 {
@@ -691,6 +806,14 @@ func (e *Engine) submitBookOrder(order *Order) ([]Trade, orderbook.Report, error
 	if err != nil {
 		return nil, orderbook.Report{}, err
 	}
+	trades, err := e.settleReport(report)
+	if err != nil {
+		return nil, orderbook.Report{}, err
+	}
+	return trades, report, nil
+}
+
+func (e *Engine) settleReport(report orderbook.Report) ([]Trade, error) {
 	trades := make([]Trade, 0, len(report.Fills))
 	for _, fill := range report.Fills {
 		e.nextTrade++
@@ -701,11 +824,11 @@ func (e *Engine) submitBookOrder(order *Order) ([]Trade, orderbook.Report, error
 			trade.BuyerID, trade.SellerID = fill.Maker.OwnerID, fill.Taker.OwnerID
 		}
 		if err := e.applyTrade(trade); err != nil {
-			return nil, orderbook.Report{}, err
+			return nil, err
 		}
 		trades = append(trades, trade)
 	}
-	return trades, report, nil
+	return trades, nil
 }
 
 func (e *Engine) applyTrade(trade Trade) error {
@@ -728,6 +851,12 @@ func (e *Engine) applyTrade(trade Trade) error {
 	}
 	sellerPosition, err := fixed.SubQty(seller.Position, trade.Quantity)
 	if err != nil {
+		return err
+	}
+	if err := e.ledger.append(LedgerEntry{Type: "trade_settled", Reference: LedgerReference{TradeID: trade.ID}, Postings: []Posting{
+		{Account: cashAvailable(trade.BuyerID), Money: -n}, {Account: cashAvailable(trade.SellerID), Money: n},
+		{Account: instrumentAvailable(trade.BuyerID), Instrument: trade.Quantity}, {Account: instrumentAvailable(trade.SellerID), Instrument: -trade.Quantity},
+	}}); err != nil {
 		return err
 	}
 	buyer.Cash, seller.Cash = buyerCash, sellerCash
@@ -764,6 +893,11 @@ func (e *Engine) emitLifecycle(report orderbook.Report) []Event {
 
 func toBookOrder(order Order) orderbook.Order {
 	return orderbook.Order{ID: order.ID, Sequence: order.Sequence, OwnerID: order.AccountID, Side: orderbook.Side(order.Side), Price: order.Price, Quantity: order.Quantity, Remaining: order.Remaining, TIF: orderbook.TimeInForce(order.TIF)}
+}
+
+func (e *Engine) postOpening(id string, cash fixed.Money, position fixed.Qty) error {
+	postings := []Posting{{Account: cashAvailable(id), Money: cash}, {Account: openingCashAccount, Money: -cash}, {Account: instrumentAvailable(id), Instrument: position}, {Account: openingInstrumentAccount, Instrument: -position}}
+	return e.ledger.append(LedgerEntry{Type: "account_opened", Postings: postings})
 }
 func fromBookOrder(order orderbook.Order) Order {
 	return Order{ID: order.ID, Sequence: order.Sequence, AccountID: order.OwnerID, Side: Side(order.Side), Price: order.Price, Quantity: order.Quantity, Remaining: order.Remaining, TIF: TimeInForce(order.TIF)}

@@ -220,6 +220,114 @@ func TestOpenAccountIsAVersionedVenueCommand(t *testing.T) {
 	}
 }
 
+func TestReplaceIsAtomicAndSettlesAtMakerPrice(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "1"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := initial.Events[0].Order.ID
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.ReplaceLimit(PlayerAccount, oldID, Buy, mustPrice(t, "101"), mustQty(t, "1"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Events[0].Type != "order_replaced" || result.Events[0].PreviousOrder.ID != oldID || result.Events[0].Order.ID == oldID {
+		t.Fatalf("events=%+v", result.Events)
+	}
+	if _, ok := e.book.Order(oldID); ok {
+		t.Fatal("old order remains live")
+	}
+	state, _ := e.Account(PlayerAccount)
+	if state.Cash != mustMoney(t, "99900") || state.Position != mustQty(t, "1") || state.ReservedCash != 0 {
+		t.Fatalf("account=%+v", state)
+	}
+	assertLedgerMatchesAccounts(t, e)
+}
+
+func TestRejectedReplaceLeavesVenueUntouched(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "1"), GTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := placed.Events[0].Order.ID
+	beforeState := e.State()
+	beforeLedger := len(e.LedgerEntries())
+	if _, err := e.ReplaceLimit(PlayerAccount, oldID, Sell, mustPrice(t, "101"), mustQty(t, "1"), GTC); err == nil {
+		t.Fatal("expected side-change rejection")
+	}
+	if e.State() != beforeState || len(e.LedgerEntries()) != beforeLedger {
+		t.Fatal("rejected replace changed venue state")
+	}
+	order, ok := e.book.Order(oldID)
+	if !ok || order.Remaining != mustQty(t, "1") {
+		t.Fatalf("old order=%+v", order)
+	}
+	assertLedgerMatchesAccounts(t, e)
+}
+
+func TestLedgerEntriesBalanceAndMatchAccountProjections(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Cancel(PlayerAccount, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertLedgerMatchesAccounts(t, e)
+}
+
+func assertLedgerMatchesAccounts(t *testing.T, e *Engine) {
+	t.Helper()
+	for _, entry := range e.LedgerEntries() {
+		money, instrument := fixed.Money(0), fixed.Qty(0)
+		for _, posting := range entry.Postings {
+			money += posting.Money
+			instrument += posting.Instrument
+		}
+		if money != 0 || instrument != 0 {
+			t.Fatalf("unbalanced ledger entry=%+v", entry)
+		}
+	}
+	for id, account := range e.accounts {
+		cash := e.LedgerBalance(cashAvailable(id)).Money + e.LedgerBalance(cashReserved(id)).Money
+		position := e.LedgerBalance(instrumentAvailable(id)).Instrument + e.LedgerBalance(instrumentReserved(id)).Instrument
+		if cash != account.Cash || position != account.Position {
+			t.Fatalf("ledger projection account=%s cash=%s/%s position=%s/%s", id, cash, account.Cash, position, account.Position)
+		}
+	}
+}
+
 func TestDeterministicResults(t *testing.T) {
 	e1, err := New(config(t))
 	if err != nil {

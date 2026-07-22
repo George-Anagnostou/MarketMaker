@@ -64,7 +64,9 @@ The matching foundation has three deliberate layers:
 
 Venue account state separates settled cash from `reserved_cash`, and reports open buy/sell quantity plus available cash. Live orders derive reservations, so cancellation and partial/full fill release the correct amount automatically.
 
-The current durable venue commands are `open_account`, `place_order`, and `cancel_order`. Funding, withdrawals, replace, fees, and liquidation remain deferred until the double-entry ledger exists. `submit_quote` and `quit` are temporary scenario commands, not part of the future bot-facing venue contract.
+The current durable venue commands are `open_account`, `place_order`, `cancel_order`, and `replace_order`. A replacement atomically removes one live order and accepts a new same-side order after risk and self-trade checks against a preview without the old order. It receives a new order ID and loses queue priority.
+
+The venue also has an append-only double-entry journal. Opening balances, reservation movements, settled trades, and storage charges each balance independently in cash and instrument units. Account fields remain verified projections during this transition; deposits, withdrawals, fees, and liquidation remain deferred until ledger persistence and authorization are introduced. `submit_quote` and `quit` are temporary scenario commands, not part of the future bot-facing venue contract.
 
 ## Architecture
 
