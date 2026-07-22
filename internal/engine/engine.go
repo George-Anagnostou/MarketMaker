@@ -43,7 +43,7 @@ func NewEngine(cfg types.GameConfig) *Engine {
 	}
 	r := rand.New(rand.NewPCG(uint64(seed), uint64(seed>>32)))
 
-	return &Engine{
+	e := &Engine{
 		cfg:       cfg,
 		rng:       r,
 		cash:      cfg.StartingCash,
@@ -51,6 +51,8 @@ func NewEngine(cfg types.GameConfig) *Engine {
 		lastPrice: cfg.StartingPrice,
 		turn:      0,
 	}
+	e.maxAbsInventory = math.Abs(cfg.StartingInventory)
+	return e
 }
 
 // Step executes one turn with the player's bid/ask against generated flow.
