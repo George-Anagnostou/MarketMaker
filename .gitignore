@@ -3,3 +3,5 @@ market-maker
 tmp/
 *.test
 .DS_Store
+data/
+.env
