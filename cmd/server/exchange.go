@@ -293,7 +293,7 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry := s.entries[id]; entry != nil {
-		if entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg || !reflect.DeepEqual(entry.log.Meta().Scenario, snapshot) {
+		if entry.log.Meta().CreateCommandID != createCommandID || !sameScenario(entry.log.Meta().Scenario, snapshot) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, nil
@@ -305,7 +305,7 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, snapshot)
 	if errors.Is(err, os.ErrExist) {
 		entry, loadErr := s.loadLocked(id)
-		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg || !reflect.DeepEqual(entry.log.Meta().Scenario, snapshot)) {
+		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || !sameScenario(entry.log.Meta().Scenario, snapshot)) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, loadErr
@@ -316,6 +316,13 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: snapshot}
 	s.entries[id] = entry
 	return entry, true, nil
+}
+
+func sameScenario(stored, requested *scenario.Snapshot) bool {
+	if stored == nil || requested == nil {
+		return stored == requested
+	}
+	return stored.ID == requested.ID
 }
 
 func (s *exchangeService) load(id string) (*exchangeEntry, error) {

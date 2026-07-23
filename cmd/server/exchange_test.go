@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"market-maker/internal/scenario"
 )
 
 const testGameID = "11111111-1111-4111-8111-111111111111"
@@ -202,5 +205,37 @@ func TestV2CreateIsIdempotentOnlyForMatchingRequest(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("conflict status=%d", resp.StatusCode)
+	}
+}
+
+func TestCreateRetryUsesPersistedScenarioIdentity(t *testing.T) {
+	svc := newExchangeService(t.TempDir())
+	first, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	original := first.Snapshot()
+	entry, created, err := svc.createOrLoad(testGameID, testCreateID, first.Config, &original)
+	if err != nil || !created {
+		t.Fatalf("create: entry=%v created=%t err=%v", entry != nil, created, err)
+	}
+
+	updated := original
+	updated.Revision = "next"
+	updated.Title = "Updated first spread"
+	changedConfig := first.Config
+	changedConfig.NumTurns++
+	retry, created, err := svc.createOrLoad(testGameID, testCreateID, changedConfig, &updated)
+	if err != nil || created || retry != entry {
+		t.Fatalf("retry: entry=%v created=%t err=%v", retry == entry, created, err)
+	}
+
+	second, ok := scenario.Get("inventory-pressure-v1")
+	if !ok {
+		t.Fatal("missing second scenario")
+	}
+	other := second.Snapshot()
+	if _, _, err := svc.createOrLoad(testGameID, testCreateID, second.Config, &other); !errors.Is(err, errCreateConflict) {
+		t.Fatalf("different scenario error=%v", err)
 	}
 }
