@@ -33,6 +33,7 @@ func main() {
 	srv := newServer()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
+	mux.HandleFunc("/api/v2/scenarios", srv.v2.handleScenarios)
 	mux.HandleFunc("/api/v2/games", srv.v2.handleGames)
 	mux.HandleFunc("/api/v2/games/", srv.v2.handleGame)
 

@@ -14,26 +14,30 @@ import (
 	"time"
 
 	"market-maker/internal/exchange"
+	"market-maker/internal/scenario"
 )
 
 const SchemaVersion = 1
 
 type Meta struct {
-	Schema          int             `json:"schema"`
-	GameID          string          `json:"game_id"`
-	OwnerID         string          `json:"owner_id"`
-	CreateCommandID string          `json:"create_command_id"`
-	CreatedAt       time.Time       `json:"created_at"`
-	Config          exchange.Config `json:"config"`
+	Schema          int                `json:"schema"`
+	GameID          string             `json:"game_id"`
+	OwnerID         string             `json:"owner_id"`
+	CreateCommandID string             `json:"create_command_id"`
+	CreatedAt       time.Time          `json:"created_at"`
+	Config          exchange.Config    `json:"config"`
+	Scenario        *scenario.Snapshot `json:"scenario,omitempty"`
 }
 
 type Record struct {
-	Schema           int              `json:"schema"`
-	Version          uint64           `json:"version"`
-	PreviousChecksum string           `json:"previous_checksum,omitempty"`
-	Checksum         string           `json:"checksum"`
-	Command          exchange.Command `json:"command"`
-	Result           exchange.Result  `json:"result"`
+	Schema           int                `json:"schema"`
+	Version          uint64             `json:"version"`
+	PreviousChecksum string             `json:"previous_checksum,omitempty"`
+	Checksum         string             `json:"checksum"`
+	Command          exchange.Command   `json:"command"`
+	Result           exchange.Result    `json:"result"`
+	Coaching         *scenario.Coaching `json:"coaching,omitempty"`
+	Recap            *scenario.Recap    `json:"recap,omitempty"`
 }
 
 type Log struct {
@@ -43,7 +47,7 @@ type Log struct {
 	nextVersion  uint64
 }
 
-func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) (*Log, error) {
+func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -63,7 +67,7 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) 
 	if createCommandID == "" {
 		return nil, errors.New("create command id is required")
 	}
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg}
+	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg, Scenario: snapshot}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err

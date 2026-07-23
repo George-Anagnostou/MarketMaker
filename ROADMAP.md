@@ -10,6 +10,7 @@ The project now has a coherent local exchange foundation:
 - A venue/account boundary with settled cash, book-derived reserved cash, position, open-order exposure, durable account-open/order/cancel/replace commands, and balanced in-memory journal entries.
 - Versioned, idempotent commands and structured events. A retry never executes another turn.
 - A fsynced JSONL command/result record per local game, replay on restart, and retained terminal sessions.
+- A server-owned catalog of curated lessons with persisted snapshots, deterministic turn coaching, and terminal P&L recaps.
 - A local-only v2 HTTP API, browser client, and CLI that all use the same exchange kernel.
 
 This is a sound simulation kernel, not yet a shared real-time venue. Known constraints are intentional and should guide the next work:
@@ -17,7 +18,7 @@ This is a sound simulation kernel, not yet a shared real-time venue. Known const
 - The HTTP scenario API intentionally exposes only player quote/quit commands until authenticated account ownership exists. The venue supports multi-account order primitives internally.
 - The book uses deterministic price levels and FIFO queues. It is correct for a single instrument, but it still needs per-instrument sharding and performance profiling before high order counts.
 - Time advances when a player submits a quote. There is no independent market clock, latency model, or scheduled event queue.
-- JSONL storage is single-process and local. It has no snapshots, integrity hash chain, schema migration, or cross-process lock.
+- JSONL storage is single-process and local. It has no compaction snapshots, schema migration, or cross-process lock; committed records are integrity hash-chained.
 - Risk has a balanced in-memory journal and conservative order-entry checks, but still lacks collateral/borrow models, forced liquidation, and kill switches.
 - The browser restores an active game state but does not yet rebuild full chart history after refresh.
 - There is no browser test suite, CI pipeline, metrics, tracing, structured logs, health endpoint, graceful shutdown, or packaged static assets.
@@ -37,7 +38,7 @@ This is a sound simulation kernel, not yet a shared real-time venue. Known const
 1. Split deterministic random streams for customer flow, reference price, news, and regime changes; persist the effective scenario and engine version.
 2. Add an independent simulation clock, scheduled arrivals, cancel/replace latency, exchange sequencing, and deterministic tie-breaking.
 3. Model informed flow, adverse selection, inventory-sensitive customer behavior, market regimes, volatility clusters, outages, and liquidity shocks.
-4. Add scenario definitions with server-approved parameters, public/private seeds, scorecards, benchmark market-makers, and replayable historical runs.
+4. Extend curated scenarios with public/private seeds, scorecards, benchmark market-makers, and replayable historical runs.
 5. Add bot execution constraints: API quotas, CPU/wall-clock budgets, network latency profiles, fault injection, and simulation isolation.
 
 ## Platform Wave

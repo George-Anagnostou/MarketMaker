@@ -70,6 +70,7 @@
   .turn-heading h2 { font-size: 21px; }
   .turn-status { color: var(--ink-soft); font-size: 12px; }
   .story { color: var(--ink-soft); line-height: 1.45; margin: 0 0 12px; font-size: 13px; }
+  .coaching { margin: 0 0 12px; padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; font-size: 12px; line-height: 1.4; }
   .fill-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
   .fill { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 7px; background: #f6f2ea; font-size: 12px; font-variant-numeric: tabular-nums; }
   .fill strong { color: var(--ink); }
@@ -90,16 +91,24 @@
   summary { cursor: pointer; color: var(--ink-soft); font-size: 13px; font-weight: 650; }
   .scenario-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin: 12px 0; }
   .scenario-grid label { color: var(--ink-soft); font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
-  .scenario-grid input { display: block; width: 100%; margin-top: 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--ink); padding: 7px; font: 12px ui-monospace, monospace; }
   .scenario-actions { display: flex; gap: 9px; }
   .quiet { color: var(--ink-soft); font-size: 12px; }
+  .scenario-card { margin-top: 12px; padding: 14px 16px; }
+  .scenario-card-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
+  .scenario-card h3 { margin: 3px 0 0; font: 500 20px/1 Georgia, "Times New Roman", serif; letter-spacing: -.025em; }
+  .scenario-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+  .scenario-option { text-align: left; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); padding: 10px; min-height: 86px; }
+  .scenario-option:hover, .scenario-option[aria-pressed="true"] { border-color: var(--pine); background: var(--pine-soft); }
+  .scenario-option strong { display: block; font-size: 13px; margin-bottom: 4px; }
+  .scenario-option span { display: block; color: var(--ink-soft); font-size: 11px; line-height: 1.35; }
+  .objective { margin: 11px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
   @media (max-width: 780px) {
     .shell { padding: 0 16px 32px; }
     .masthead { min-height: 72px; }
     .intro, .quote-top { align-items: start; flex-direction: column; }
     .mark { text-align: left; }
     .desk, .turn-grid { grid-template-columns: 1fr; }
-    .scenario-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .scenario-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } }
 </style>
@@ -136,11 +145,18 @@
       </aside>
     </section>
 
+    <section class="card scenario-card" aria-label="Scenario selection">
+      <div class="scenario-card-head"><div><div class="section-label">Choose a lesson</div><h3 id="scenario-title">Loading scenarios…</h3></div><span id="scenario-turns" class="quiet"></span></div>
+      <p id="scenario-brief" class="objective"></p>
+      <div id="scenario-options" class="scenario-options"></div>
+      <p id="scenario-objective" class="objective"></p>
+    </section>
+
     <section class="turn-grid">
       <article class="card turn-card">
         <div class="turn-heading"><div><div class="section-label">What just happened</div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status">No turn submitted</span></div>
         <div id="turn-empty" class="turn-empty">Your next quote will turn market flow into a short, reviewable story.</div>
-        <div id="turn-detail" hidden><p id="turn-story" class="story"></p><ul id="fillsbody" class="fill-list"></ul></div>
+        <div id="turn-detail" hidden><p id="turn-story" class="story"></p><p id="coaching" class="coaching" hidden></p><ul id="fillsbody" class="fill-list"></ul></div>
       </article>
       <article class="card history-card">
         <div class="section-label" style="margin-bottom:14px">Session path</div>
@@ -151,19 +167,9 @@
     <section id="gamesummary" class="card summary"><div class="section-label">Session complete</div><h2>Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
 
     <details>
-      <summary>Scenario settings</summary>
-      <div class="scenario-grid">
-        <label>Turns<input id="turns" type="number" value="10" min="0"></label>
-        <label>Seed<input id="seed" type="number" value="42"></label>
-        <label>Starting cash<input id="startcash" type="number" value="100000" step="1000"></label>
-        <label>Starting inventory<input id="startinv" type="number" value="0" step="1"></label>
-        <label>Starting mark<input id="startprice" type="number" value="100" step="0.5"></label>
-        <label>Storage / unit<input id="storage" type="number" value="1" step="0.1"></label>
-        <label>Min move %<input id="volmin" type="number" value="-0.5" step="0.1"></label>
-        <label>Max move %<input id="volmax" type="number" value="3" step="0.1"></label>
-      </div>
-      <div class="scenario-actions"><button class="secondary" onclick="startNewGame()">Start new session</button><button class="secondary" onclick="startDefault()">Restore defaults</button><button class="secondary" onclick="quitSession()">End current session</button></div>
-      <p class="quiet">A fixed seed makes the same scenario reproducible. Zero turns means practice until you end the session or fail risk limits.</p>
+      <summary>Session controls</summary>
+      <div class="scenario-actions" style="margin-top:12px"><button class="secondary" onclick="startNewGame()">Start selected lesson</button><button class="secondary" onclick="quitSession()">End current session</button></div>
+      <p class="quiet">Lessons use server-owned, fixed scenarios so the same session can be replayed and compared fairly.</p>
     </details>
   </main>
 </div>
@@ -171,6 +177,7 @@
 <script>
 let gameId = null, version = 0, isOver = false, startingEquity = 0, history = [];
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
+let scenarios = [], selectedScenarioID = null;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const newID = () => crypto.randomUUID();
@@ -185,7 +192,7 @@ function updateQuotePreview() {
 }
 ['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));
 
-function setState(state, summary) {
+function setState(state, summary, recap) {
   const equity = state.cash + state.inventory * state.mark;
   const pnl = equity - startingEquity;
   $('turn').textContent = `Turn ${state.turn}${state.isOver ? ' · complete' : ''}`;
@@ -204,7 +211,7 @@ function setState(state, summary) {
   $('submitbtn').disabled = !gameId || isOver || Boolean(pendingCommand);
   $('bid').disabled = !gameId || isOver;
   $('ask').disabled = !gameId || isOver;
-  if (state.isOver) showSummary(state, summary);
+  if (state.isOver) showSummary(state, recap);
 }
 
 function addHistory(state, summary) {
@@ -228,6 +235,8 @@ function renderTurn(result) {
   const flow = fills.length ? `${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : 'No customer flow crossed your quote this turn.';
   const move = mark ? ` The reference mark finished at ${money(state.mark)}.` : '';
   $('turn-story').textContent = `${flow}${storage > 0 ? ` Storage cost ${money(storage)}.` : ''}${move}`;
+  if (result.coaching) { $('coaching').hidden = false; $('coaching').textContent = `${result.coaching.title}: ${result.coaching.body}`; }
+  else { $('coaching').hidden = true; }
   const list = $('fillsbody'); list.innerHTML = '';
   for (const event of fills) {
     const trade = event.trade, bought = trade.buyer_id === 'player';
@@ -237,22 +246,40 @@ function renderTurn(result) {
   }
 }
 
+function applyScenario(snapshot) {
+  if (!snapshot) return;
+  $('scenario-title').textContent = snapshot.title; $('scenario-brief').textContent = snapshot.briefing;
+  $('scenario-objective').textContent = `Goal: ${snapshot.objective}`; $('scenario-turns').textContent = `${snapshot.turns} turns`;
+}
+function renderScenarios() {
+  const list = $('scenario-options'); list.innerHTML = '';
+  for (const snapshot of scenarios) {
+    const button = document.createElement('button'); button.className = 'scenario-option'; button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
+    button.innerHTML = `<strong>${snapshot.title}</strong><span>${snapshot.briefing}</span>`;
+    button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(); };
+    list.appendChild(button);
+  }
+}
+async function loadScenarios() {
+  try {
+    const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
+    const data = await response.json(); scenarios = data.scenarios || [];
+    if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
+    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios();
+  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; }
+}
 async function startNewGame() {
-  const turns = Number($('turns').value), seed = Number($('seed').value), minMove = Number($('volmin').value), maxMove = Number($('volmax').value);
-  const cash = $('startcash').value.trim(), position = $('startinv').value.trim(), mark = $('startprice').value.trim(), storage = $('storage').value.trim();
-  if (!Number.isInteger(turns) || turns < 0 || !Number.isFinite(seed) || !Number.isFinite(minMove) || !Number.isFinite(maxMove) || !cash || !position || !mark || !storage) { alert('Enter valid scenario settings.'); return; }
-  const request = {game_id:newID(), command_id:newID(), config:{num_turns:turns, seed:Math.trunc(seed), starting_cash:cash, starting_position:position, starting_mark:mark, storage_per_unit:storage, initial_margin_bps:5000, maintenance_margin_bps:2500, max_position:'1000', max_orders_per_turn:5, max_order_qty:'10', max_flow_slippage_bps:200, min_move_bps:Math.round(minMove*100), max_move_bps:Math.round(maxMove*100)}};
+  if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return; }
+  const request = {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
   const response = await fetch('/api/v2/games', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(request)});
   if (!response.ok) { alert('Could not start this scenario.'); return; }
   const data = await response.json(), state = uiState(data.state);
   gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
   startingEquity = state.cash + state.inventory * state.mark; history = [];
   localStorage.setItem('mmg.game_id', gameId); localStorage.setItem('mmg.starting_equity', String(startingEquity));
-  $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('gamesummary').style.display = 'none'; $('historybody').innerHTML = '';
-  setState(state); addHistory(state);
+  applyScenario(data.scenario); $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('coaching').hidden = true; $('gamesummary').style.display = 'none'; $('historybody').innerHTML = '';
+  setState(state, null, data.recap); addHistory(state);
 }
-
-function startDefault() { $('turns').value=10; $('seed').value=42; $('startcash').value=100000; $('startinv').value=0; $('startprice').value=100; $('storage').value=1; $('volmin').value=-0.5; $('volmax').value=3; startNewGame(); }
 
 async function submitTurn() {
   if (!gameId || isOver || pendingCommand) return;
@@ -264,7 +291,7 @@ async function submitTurn() {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
     if (!response.ok) { alert(`Quote rejected: ${await response.text()}`); retryCommand = null; return; }
     const data = await response.json(), state = uiState(data.state); version = data.version; retryCommand = null;
-    renderTurn(data); setState(state, data.summary); addHistory(state, data.summary);
+    renderTurn(data); setState(state, data.summary, data.recap); addHistory(state, data.summary);
   } catch (_) { retryCommand = command; alert('Network error. Post the same quote again to recover safely.'); }
   finally { pendingCommand = null; if (!isOver) $('submitbtn').disabled = false; }
 }
@@ -275,24 +302,24 @@ async function quitSession() {
   try {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
     if (!response.ok) { alert(`Could not end session: ${await response.text()}`); retryQuitCommand = null; return; }
-    const data = await response.json(), state = uiState(data.state); version = data.version; retryQuitCommand = null; setState(state, data.summary);
+    const data = await response.json(), state = uiState(data.state); version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap);
   } catch (_) { retryQuitCommand = command; alert('Network error. End the session again to recover safely.'); }
   finally { pendingCommand = null; }
 }
 
-function showSummary(state) {
+function showSummary(state, recap) {
   const equity = state.cash + state.inventory * state.mark, pnl = equity - startingEquity;
-  $('summarycontent').textContent = `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start. Review the turns above: the key question is whether the spread you earned justified the inventory risk you carried.`;
+  $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
   $('gamesummary').style.display = 'block';
 }
-function playAgain() { gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; localStorage.removeItem('mmg.game_id'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('historybody').innerHTML=''; setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
+function playAgain() { gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; localStorage.removeItem('mmg.game_id'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
 function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
   const id = localStorage.getItem('mmg.game_id'); if (!id) return;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { localStorage.removeItem('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); gameId=data.game_id; version=data.version; startingEquity=Number(localStorage.getItem('mmg.starting_equity')) || state.cash + state.inventory * state.mark; setState(state); addHistory(state); } catch (_) { /* Keep ID for a later reconnect. */ }
+  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { localStorage.removeItem('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); gameId=data.game_id; version=data.version; startingEquity=Number(localStorage.getItem('mmg.starting_equity')) || state.cash + state.inventory * state.mark; applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); } catch (_) { /* Keep ID for a later reconnect. */ }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
-updateQuotePreview(); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); resumeGame();
+updateQuotePreview(); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); loadScenarios(); resumeGame();
 </script>
 </body>
 </html>
