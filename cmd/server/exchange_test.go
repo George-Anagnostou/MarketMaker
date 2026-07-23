@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 
+	"market-maker/internal/fixed"
 	"market-maker/internal/scenario"
 )
 
@@ -20,6 +22,10 @@ const testQuitID = "44444444-4444-4444-8444-444444444444"
 
 func v2Server(root string) *httptest.Server {
 	svc := newExchangeService(root)
+	return v2ServerForService(svc)
+}
+
+func v2ServerForService(svc *exchangeService) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v2/scenarios", svc.handleScenarios)
 	mux.HandleFunc("/api/v2/games", svc.handleGames)
@@ -132,30 +138,31 @@ func TestV2PersistsTerminalRecap(t *testing.T) {
 	root := t.TempDir()
 	ts := v2Server(root)
 	createV2Game(t, ts.URL)
-	quote := `{"id":"` + testQuoteID + `","type":"submit_quote","expected_version":0,"bid":"99.50","ask":"100.50"}`
-	resp, err := http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", bytes.NewBufferString(quote))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	quit := `{"id":"` + testQuitID + `","type":"quit","expected_version":1}`
-	resp, err = http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", bytes.NewBufferString(quit))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var terminal exchangeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&terminal); err != nil {
-		t.Fatal(err)
+	for turn := 0; turn < 8; turn++ {
+		commandID := fmt.Sprintf("44444444-4444-4444-8444-%012d", turn+1)
+		quote := fmt.Sprintf(`{"id":"%s","type":"submit_quote","expected_version":%d,"bid":"99.50","ask":"100.50"}`, commandID, turn)
+		resp, err := http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", bytes.NewBufferString(quote))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&terminal); err != nil {
+			resp.Body.Close()
+			t.Fatal(err)
+		}
+		resp.Body.Close()
 	}
-	resp.Body.Close()
 	if terminal.Recap == nil || terminal.Coaching == nil || !terminal.State.IsOver {
 		t.Fatalf("terminal=%+v", terminal)
+	}
+	if terminal.Recap.UnitsTraded < terminal.Summary.UnitsTraded || terminal.Recap.StoragePaid < terminal.Summary.StorageCost || terminal.Recap.MaxAbsInventory < fixed.AbsQty(terminal.State.Position) {
+		t.Fatalf("recap=%+v terminal summary=%+v", terminal.Recap, terminal.Summary)
 	}
 	ts.Close()
 
 	reloaded := v2Server(root)
 	defer reloaded.Close()
-	resp, err = http.Get(reloaded.URL + "/api/v2/games/" + testGameID)
+	resp, err := http.Get(reloaded.URL + "/api/v2/games/" + testGameID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +173,31 @@ func TestV2PersistsTerminalRecap(t *testing.T) {
 	resp.Body.Close()
 	if !reflect.DeepEqual(state.Recap, terminal.Recap) {
 		t.Fatalf("recap after reload=%+v", state.Recap)
+	}
+}
+
+func TestV2CreateRetrySurvivesCatalogRemoval(t *testing.T) {
+	root := t.TempDir()
+	ts := v2Server(root)
+	createV2Game(t, ts.URL)
+	ts.Close()
+
+	reloadedService := newExchangeService(root)
+	reloadedService.lookupScenario = func(string) (scenario.Definition, bool) { return scenario.Definition{}, false }
+	reloaded := v2ServerForService(reloadedService)
+	defer reloaded.Close()
+	body := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1"}`
+	resp, err := http.Post(reloaded.URL+"/api/v2/games", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var retried exchangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&retried); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !retried.Command.Replayed || retried.Scenario == nil || retried.Scenario.ID != "first-spread-v1" {
+		t.Fatalf("retry status=%d response=%+v", resp.StatusCode, retried)
 	}
 }
 
@@ -209,33 +241,33 @@ func TestV2CreateIsIdempotentOnlyForMatchingRequest(t *testing.T) {
 }
 
 func TestCreateRetryUsesPersistedScenarioIdentity(t *testing.T) {
-	svc := newExchangeService(t.TempDir())
+	root := t.TempDir()
+	svc := newExchangeService(root)
 	first, ok := scenario.Get("first-spread-v1")
 	if !ok {
 		t.Fatal("missing first scenario")
 	}
-	original := first.Snapshot()
-	entry, created, err := svc.createOrLoad(testGameID, testCreateID, first.Config, &original)
+	entry, created, err := svc.createOrLoad(testGameID, testCreateID, first.ID)
 	if err != nil || !created {
 		t.Fatalf("create: entry=%v created=%t err=%v", entry != nil, created, err)
 	}
 
-	updated := original
-	updated.Revision = "next"
-	updated.Title = "Updated first spread"
-	changedConfig := first.Config
-	changedConfig.NumTurns++
-	retry, created, err := svc.createOrLoad(testGameID, testCreateID, changedConfig, &updated)
+	retry, created, err := svc.createOrLoad(testGameID, testCreateID, first.ID)
 	if err != nil || created || retry != entry {
 		t.Fatalf("retry: entry=%v created=%t err=%v", retry == entry, created, err)
+	}
+	reloaded := newExchangeService(root)
+	reloaded.lookupScenario = func(string) (scenario.Definition, bool) { return scenario.Definition{}, false }
+	retry, created, err = reloaded.createOrLoad(testGameID, testCreateID, first.ID)
+	if err != nil || created || retry.log.Meta().Scenario.ID != first.ID {
+		t.Fatalf("persisted retry: created=%t err=%v", created, err)
 	}
 
 	second, ok := scenario.Get("inventory-pressure-v1")
 	if !ok {
 		t.Fatal("missing second scenario")
 	}
-	other := second.Snapshot()
-	if _, _, err := svc.createOrLoad(testGameID, testCreateID, second.Config, &other); !errors.Is(err, errCreateConflict) {
+	if _, _, err := svc.createOrLoad(testGameID, testCreateID, second.ID); !errors.Is(err, errCreateConflict) {
 		t.Fatalf("different scenario error=%v", err)
 	}
 }

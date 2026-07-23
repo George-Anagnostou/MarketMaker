@@ -22,7 +22,7 @@ func TestIndexServesGuidedQuoteUI(t *testing.T) {
 		t.Fatalf("status=%d", response.Code)
 	}
 	body := response.Body.String()
-	for _, expected := range []string{"Make a market.", "Post a two-sided quote", "Start a practice session", "Choose a lesson", `onclick="startDefault()"`, "function startDefault()"} {
+	for _, expected := range []string{"Make a market.", "Post a two-sided quote", "Start a practice session", "Choose a lesson", `onclick="startDefault()"`, "function startDefault()", "sessionEpoch", "mmg.pending_create", "function initialize()"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("missing %q", expected)
 		}

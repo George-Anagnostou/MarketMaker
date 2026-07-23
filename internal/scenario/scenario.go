@@ -136,26 +136,78 @@ func Coach(before exchange.State, result exchange.Result) *Coaching {
 	return &Coaching{Code: "fill-near-flat", Title: "You traded and stayed controlled", Body: "Customer flow reached your quote without leaving a large position. Keep watching whether that balance holds."}
 }
 
-func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) *Recap {
-	startingInventoryValue, _ := fixed.Notional(cfg.StartingMark, cfg.StartingPosition)
-	startEquity, _ := fixed.AddMoney(cfg.StartingCash, startingInventoryValue)
+func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) (*Recap, error) {
+	startingInventoryValue, err := fixed.Notional(cfg.StartingMark, cfg.StartingPosition)
+	if err != nil {
+		return nil, err
+	}
+	startEquity, err := fixed.AddMoney(cfg.StartingCash, startingInventoryValue)
+	if err != nil {
+		return nil, err
+	}
 	maxInventory, units, storage := fixed.Qty(0), fixed.Qty(0), fixed.Money(0)
-	include := func(result exchange.Result) {
+	position := cfg.StartingPosition
+	includePosition := func(next fixed.Qty) {
+		position = next
+		if abs(position) > maxInventory {
+			maxInventory = abs(position)
+		}
+	}
+	includePosition(position)
+	include := func(result exchange.Result) error {
+		for _, event := range result.Events {
+			if event.Trade == nil {
+				continue
+			}
+			if event.Trade.BuyerID == exchange.PlayerAccount {
+				next, err := fixed.AddQty(position, event.Trade.Quantity)
+				if err != nil {
+					return err
+				}
+				includePosition(next)
+			}
+			if event.Trade.SellerID == exchange.PlayerAccount {
+				next, err := fixed.SubQty(position, event.Trade.Quantity)
+				if err != nil {
+					return err
+				}
+				includePosition(next)
+			}
+		}
 		if abs(result.State.Position) > maxInventory {
 			maxInventory = abs(result.State.Position)
 		}
-		units, _ = fixed.AddQty(units, result.Summary.UnitsTraded)
-		storage, _ = fixed.AddMoney(storage, result.Summary.StorageCost)
+		position = result.State.Position
+		var err error
+		units, err = fixed.AddQty(units, result.Summary.UnitsTraded)
+		if err != nil {
+			return err
+		}
+		storage, err = fixed.AddMoney(storage, result.Summary.StorageCost)
+		return err
 	}
 	for _, result := range records {
-		include(result)
+		if err := include(result); err != nil {
+			return nil, err
+		}
 	}
-	include(final)
-	finalInventoryValue, _ := fixed.Notional(final.State.Mark, final.State.Position)
-	finalEquity, _ := fixed.AddMoney(final.State.Cash, finalInventoryValue)
-	pnl, _ := fixed.AddMoney(finalEquity, -startEquity)
+	if err := include(final); err != nil {
+		return nil, err
+	}
+	finalInventoryValue, err := fixed.Notional(final.State.Mark, final.State.Position)
+	if err != nil {
+		return nil, err
+	}
+	finalEquity, err := fixed.AddMoney(final.State.Cash, finalInventoryValue)
+	if err != nil {
+		return nil, err
+	}
+	pnl, err := fixed.AddMoney(finalEquity, -startEquity)
+	if err != nil {
+		return nil, err
+	}
 	body := fmt.Sprintf("%s You finished with %s P&L, traded %s units, and carried as much as %s units of inventory.", snapshot.Objective, pnl, units, maxInventory)
-	return &Recap{Headline: "Review the desk", Body: body, FinalEquity: finalEquity, TotalPnL: pnl, MaxAbsInventory: maxInventory, UnitsTraded: units, StoragePaid: storage, EndReason: final.State.Reason}
+	return &Recap{Headline: "Review the desk", Body: body, FinalEquity: finalEquity, TotalPnL: pnl, MaxAbsInventory: maxInventory, UnitsTraded: units, StoragePaid: storage, EndReason: final.State.Reason}, nil
 }
 
 func abs(value fixed.Qty) fixed.Qty {

@@ -178,19 +178,28 @@
 let gameId = null, version = 0, isOver = false, startingEquity = 0, history = [];
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
 let scenarios = [], selectedScenarioID = null;
+let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
-const newID = () => crypto.randomUUID();
+const newID = () => globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx'.replace(/x/g, () => Math.floor(Math.random() * 16).toString(16));
 const money = value => '$' + number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
 const quantity = value => number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
 function uiState(state) { return {turn:state.turn, cash:number(state.cash), inventory:number(state.position), mark:number(state.mark), isOver:state.is_over, reason:state.reason}; }
+function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
+function store(key, value) { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } }
+function removeStored(key) { try { localStorage.removeItem(key); } catch (_) {} }
 
 function updateQuotePreview() {
   const bid = number($('bid').value), ask = number($('ask').value), width = ask - bid;
   $('spread').textContent = money(Math.max(0, width));
   $('quote-note').textContent = width > 2 ? 'Wide quote: less likely to trade.' : width > 0 ? 'Balanced quote around the mark.' : 'Ask must be above bid.';
 }
-['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));
+['bid', 'ask'].forEach(id => $(id).addEventListener('input', () => { retryCommand = null; updateQuotePreview(); }));
+
+function syncQuoteControls() {
+  const disabled = !gameId || isOver || Boolean(pendingCommand) || startingSession || Boolean(retryCreateRequest);
+  $('submitbtn').disabled = disabled; $('bid').disabled = disabled; $('ask').disabled = disabled;
+}
 
 function setState(state, summary, recap) {
   const equity = state.cash + state.inventory * state.mark;
@@ -208,9 +217,7 @@ function setState(state, summary, recap) {
   $('risk-note').textContent = direction === 'Flat' ? 'Tighter quotes can trade more often; inventory makes the next price move matter.' : `${direction} inventory is live. Quote with the next mark move in mind.`;
   $('session-label').textContent = state.isOver ? 'Session complete' : gameId ? 'Live scenario' : 'Ready to quote';
   isOver = state.isOver;
-  $('submitbtn').disabled = !gameId || isOver || Boolean(pendingCommand);
-  $('bid').disabled = !gameId || isOver;
-  $('ask').disabled = !gameId || isOver;
+  syncQuoteControls();
   if (state.isOver) showSummary(state, recap);
 }
 
@@ -254,34 +261,56 @@ function applyScenario(snapshot) {
 function renderScenarios() {
   const list = $('scenario-options'); list.innerHTML = '';
   for (const snapshot of scenarios) {
-    const button = document.createElement('button'); button.className = 'scenario-option'; button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
+    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = startingSession || Boolean(retryCreateRequest); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
     button.innerHTML = `<strong>${snapshot.title}</strong><span>${snapshot.briefing}</span>`;
     button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(); };
     list.appendChild(button);
   }
 }
 function setStartButtonsEnabled(enabled) {
-  $('start-default').disabled = !enabled; $('start-selected').disabled = !enabled;
+  const disabled = (!enabled && !retryCreateRequest) || startingSession;
+  $('start-default').disabled = disabled; $('start-selected').disabled = disabled;
 }
 async function loadScenarios() {
   try {
     const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
     const data = await response.json(); scenarios = data.scenarios || [];
     if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
-    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(scenarios.length > 0);
-  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; setStartButtonsEnabled(false); }
+    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); catalogReady = scenarios.length > 0; setStartButtonsEnabled(catalogReady);
+  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; catalogReady = false; setStartButtonsEnabled(false); }
 }
-async function startNewGame() {
+function pendingCreate() {
+  try { return JSON.parse(stored('mmg.pending_create')); } catch (_) { removeStored('mmg.pending_create'); return null; }
+}
+async function startNewGame(request) {
+  if (startingSession) return;
+  if (!request && gameId && !isOver && !confirm('Start a new lesson? This replaces the current session in the desk.')) return;
   if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return; }
-  const request = {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
-  const response = await fetch('/api/v2/games', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(request)});
-  if (!response.ok) { alert('Could not start this scenario.'); return; }
-  const data = await response.json(), state = uiState(data.state);
-  gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
-  startingEquity = state.cash + state.inventory * state.mark; history = [];
-  localStorage.setItem('mmg.game_id', gameId); localStorage.setItem('mmg.starting_equity', String(startingEquity));
-  applyScenario(data.scenario); $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('coaching').hidden = true; $('gamesummary').style.display = 'none'; $('historybody').innerHTML = '';
-  setState(state, null, data.recap); addHistory(state);
+  const create = request || retryCreateRequest || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
+  const attempt = ++startAttempt; startingSession = true; retryCreateRequest = create;
+  const savedCreate = store('mmg.pending_create', JSON.stringify(create)); setStartButtonsEnabled(catalogReady); syncQuoteControls();
+  try {
+    const response = await fetch('/api/v2/games', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(create)});
+    if (!response.ok) {
+      if (attempt !== startAttempt) return;
+      if (response.status < 500) { retryCreateRequest = null; removeStored('mmg.pending_create'); }
+      alert(`Could not start this lesson: ${await response.text()}`); return;
+    }
+    const data = await response.json(), state = uiState(data.state);
+    if (attempt !== startAttempt) return;
+    sessionEpoch++;
+    gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
+    startingEquity = state.cash + state.inventory * state.mark; history = []; retryCreateRequest = null;
+    removeStored('mmg.pending_create');
+    const savedGame = store('mmg.game_id', gameId) && store('mmg.starting_equity', String(startingEquity));
+    if (!savedGame) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
+    applyScenario(data.scenario); $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('coaching').hidden = true; $('gamesummary').style.display = 'none'; $('historybody').innerHTML = '';
+    setState(state, null, data.recap); addHistory(state);
+  } catch (_) {
+    if (attempt === startAttempt) alert(savedCreate ? 'Network error. Start the lesson again to safely retry.' : 'Network error. Start the lesson again to safely retry; browser storage is unavailable, so keep this tab open.');
+  } finally {
+    if (attempt === startAttempt) { startingSession = false; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
+  }
 }
 
 function startDefault() {
@@ -293,26 +322,30 @@ async function submitTurn() {
   if (!gameId || isOver || pendingCommand) return;
   const bid = number($('bid').value), ask = number($('ask').value);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || bid >= ask) { alert('Set a positive bid below your ask.'); return; }
-  const command = retryCommand || {id:newID(), type:'submit_quote', expected_version:version, bid:$('bid').value, ask:$('ask').value};
-  pendingCommand = command; $('submitbtn').disabled = true;
+  const command = retryCommand || {id:newID(), type:'submit_quote', expected_version:version, bid:$('bid').value, ask:$('ask').value}, epoch = sessionEpoch;
+  pendingCommand = command; syncQuoteControls();
   try {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
-    if (!response.ok) { alert(`Quote rejected: ${await response.text()}`); retryCommand = null; return; }
-    const data = await response.json(), state = uiState(data.state); version = data.version; retryCommand = null;
+    if (!response.ok) { if (epoch !== sessionEpoch || pendingCommand !== command) return; alert(`Quote rejected: ${await response.text()}`); retryCommand = null; return; }
+    const data = await response.json(), state = uiState(data.state);
+    if (epoch !== sessionEpoch || pendingCommand !== command) return;
+    version = data.version; retryCommand = null;
     renderTurn(data); setState(state, data.summary, data.recap); addHistory(state, data.summary);
-  } catch (_) { retryCommand = command; alert('Network error. Post the same quote again to recover safely.'); }
-  finally { pendingCommand = null; if (!isOver) $('submitbtn').disabled = false; }
+  } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryCommand = command; alert('Network error. Post the same quote again to recover safely.'); } }
+  finally { if (pendingCommand === command) { pendingCommand = null; syncQuoteControls(); } }
 }
 
 async function quitSession() {
   if (!gameId || pendingCommand) return;
-  const command = retryQuitCommand || {id:newID(), type:'quit', expected_version:version}; pendingCommand = command;
+  const command = retryQuitCommand || {id:newID(), type:'quit', expected_version:version}, epoch = sessionEpoch; pendingCommand = command; syncQuoteControls();
   try {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
-    if (!response.ok) { alert(`Could not end session: ${await response.text()}`); retryQuitCommand = null; return; }
-    const data = await response.json(), state = uiState(data.state); version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap);
-  } catch (_) { retryQuitCommand = command; alert('Network error. End the session again to recover safely.'); }
-  finally { pendingCommand = null; }
+    if (!response.ok) { if (epoch !== sessionEpoch || pendingCommand !== command) return; alert(`Could not end session: ${await response.text()}`); retryQuitCommand = null; return; }
+    const data = await response.json(), state = uiState(data.state);
+    if (epoch !== sessionEpoch || pendingCommand !== command) return;
+    version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap);
+  } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryQuitCommand = command; alert('Network error. End the session again to recover safely.'); } }
+  finally { if (pendingCommand === command) { pendingCommand = null; syncQuoteControls(); } }
 }
 
 function showSummary(state, recap) {
@@ -320,14 +353,16 @@ function showSummary(state, recap) {
   $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
   $('gamesummary').style.display = 'block';
 }
-function playAgain() { gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; localStorage.removeItem('mmg.game_id'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
+function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
 function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
-  const id = localStorage.getItem('mmg.game_id'); if (!id) return;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { localStorage.removeItem('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); gameId=data.game_id; version=data.version; startingEquity=Number(localStorage.getItem('mmg.starting_equity')) || state.cash + state.inventory * state.mark; applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); } catch (_) { /* Keep ID for a later reconnect. */ }
+  const id = stored('mmg.game_id'); if (!id) return;
+  const epoch = sessionEpoch;
+  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { removeStored('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; startingEquity=Number(stored('mmg.starting_equity')) || state.cash + state.inventory * state.mark; applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); } catch (_) { /* Keep ID for a later reconnect. */ }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
-updateQuotePreview(); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); loadScenarios(); resumeGame();
+async function initialize() { await loadScenarios(); const request = pendingCreate(); if (request) { selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); startNewGame(request); return; } resumeGame(); }
+updateQuotePreview(); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); initialize();
 </script>
 </body>
 </html>

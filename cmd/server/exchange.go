@@ -26,9 +26,10 @@ const localPrincipal = "local"
 var uuidPattern = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`)
 
 type exchangeService struct {
-	mu      sync.Mutex
-	root    string
-	entries map[string]*exchangeEntry
+	mu             sync.Mutex
+	root           string
+	entries        map[string]*exchangeEntry
+	lookupScenario func(string) (scenario.Definition, bool)
 }
 
 type exchangeEntry struct {
@@ -42,7 +43,7 @@ type exchangeEntry struct {
 }
 
 func newExchangeService(root string) *exchangeService {
-	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry)}
+	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get}
 }
 
 type createExchangeRequest struct {
@@ -90,21 +91,14 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id and command_id must be UUIDs")
 		return
 	}
-	definition, ok := scenario.Get(req.ScenarioID)
-	if !ok {
+	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
+	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, req.ScenarioID)
+	if errors.Is(err, errUnknownScenario) {
 		writeAPIError(w, http.StatusBadRequest, "unknown_scenario", "scenario_id is not in the server catalog")
 		return
 	}
-	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
-	cfg := definition.Config
-	if err := cfg.Validate(); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_config", err.Error())
-		return
-	}
-	snapshot := definition.Snapshot()
-	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, cfg, &snapshot)
 	if errors.Is(err, errCreateConflict) {
-		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id already exists with a different create command or configuration")
+		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id already exists with a different create command or scenario")
 		return
 	}
 	if err != nil {
@@ -213,7 +207,15 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		record.Coaching = scenario.Coach(before, result)
 	}
 	if entry.scenario != nil && result.State.IsOver {
-		record.Recap = scenario.BuildRecap(*entry.scenario, entry.log.Meta().Config, priorResults(entry.commands), result)
+		recap, err := scenario.BuildRecap(*entry.scenario, entry.log.Meta().Config, priorResults(entry.commands), result)
+		if err != nil {
+			if rebuilt, commands, rebuildErr := replay(entry.log); rebuildErr == nil {
+				entry.engine, entry.commands = rebuilt, commands
+			}
+			writeAPIError(w, http.StatusInternalServerError, "recap_failure", "could not build session recap")
+			return
+		}
+		record.Recap = recap
 	}
 	if err := entry.log.Append(record); err != nil {
 		// Restore authoritative state from the last committed log before exposing an error.
@@ -287,25 +289,42 @@ func priorResults(commands map[string]eventlog.Record) []exchange.Result {
 	return results
 }
 
-var errCreateConflict = errors.New("create command conflicts with existing game")
+var (
+	errCreateConflict  = errors.New("create command conflicts with existing game")
+	errUnknownScenario = errors.New("scenario is not in the server catalog")
+)
 
-func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*exchangeEntry, bool, error) {
+func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (*exchangeEntry, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry := s.entries[id]; entry != nil {
-		if entry.log.Meta().CreateCommandID != createCommandID || !sameScenario(entry.log.Meta().Scenario, snapshot) {
+		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, nil
 	}
+	if entry, err := s.loadLocked(id); err == nil {
+		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
+			return nil, false, errCreateConflict
+		}
+		return entry, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+	definition, ok := s.lookupScenario(scenarioID)
+	if !ok {
+		return nil, false, errUnknownScenario
+	}
+	cfg := definition.Config
 	engine, err := exchange.New(cfg)
 	if err != nil {
 		return nil, false, err
 	}
-	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, snapshot)
+	snapshot := definition.Snapshot()
+	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, &snapshot)
 	if errors.Is(err, os.ErrExist) {
 		entry, loadErr := s.loadLocked(id)
-		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || !sameScenario(entry.log.Meta().Scenario, snapshot)) {
+		if loadErr == nil && !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, loadErr
@@ -313,16 +332,13 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: snapshot}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: &snapshot}
 	s.entries[id] = entry
 	return entry, true, nil
 }
 
-func sameScenario(stored, requested *scenario.Snapshot) bool {
-	if stored == nil || requested == nil {
-		return stored == requested
-	}
-	return stored.ID == requested.ID
+func matchesCreate(meta eventlog.Meta, createCommandID, scenarioID string) bool {
+	return meta.CreateCommandID == createCommandID && meta.Scenario != nil && meta.Scenario.ID == scenarioID
 }
 
 func (s *exchangeService) load(id string) (*exchangeEntry, error) {
