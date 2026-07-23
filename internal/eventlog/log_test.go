@@ -39,7 +39,7 @@ func testConfig(t *testing.T) exchange.Config {
 func TestAppendAndOpen(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(t)
-	log, err := Create(root, "game-1", "local", "create-1", cfg)
+	log, err := Create(root, "game-1", "local", "create-1", cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestAppendAndOpen(t *testing.T) {
 
 func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	root := t.TempDir()
-	log, err := Create(root, "game-1", "local", "create-1", testConfig(t))
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 
 func TestOpenRejectsTamperedRecord(t *testing.T) {
 	root := t.TempDir()
-	log, err := Create(root, "game-1", "local", "create-1", testConfig(t))
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

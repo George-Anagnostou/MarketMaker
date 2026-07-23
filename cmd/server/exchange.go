@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +18,7 @@ import (
 
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
-	"market-maker/internal/fixed"
+	"market-maker/internal/scenario"
 )
 
 const localPrincipal = "local"
@@ -38,43 +36,19 @@ type exchangeEntry struct {
 	engine   *exchange.Engine
 	log      *eventlog.Log
 	commands map[string]eventlog.Record
+	scenario *scenario.Snapshot
+	coaching *scenario.Coaching
+	recap    *scenario.Recap
 }
 
 func newExchangeService(root string) *exchangeService {
 	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry)}
 }
 
-type exchangeConfigRequest struct {
-	NumTurns             int         `json:"num_turns"`
-	Seed                 uint64      `json:"seed"`
-	StartingCash         fixed.Money `json:"starting_cash"`
-	StartingPosition     fixed.Qty   `json:"starting_position"`
-	StartingMark         fixed.Price `json:"starting_mark"`
-	StoragePerUnit       fixed.Price `json:"storage_per_unit"`
-	InitialMarginBps     int64       `json:"initial_margin_bps"`
-	MaintenanceMarginBps int64       `json:"maintenance_margin_bps"`
-	MaxPosition          fixed.Qty   `json:"max_position"`
-	MaxOrdersPerTurn     int         `json:"max_orders_per_turn"`
-	MaxOrderQty          fixed.Qty   `json:"max_order_qty"`
-	MaxFlowSlippageBps   int64       `json:"max_flow_slippage_bps"`
-	MinMoveBps           int64       `json:"min_move_bps"`
-	MaxMoveBps           int64       `json:"max_move_bps"`
-}
-
-func (r exchangeConfigRequest) config() exchange.Config {
-	return exchange.Config{
-		Instrument: "SIM", NumTurns: r.NumTurns, Seed: r.Seed,
-		StartingCash: r.StartingCash, StartingPosition: r.StartingPosition, StartingMark: r.StartingMark,
-		StoragePerUnit: r.StoragePerUnit, InitialMarginBps: r.InitialMarginBps, MaintenanceMarginBps: r.MaintenanceMarginBps,
-		MaxPosition: r.MaxPosition, MaxOrdersPerTurn: r.MaxOrdersPerTurn, MaxOrderQty: r.MaxOrderQty,
-		MaxFlowSlippageBps: r.MaxFlowSlippageBps, MinMoveBps: r.MinMoveBps, MaxMoveBps: r.MaxMoveBps,
-	}
-}
-
 type createExchangeRequest struct {
-	GameID    string                `json:"game_id"`
-	CommandID string                `json:"command_id"`
-	Config    exchangeConfigRequest `json:"config"`
+	GameID     string `json:"game_id"`
+	CommandID  string `json:"command_id"`
+	ScenarioID string `json:"scenario_id"`
 }
 
 type commandResponse struct {
@@ -84,12 +58,15 @@ type commandResponse struct {
 }
 
 type exchangeResponse struct {
-	GameID  string           `json:"game_id"`
-	Version uint64           `json:"version"`
-	State   exchange.State   `json:"state"`
-	Summary exchange.Summary `json:"summary"`
-	Events  []exchange.Event `json:"events"`
-	Command commandResponse  `json:"command"`
+	GameID   string             `json:"game_id"`
+	Version  uint64             `json:"version"`
+	State    exchange.State     `json:"state"`
+	Summary  exchange.Summary   `json:"summary"`
+	Events   []exchange.Event   `json:"events"`
+	Command  commandResponse    `json:"command"`
+	Scenario *scenario.Snapshot `json:"scenario,omitempty"`
+	Coaching *scenario.Coaching `json:"coaching,omitempty"`
+	Recap    *scenario.Recap    `json:"recap,omitempty"`
 }
 
 type apiError struct {
@@ -113,16 +90,19 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id and command_id must be UUIDs")
 		return
 	}
-	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
-	cfg := req.Config.config()
-	if cfg.Seed == 0 {
-		cfg.Seed = secureSeed()
+	definition, ok := scenario.Get(req.ScenarioID)
+	if !ok {
+		writeAPIError(w, http.StatusBadRequest, "unknown_scenario", "scenario_id is not in the server catalog")
+		return
 	}
+	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
+	cfg := definition.Config
 	if err := cfg.Validate(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return
 	}
-	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, cfg)
+	snapshot := definition.Snapshot()
+	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, cfg, &snapshot)
 	if errors.Is(err, errCreateConflict) {
 		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id already exists with a different create command or configuration")
 		return
@@ -138,7 +118,15 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, exchangeResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}})
+	writeJSON(w, status, exchangeResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap})
+}
+
+func (s *exchangeService) handleScenarios(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"scenarios": scenario.List()})
 }
 
 func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +165,7 @@ func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, 
 	entry.mu.Lock()
 	state := entry.engine.State()
 	entry.mu.Unlock()
-	writeJSON(w, http.StatusOK, exchangeResponse{GameID: id, Version: state.Version, State: state})
+	writeJSON(w, http.StatusOK, exchangeResponse{GameID: id, Version: state.Version, State: state, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap})
 }
 
 func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
@@ -202,13 +190,16 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 			writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "command id has a different payload")
 			return
 		}
-		writeJSON(w, http.StatusOK, exchangeResult(id, prior.Result, command, true))
+		response := exchangeResult(id, prior.Result, command, true, entry)
+		response.Coaching, response.Recap = prior.Coaching, prior.Recap
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	if command.ExpectedVersion != entry.engine.State().Version {
 		writeAPIError(w, http.StatusConflict, "version_conflict", "expected_version does not match current game version")
 		return
 	}
+	before := entry.engine.State()
 	result, err := entry.engine.Execute(command)
 	if err != nil {
 		writeAPIError(w, http.StatusConflict, "command_rejected", err.Error())
@@ -218,6 +209,12 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		result.Events[i].CommandID = command.ID
 	}
 	record := eventlog.Record{Schema: eventlog.SchemaVersion, Version: result.State.Version, Command: command, Result: result}
+	if entry.scenario != nil {
+		record.Coaching = scenario.Coach(before, result)
+	}
+	if entry.scenario != nil && result.State.IsOver {
+		record.Recap = scenario.BuildRecap(*entry.scenario, entry.log.Meta().Config, priorResults(entry.commands), result)
+	}
 	if err := entry.log.Append(record); err != nil {
 		// Restore authoritative state from the last committed log before exposing an error.
 		if rebuilt, commands, rebuildErr := replay(entry.log); rebuildErr == nil {
@@ -227,7 +224,8 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		return
 	}
 	entry.commands[command.ID] = record
-	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false))
+	entry.coaching, entry.recap = record.Coaching, record.Recap
+	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false, entry))
 }
 
 func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Request, entry *exchangeEntry) {
@@ -272,17 +270,30 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "next_after": nextAfter, "has_more": hasMore})
 }
 
-func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool) exchangeResponse {
-	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}}
+func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool, entry *exchangeEntry) exchangeResponse {
+	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap}
+}
+
+func priorResults(commands map[string]eventlog.Record) []exchange.Result {
+	records := make([]eventlog.Record, 0, len(commands))
+	for _, record := range commands {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Version < records[j].Version })
+	results := make([]exchange.Result, len(records))
+	for i, record := range records {
+		results[i] = record.Result
+	}
+	return results
 }
 
 var errCreateConflict = errors.New("create command conflicts with existing game")
 
-func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.Config) (*exchangeEntry, bool, error) {
+func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*exchangeEntry, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry := s.entries[id]; entry != nil {
-		if entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg {
+		if entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg || !reflect.DeepEqual(entry.log.Meta().Scenario, snapshot) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, nil
@@ -291,10 +302,10 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	if err != nil {
 		return nil, false, err
 	}
-	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg)
+	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, snapshot)
 	if errors.Is(err, os.ErrExist) {
 		entry, loadErr := s.loadLocked(id)
-		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg) {
+		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg || !reflect.DeepEqual(entry.log.Meta().Scenario, snapshot)) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, loadErr
@@ -302,7 +313,7 @@ func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record)}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: snapshot}
 	s.entries[id] = entry
 	return entry, true, nil
 }
@@ -324,7 +335,15 @@ func (s *exchangeService) loadLocked(id string) (*exchangeEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: commands}
+	entry := &exchangeEntry{engine: engine, log: log, commands: commands, scenario: log.Meta().Scenario}
+	for _, record := range records {
+		if record.Coaching != nil {
+			entry.coaching = record.Coaching
+		}
+		if record.Recap != nil {
+			entry.recap = record.Recap
+		}
+	}
 	s.entries[id] = entry
 	return entry, nil
 }
@@ -392,10 +411,3 @@ func writeAPIError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, response)
 }
 func validUUID(value string) bool { return uuidPattern.MatchString(strings.ToLower(value)) }
-func secureSeed() uint64 {
-	var data [8]byte
-	if _, err := rand.Read(data[:]); err != nil {
-		panic(err)
-	}
-	return binary.LittleEndian.Uint64(data[:])
-}

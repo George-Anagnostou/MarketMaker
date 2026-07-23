@@ -43,12 +43,23 @@ All mutating v2 requests are versioned and idempotent. IDs are UUIDs.
 
 ```text
 POST /api/v2/games
+GET  /api/v2/scenarios
 GET  /api/v2/games/{game_id}
 POST /api/v2/games/{game_id}/commands
 GET  /api/v2/games/{game_id}/events?after={sequence}
 ```
 
-Create a game with a client-generated `game_id` and `command_id`. The response preserves the resolved non-zero seed. Submit a quote with an idempotency key and the last observed version:
+The server owns the lesson catalog. Fetch the available scenario snapshots, then create a game with a client-generated `game_id`, `command_id`, and a catalog `scenario_id`:
+
+```json
+{
+  "game_id": "11111111-1111-4111-8111-111111111111",
+  "command_id": "22222222-2222-4222-8222-222222222222",
+  "scenario_id": "first-spread-v1"
+}
+```
+
+Each response includes the persisted scenario snapshot. Quote outcomes also include concise coaching, and terminal sessions include a recap. Submit a quote with an idempotency key and the last observed version:
 
 ```json
 {
@@ -62,7 +73,7 @@ Create a game with a client-generated `game_id` and `command_id`. The response p
 
 Retrying the same command returns its original result without advancing the market. Reusing a command ID with another payload and submitting a stale version both return `409`.
 
-Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. Restarting the server replays that log from the persisted scenario configuration; a partial final write is ignored.
+Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. Scenario snapshots, coaching, and recaps are durable parts of that history. Restarting the server replays the persisted configuration; a partial final write is ignored.
 
 ## Venue Boundary
 
@@ -87,6 +98,7 @@ internal/fixed             Exact decimal parsing and arithmetic
 internal/orderbook         Pure price-level FIFO matching and depth snapshots
 internal/exchange          Account/risk, settlement, scenario policy, event projection
 internal/eventlog          Durable committed-command JSONL store
+internal/scenario          Curated lessons, deterministic coaching, and recaps
 web/static                 Browser projection of structured API events
 ```
 
