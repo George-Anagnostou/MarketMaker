@@ -122,7 +122,7 @@
 
   <main>
     <section class="intro">
-      <div><div class="eyebrow">Practice desk</div><h1>Make a market.<br>Carry the risk.</h1><div class="actions"><button class="secondary" onclick="startDefault()">Start a practice session</button></div></div>
+      <div><div class="eyebrow">Practice desk</div><h1>Make a market.<br>Carry the risk.</h1><div class="actions"><button id="start-default" class="secondary" onclick="startDefault()" disabled>Start a practice session</button></div></div>
       <p class="lede">Post a two-sided quote, meet simulated customer flow, and learn how price movement changes the value of your inventory.</p>
     </section>
 
@@ -168,7 +168,7 @@
 
     <details>
       <summary>Session controls</summary>
-      <div class="scenario-actions" style="margin-top:12px"><button class="secondary" onclick="startNewGame()">Start selected lesson</button><button class="secondary" onclick="quitSession()">End current session</button></div>
+      <div class="scenario-actions" style="margin-top:12px"><button id="start-selected" class="secondary" onclick="startNewGame()" disabled>Start selected lesson</button><button class="secondary" onclick="quitSession()">End current session</button></div>
       <p class="quiet">Lessons use server-owned, fixed scenarios so the same session can be replayed and compared fairly.</p>
     </details>
   </main>
@@ -260,13 +260,16 @@ function renderScenarios() {
     list.appendChild(button);
   }
 }
+function setStartButtonsEnabled(enabled) {
+  $('start-default').disabled = !enabled; $('start-selected').disabled = !enabled;
+}
 async function loadScenarios() {
   try {
     const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
     const data = await response.json(); scenarios = data.scenarios || [];
     if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
-    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios();
-  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; }
+    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(scenarios.length > 0);
+  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; setStartButtonsEnabled(false); }
 }
 async function startNewGame() {
   if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return; }
@@ -279,6 +282,11 @@ async function startNewGame() {
   localStorage.setItem('mmg.game_id', gameId); localStorage.setItem('mmg.starting_equity', String(startingEquity));
   applyScenario(data.scenario); $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('coaching').hidden = true; $('gamesummary').style.display = 'none'; $('historybody').innerHTML = '';
   setState(state, null, data.recap); addHistory(state);
+}
+
+function startDefault() {
+  if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
+  return startNewGame();
 }
 
 async function submitTurn() {
