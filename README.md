@@ -13,6 +13,16 @@ go run ./cmd/server
 go run ./cmd/mmg -seed 42 -turns 10
 ```
 
+Or use the project workflows:
+
+```sh
+make run        # local web server
+make build      # CLI and server binaries in bin/
+make test       # all tests
+make test-race  # race-enabled tests
+make check      # format, vet, and race tests
+```
+
 The server intentionally binds only to loopback. Durable game records are stored under `data/games/` and are excluded from Git.
 
 ## Mechanics
