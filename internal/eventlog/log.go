@@ -4,6 +4,7 @@ package eventlog
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,15 +28,19 @@ type Meta struct {
 }
 
 type Record struct {
-	Schema  int              `json:"schema"`
-	Version uint64           `json:"version"`
-	Command exchange.Command `json:"command"`
-	Result  exchange.Result  `json:"result"`
+	Schema           int              `json:"schema"`
+	Version          uint64           `json:"version"`
+	PreviousChecksum string           `json:"previous_checksum,omitempty"`
+	Checksum         string           `json:"checksum"`
+	Command          exchange.Command `json:"command"`
+	Result           exchange.Result  `json:"result"`
 }
 
 type Log struct {
-	dir  string
-	meta Meta
+	dir          string
+	meta         Meta
+	lastChecksum string
+	nextVersion  uint64
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) (*Log, error) {
@@ -52,6 +57,9 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) 
 		}
 		return nil, err
 	}
+	if err := syncDir(root); err != nil {
+		return nil, err
+	}
 	if createCommandID == "" {
 		return nil, errors.New("create command id is required")
 	}
@@ -63,7 +71,21 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) 
 	if err := writeAtomic(filepath.Join(dir, "meta.json"), append(data, '\n')); err != nil {
 		return nil, err
 	}
-	return &Log{dir: dir, meta: meta}, nil
+	f, err := os.OpenFile(filepath.Join(dir, "events.jsonl"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	if err := syncDir(dir); err != nil {
+		return nil, err
+	}
+	return &Log{dir: dir, meta: meta, nextVersion: 1}, nil
 }
 
 func Open(root, gameID string) (*Log, []Record, error) {
@@ -86,15 +108,25 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return &Log{dir: dir, meta: meta}, records, nil
+	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1)}
+	if len(records) > 0 {
+		log.lastChecksum = records[len(records)-1].Checksum
+	}
+	return log, records, nil
 }
 
 func (l *Log) Meta() Meta { return l.meta }
 
 func (l *Log) Append(record Record) error {
-	if record.Schema != SchemaVersion || record.Command.ID == "" || record.Version == 0 {
+	if record.Schema != SchemaVersion || record.Command.ID == "" || record.Version != l.nextVersion {
 		return errors.New("invalid event record")
 	}
+	record.PreviousChecksum = l.lastChecksum
+	checksum, err := recordChecksum(record)
+	if err != nil {
+		return err
+	}
+	record.Checksum = checksum
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -107,7 +139,11 @@ func (l *Log) Append(record Record) error {
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
+	return nil
 }
 
 func (l *Log) Path() string { return l.dir }
@@ -122,6 +158,7 @@ func loadRecords(path string) ([]Record, error) {
 	}
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
+	previousChecksum := ""
 	for i, line := range lines {
 		rawLine := line
 		line = bytes.TrimSpace(line)
@@ -140,10 +177,15 @@ func loadRecords(path string) ([]Record, error) {
 			}
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
 		}
-		if record.Schema != SchemaVersion || record.Version != uint64(len(records)+1) || record.Command.ID == "" {
+		if record.Schema != SchemaVersion || record.Version != uint64(len(records)+1) || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
 			return nil, fmt.Errorf("invalid event record %d", i+1)
 		}
+		checksum, err := recordChecksum(record)
+		if err != nil || record.Checksum == "" || record.Checksum != checksum {
+			return nil, fmt.Errorf("invalid event record checksum %d", i+1)
+		}
 		records = append(records, record)
+		previousChecksum = record.Checksum
 	}
 	return records, nil
 }
@@ -177,5 +219,27 @@ func writeAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+func recordChecksum(record Record) (string, error) {
+	record.Checksum = ""
+	data, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte(record.PreviousChecksum), data...))
+	return fmt.Sprintf("%x", digest), nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

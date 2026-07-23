@@ -1,6 +1,7 @@
 package eventlog
 
 import (
+	"encoding/json"
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
 	"os"
@@ -87,5 +88,33 @@ func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	}
 	if len(records) != 1 {
 		t.Fatalf("records=%+v", records)
+	}
+}
+
+func TestOpenRejectsTamperedRecord(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}}
+	if err := log.Append(record); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err := Open(root, "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record = records[0]
+	record.Command.Ask = price(t, "102")
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(log.Path()+"/events.jsonl", append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil {
+		t.Fatal("expected tampered record rejection")
 	}
 }
