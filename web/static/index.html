@@ -239,6 +239,7 @@ let history = []; // [{turn, price, equity, inventory, netfill, storage, turnpnl
 let version = 0;
 let pendingCommand = null;
 let retryCommand = null;
+let retryQuitCommand = null;
 
 function number(v) { return Number(v); }
 function uiState(state) {
@@ -498,7 +499,7 @@ async function startNewGame() {
   const res = await fetch('/api/v2/games', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   if (!res.ok) { alert('Failed to create game'); return; }
   const data = await res.json();
-  gameId = data.game_id; version = data.version; isOver = false; pendingCommand = null;
+  gameId = data.game_id; version = data.version; isOver = false; pendingCommand = null; retryCommand = null; retryQuitCommand = null;
   const state = uiState(data.state);
   startingEquity = state.cash + state.inventory * state.last_price;
   localStorage.setItem('mmg.game_id', gameId);
@@ -561,28 +562,33 @@ async function submitTurn() {
 }
 
 async function quitSession() {
-  if (!gameId) return;
+  if (!gameId || pendingCommand) return;
   let eq;
   let finalState = null;
+  const command = retryQuitCommand || {id: newID(), type: 'quit', expected_version: version};
+  pendingCommand = command;
   try {
-    const command = {id: newID(), type: 'quit', expected_version: version};
     const res = await fetch('/api/v2/games/' + gameId + '/commands', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(command)});
-    if (res.ok) {
-      const data = await res.json();
-      // /quit returns TurnResult {state, ...} or similar
-      const st = data.state || data;
-      if (st) {
-        finalState = uiState(st);
-        version = data.version;
-        eq = finalState.cash + finalState.inventory * finalState.last_price;
-      }
+    if (!res.ok) { alert('Quit failed: ' + await res.text()); retryQuitCommand = null; return; }
+    const data = await res.json();
+    const st = data.state || data;
+    if (st) {
+      finalState = uiState(st);
+      version = data.version;
+      eq = finalState.cash + finalState.inventory * finalState.last_price;
     }
   } catch (e) {
-    // already removed or network; use local if possible
+    retryQuitCommand = command;
+    alert('Network error. Retry Quit to safely recover its result.');
+    return;
+  } finally {
+    pendingCommand = null;
   }
   if (eq === undefined && finalState) {
     eq = finalState.cash + finalState.inventory * finalState.last_price;
   }
+  if (!finalState) { alert('Quit did not return a final state.'); return; }
+  retryQuitCommand = null;
   const msg = (eq !== undefined) ? 'Final MTM Equity ≈ ' + fmtMoney(eq) : 'Game ended.';
   alert('Session ended.\n' + msg);
   if (!finalState) return;
@@ -624,7 +630,7 @@ function showGameSummary(state, lastSummary) {
 }
 
 function playAgain() {
-  gameId = null; isOver = false;
+  gameId = null; isOver = false; retryCommand = null; retryQuitCommand = null; pendingCommand = null;
   document.getElementById('gamesummary').style.display = 'none';
   clearFills();
   clearHistory();

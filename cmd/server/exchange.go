@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,6 +113,7 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id and command_id must be UUIDs")
 		return
 	}
+	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
 	cfg := req.Config.config()
 	if cfg.Seed == 0 {
 		cfg.Seed = secureSeed()
@@ -120,7 +122,11 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return
 	}
-	entry, created, err := s.createOrLoad(req.GameID, cfg)
+	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, cfg)
+	if errors.Is(err, errCreateConflict) {
+		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id already exists with a different create command or configuration")
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not create game")
 		return
@@ -142,6 +148,7 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id must be a UUID")
 		return
 	}
+	parts[0] = strings.ToLower(parts[0])
 	entry, err := s.load(parts[0])
 	if errors.Is(err, os.ErrNotExist) {
 		writeAPIError(w, http.StatusNotFound, "not_found", "game not found")
@@ -181,6 +188,11 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	}
 	if !validUUID(command.ID) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "command id must be a UUID")
+		return
+	}
+	command.ID = strings.ToLower(command.ID)
+	if command.Type != exchange.CommandSubmitQuote && command.Type != exchange.CommandQuit {
+		writeAPIError(w, http.StatusForbidden, "venue_command_unavailable", "account commands require authenticated venue access")
 		return
 	}
 	entry.mu.Lock()
@@ -239,7 +251,7 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	}
 	entry.mu.Unlock()
 	// Command records are in a map; restore the global sequence before returning.
-	sortEvents(events)
+	sort.Slice(events, func(i, j int) bool { return events[i].Sequence < events[j].Sequence })
 	limit := 100
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -260,33 +272,33 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "next_after": nextAfter, "has_more": hasMore})
 }
 
-func sortEvents(events []exchange.Event) {
-	for i := 1; i < len(events); i++ {
-		for j := i; j > 0 && events[j].Sequence < events[j-1].Sequence; j-- {
-			events[j], events[j-1] = events[j-1], events[j]
-		}
-	}
-}
-
 func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool) exchangeResponse {
 	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}}
 }
 
-func (s *exchangeService) createOrLoad(id string, cfg exchange.Config) (*exchangeEntry, bool, error) {
+var errCreateConflict = errors.New("create command conflicts with existing game")
+
+func (s *exchangeService) createOrLoad(id, createCommandID string, cfg exchange.Config) (*exchangeEntry, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry := s.entries[id]; entry != nil {
+		if entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg {
+			return nil, false, errCreateConflict
+		}
 		return entry, false, nil
 	}
-	log, err := eventlog.Create(s.root, id, localPrincipal, cfg)
-	if errors.Is(err, os.ErrExist) {
-		entry, loadErr := s.loadLocked(id)
-		return entry, false, loadErr
-	}
+	engine, err := exchange.New(cfg)
 	if err != nil {
 		return nil, false, err
 	}
-	engine, err := exchange.New(cfg)
+	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg)
+	if errors.Is(err, os.ErrExist) {
+		entry, loadErr := s.loadLocked(id)
+		if loadErr == nil && (entry.log.Meta().CreateCommandID != createCommandID || entry.log.Meta().Config != cfg) {
+			return nil, false, errCreateConflict
+		}
+		return entry, false, loadErr
+	}
 	if err != nil {
 		return nil, false, err
 	}

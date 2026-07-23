@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -94,5 +95,29 @@ func TestV2RejectsStaleAndMalformedCommands(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestV2CreateIsIdempotentOnlyForMatchingRequest(t *testing.T) {
+	ts := v2Server(t.TempDir())
+	defer ts.Close()
+	createV2Game(t, ts.URL)
+	body := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","config":{"num_turns":3,"seed":42,"starting_cash":"100000","starting_position":"0","starting_mark":"100","storage_per_unit":"1","initial_margin_bps":5000,"maintenance_margin_bps":2500,"max_position":"1000","max_orders_per_turn":3,"max_order_qty":"10","max_flow_slippage_bps":200,"min_move_bps":-50,"max_move_bps":300}}`
+	resp, err := http.Post(ts.URL+"/api/v2/games", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry status=%d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	conflict := strings.Replace(body, testCreateID, "44444444-4444-4444-8444-444444444444", 1)
+	resp, err = http.Post(ts.URL+"/api/v2/games", "application/json", bytes.NewBufferString(conflict))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("conflict status=%d", resp.StatusCode)
 	}
 }
