@@ -18,11 +18,12 @@ import (
 const SchemaVersion = 1
 
 type Meta struct {
-	Schema    int             `json:"schema"`
-	GameID    string          `json:"game_id"`
-	OwnerID   string          `json:"owner_id"`
-	CreatedAt time.Time       `json:"created_at"`
-	Config    exchange.Config `json:"config"`
+	Schema          int             `json:"schema"`
+	GameID          string          `json:"game_id"`
+	OwnerID         string          `json:"owner_id"`
+	CreateCommandID string          `json:"create_command_id"`
+	CreatedAt       time.Time       `json:"created_at"`
+	Config          exchange.Config `json:"config"`
 }
 
 type Record struct {
@@ -37,7 +38,7 @@ type Log struct {
 	meta Meta
 }
 
-func Create(root, gameID, ownerID string, cfg exchange.Config) (*Log, error) {
+func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -51,7 +52,10 @@ func Create(root, gameID, ownerID string, cfg exchange.Config) (*Log, error) {
 		}
 		return nil, err
 	}
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreatedAt: time.Now().UTC(), Config: cfg}
+	if createCommandID == "" {
+		return nil, errors.New("create command id is required")
+	}
+	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
@@ -119,6 +123,7 @@ func loadRecords(path string) ([]Record, error) {
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
 	for i, line := range lines {
+		rawLine := line
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
@@ -128,6 +133,9 @@ func loadRecords(path string) ([]Record, error) {
 			// A power loss may leave only the final append partial. It was never
 			// fsynced as a complete record, so replay ignores that trailing data.
 			if i == len(lines)-1 && !strings.HasSuffix(string(data), "\n") {
+				if err := truncateAndSync(path, int64(len(data)-len(rawLine))); err != nil {
+					return nil, err
+				}
 				break
 			}
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
@@ -138,6 +146,18 @@ func loadRecords(path string) ([]Record, error) {
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func truncateAndSync(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func writeAtomic(path string, data []byte) error {

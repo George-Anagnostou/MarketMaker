@@ -81,6 +81,9 @@ func (c Config) Validate() error {
 	if c.MaxPosition <= 0 {
 		return errors.New("max position must be positive")
 	}
+	if fixed.AbsQty(c.StartingPosition) > c.MaxPosition {
+		return errors.New("starting position exceeds maximum position")
+	}
 	if c.MaxOrdersPerTurn < 0 || c.MaxOrdersPerTurn > 1_000 || !c.MaxOrderQty.Positive() || c.MaxFlowSlippageBps < 0 || c.MaxFlowSlippageBps > 10_000 {
 		return errors.New("invalid flow scenario")
 	}
@@ -92,6 +95,22 @@ func (c Config) Validate() error {
 	}
 	if _, err := fixed.Notional(c.StoragePerUnit, c.MaxPosition); err != nil {
 		return errors.New("storage and position exceed supported range")
+	}
+	startingNotional, err := fixed.Notional(c.StartingMark, c.StartingPosition)
+	if err != nil {
+		return errors.New("starting equity exceeds supported range")
+	}
+	startingEquity, err := fixed.AddMoney(c.StartingCash, startingNotional)
+	if err != nil || startingEquity <= 0 {
+		return errors.New("starting account has non-positive equity")
+	}
+	startingGross, err := fixed.Notional(c.StartingMark, fixed.AbsQty(c.StartingPosition))
+	if err != nil {
+		return errors.New("starting exposure exceeds supported range")
+	}
+	startingMargin, err := fixed.ScaleMoney(startingGross, c.InitialMarginBps, 10_000)
+	if err != nil || startingEquity < startingMargin {
+		return errors.New("starting account violates initial margin")
 	}
 	if c.Seed == 0 {
 		return errors.New("resolved seed must be non-zero")
@@ -349,6 +368,9 @@ func (e *Engine) OpenAccount(id string, cash fixed.Money, position fixed.Qty) (R
 }
 
 func (e *Engine) openAccount(id string, cash fixed.Money, position fixed.Qty) (Result, error) {
+	if e.isOver {
+		return Result{State: e.State()}, errors.New("game is over")
+	}
 	if err := e.AddAccount(id, cash, position); err != nil {
 		return Result{State: e.State()}, err
 	}

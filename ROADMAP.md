@@ -14,20 +14,20 @@ The project now has a coherent local exchange foundation:
 
 This is a sound simulation kernel, not yet a shared real-time venue. Known constraints are intentional and should guide the next work:
 
-- Only the player and synthetic-flow accounts are provisioned through the application. Multi-account primitives are internal only.
+- The HTTP scenario API intentionally exposes only player quote/quit commands until authenticated account ownership exists. The venue supports multi-account order primitives internally.
 - The book uses deterministic price levels and FIFO queues. It is correct for a single instrument, but it still needs per-instrument sharding and performance profiling before high order counts.
 - Time advances when a player submits a quote. There is no independent market clock, latency model, or scheduled event queue.
 - JSONL storage is single-process and local. It has no snapshots, integrity hash chain, schema migration, or cross-process lock.
-- Risk is conservative at order entry but has no double-entry ledger, collateral model, borrow model, forced liquidation, or kill switch.
+- Risk has a balanced in-memory journal and conservative order-entry checks, but still lacks collateral/borrow models, forced liquidation, and kill switches.
 - The browser restores an active game state but does not yet rebuild full chart history after refresh.
 - There is no browser test suite, CI pipeline, metrics, tracing, structured logs, health endpoint, graceful shutdown, or packaged static assets.
 
 ## Next Wave: Exchange Correctness
 
-1. Replace map scans with per-instrument price levels and FIFO queues. Add depth snapshots and deterministic best-book updates.
-2. Promote account provisioning, place, cancel, replace, and account-query operations into authenticated API commands. Keep account identity server-owned.
-3. Add atomic replace semantics, client order IDs, order-status history, reject reasons, and explicit trade/settlement records.
-4. Introduce a double-entry ledger with cash, reserved cash, position, reserved position, collateral, realized P&L, and fees as separate balances.
+1. Add per-instrument venue sharding, full depth snapshots, deterministic best-book updates, and performance profiling at larger order counts.
+2. Promote authenticated account provisioning, place, cancel, replace, and account-query operations. Keep account identity server-owned.
+3. Add client order IDs, order-status history, reject reasons, and explicit trade/settlement records.
+4. Persist the balanced journal atomically with commands, then add collateral, realized P&L, and fees as separate balances.
 5. Define maintenance handling: margin calls, cancel-on-breach, forced liquidation, bankruptcy waterfall, and venue loss limits.
 6. Add maker/taker fees, tick/lot schedules, price bands, trading halts, self-trade policy modes, and per-account rate/position/notional limits.
 7. Build property and fuzz tests for conservation, reservation release, matching priority, replay equivalence, overflow boundaries, and command idempotency.

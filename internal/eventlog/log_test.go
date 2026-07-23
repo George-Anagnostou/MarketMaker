@@ -38,7 +38,7 @@ func testConfig(t *testing.T) exchange.Config {
 func TestAppendAndOpen(t *testing.T) {
 	root := t.TempDir()
 	cfg := testConfig(t)
-	log, err := Create(root, "game-1", "local", cfg)
+	log, err := Create(root, "game-1", "local", "create-1", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestAppendAndOpen(t *testing.T) {
 
 func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	root := t.TempDir()
-	log, err := Create(root, "game-1", "local", testConfig(t))
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,5 +77,15 @@ func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatal("partial record was replayed")
+	}
+	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: exchange.Result{}}); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err = Open(root, "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records=%+v", records)
 	}
 }
