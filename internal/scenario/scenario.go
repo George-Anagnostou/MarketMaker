@@ -140,13 +140,17 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 	startingInventoryValue, _ := fixed.Notional(cfg.StartingMark, cfg.StartingPosition)
 	startEquity, _ := fixed.AddMoney(cfg.StartingCash, startingInventoryValue)
 	maxInventory, units, storage := fixed.Qty(0), fixed.Qty(0), fixed.Money(0)
-	for _, result := range records {
+	include := func(result exchange.Result) {
 		if abs(result.State.Position) > maxInventory {
 			maxInventory = abs(result.State.Position)
 		}
 		units, _ = fixed.AddQty(units, result.Summary.UnitsTraded)
 		storage, _ = fixed.AddMoney(storage, result.Summary.StorageCost)
 	}
+	for _, result := range records {
+		include(result)
+	}
+	include(final)
 	finalInventoryValue, _ := fixed.Notional(final.State.Mark, final.State.Position)
 	finalEquity, _ := fixed.AddMoney(final.State.Cash, finalInventoryValue)
 	pnl, _ := fixed.AddMoney(finalEquity, -startEquity)
