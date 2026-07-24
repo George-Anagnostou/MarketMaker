@@ -84,6 +84,25 @@
   .fill { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 7px; background: #f6f2ea; font-size: 12px; font-variant-numeric: tabular-nums; }
   .fill strong { color: var(--ink); }
   .turn-empty { display: grid; place-items: center; min-height: 120px; text-align: center; color: var(--ink-soft); font: 18px/1.3 Georgia, "Times New Roman", serif; }
+  .audit-card { margin-top: 12px; padding: 16px; }
+  .audit-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }
+  .audit-heading h2 { font-size: 21px; }
+  .audit-status { color: var(--ink-soft); font-size: 12px; }
+  .audit-empty { color: var(--ink-soft); line-height: 1.45; font-size: 13px; }
+  .audit-explainer { margin: 0 0 12px; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+  .audit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .audit-panel { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .audit-panel h3 { margin: 0; padding: 10px 11px; border-bottom: 1px solid var(--line); background: #f8f5ed; font: 500 16px/1 Georgia, "Times New Roman", serif; }
+  .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .audit-table th { color: var(--ink-soft); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; text-align: left; padding: 9px 11px 6px; }
+  .audit-table td { padding: 8px 11px; border-top: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
+  .audit-table td:first-child { color: var(--ink); font-weight: 650; }
+  .audit-table .filled { color: var(--pine); }
+  .audit-table .unfilled { color: var(--coral); }
+  .tape { margin-top: 10px; }
+  .tape summary { padding: 3px 0; }
+  .tape-list { display: grid; gap: 7px; margin-top: 9px; }
+  .tape-entry { padding: 9px 10px; border-left: 3px solid var(--line); background: #f8f5ed; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
   .history-card { overflow: hidden; }
   .history-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
   .history-table th { color: var(--ink-soft); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; text-align: right; padding: 0 0 8px; }
@@ -116,7 +135,7 @@
     .masthead { min-height: 72px; }
     .intro, .quote-top { align-items: start; flex-direction: column; }
     .mark { text-align: left; }
-    .desk, .turn-grid, .guide-grid { grid-template-columns: 1fr; }
+    .desk, .turn-grid, .guide-grid, .audit-grid { grid-template-columns: 1fr; }
     .scenario-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } }
@@ -186,12 +205,25 @@
       <article class="card turn-card">
         <div class="turn-heading"><div><div class="section-label">What just happened</div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status">No turn submitted</span></div>
         <div id="turn-empty" class="turn-empty">Your next quote will turn market flow into a short, reviewable story.</div>
-        <div id="turn-detail" hidden><p id="turn-story" class="story"></p><p id="coaching" class="coaching" hidden></p><ul id="fillsbody" class="fill-list"></ul></div>
+        <div id="turn-detail" hidden><p id="turn-story" class="story"></p><p id="coaching" class="coaching" hidden></p></div>
       </article>
       <article class="card history-card">
         <div class="section-label" style="margin-bottom:14px">Session path</div>
         <table class="history-table"><thead><tr><th>Turn</th><th>Mark</th><th>Inv.</th><th>Equity</th><th>P&amp;L</th></tr></thead><tbody id="historybody"></tbody></table>
       </article>
+    </section>
+
+    <section class="card audit-card" aria-labelledby="audit-title">
+      <div class="audit-heading"><div><div class="section-label">Exchange tape</div><h2 id="audit-title">Turn audit</h2></div><span id="audit-status" class="audit-status" role="status" aria-live="polite">No customer flow yet</span></div>
+      <div id="audit-empty" class="audit-empty">When you post a quote, the exchange places your bid and ask as resting orders. Simulated customer IOC orders then arrive: they trade immediately only if their limit crosses your quote; otherwise, they expire.</div>
+      <div id="audit-detail" hidden>
+        <p id="audit-explainer" class="audit-explainer"></p>
+        <div class="audit-grid">
+          <article class="audit-panel"><h3>Customer orders</h3><table class="audit-table"><thead><tr><th>Order</th><th>Limit</th><th>Outcome</th></tr></thead><tbody id="ordersbody"></tbody></table></article>
+          <article class="audit-panel"><h3>Your matched trades</h3><table class="audit-table"><thead><tr><th>You</th><th>Execution</th><th>Why it traded</th></tr></thead><tbody id="tradesbody"></tbody></table></article>
+        </div>
+        <details class="tape"><summary>Session tape: earlier customer flow</summary><div id="tapebody" class="tape-list"></div></details>
+      </div>
     </section>
 
     <section id="gamesummary" class="card summary"><div class="section-label">Session complete</div><h2>Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
@@ -209,6 +241,7 @@ let gameId = null, version = 0, isOver = false, startingEquity = 0, history = []
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
 let scenarios = [], selectedScenarioID = null;
 let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null;
+let turnAudits = [], auditGeneration = 0;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const newID = () => globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx'.replace(/x/g, () => Math.floor(Math.random() * 16).toString(16));
@@ -265,22 +298,83 @@ function addHistory(state, summary) {
 function renderTurn(result) {
   const state = uiState(result.state), summary = result.summary || {}, events = result.events || [];
   const fills = events.filter(event => event.type === 'trade' && event.trade);
+  const flowOrders = events.filter(event => event.type === 'flow_order' && event.order);
+  const playerOrders = events.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player');
   const mark = events.find(event => event.type === 'mark_updated');
   const storage = number(summary.storage_cost || 0), turnPnl = number(summary.turn_pnl || 0);
   $('turn-empty').hidden = true; $('turn-detail').hidden = false;
   $('turn-status').textContent = `Mark ${money(state.mark)} · turn P&L ${money(turnPnl)}`;
-  const flow = fills.length ? `${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : 'No customer flow crossed your quote this turn.';
+  const flow = fills.length ? `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived and ${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived, but none crossed your quote.`;
   const move = mark ? ` The reference mark finished at ${money(state.mark)}.` : '';
   $('turn-story').textContent = `${flow}${storage > 0 ? ` Storage cost ${money(storage)}.` : ''}${move}`;
   if (result.coaching) { $('coaching').hidden = false; $('coaching').textContent = `${result.coaching.title}: ${result.coaching.body}`; }
   else { $('coaching').hidden = true; }
-  const list = $('fillsbody'); list.innerHTML = '';
-  for (const event of fills) {
-    const trade = event.trade, bought = trade.buyer_id === 'player';
-    const item = document.createElement('li'); item.className = 'fill';
-    item.innerHTML = `<span><strong>${bought ? 'Bought' : 'Sold'} ${quantity(trade.quantity)}</strong> units</span><span>${money(trade.price)}</span>`;
-    list.appendChild(item);
+  const audit = {turn:state.turn, playerOrders, flowOrders, fills}; auditGeneration++; turnAudits.push(audit); renderAudit(audit);
+}
+
+function renderAudit(audit) {
+  $('audit-empty').hidden = true; $('audit-detail').hidden = false;
+  const bid = audit.playerOrders.find(order => order.order.side === 'buy')?.order, ask = audit.playerOrders.find(order => order.order.side === 'sell')?.order;
+  $('audit-status').textContent = `Turn ${audit.turn} · ${audit.playerOrders.length} resting quote${audit.playerOrders.length === 1 ? '' : 's'} · ${audit.flowOrders.length} customer order${audit.flowOrders.length === 1 ? '' : 's'} · ${audit.fills.length} trade${audit.fills.length === 1 ? '' : 's'}`;
+  $('audit-explainer').textContent = bid && ask ? `You rested a bid at ${money(bid.price)} and an ask at ${money(ask.price)}. Every customer order is immediate-or-cancel: it trades only when its limit crosses your price; any unmatched quantity expires.` : 'Every customer order is immediate-or-cancel: it trades only when its limit crosses your resting quote; any unmatched quantity expires.';
+  const orders = $('ordersbody'); orders.innerHTML = '';
+  for (const event of audit.flowOrders) {
+    const order = event.order, filled = audit.fills.filter(fill => fill.trade.taker_order_id === order.id).reduce((total, fill) => total + number(fill.trade.quantity), 0);
+    const complete = filled >= number(order.quantity), outcome = filled === 0 ? 'Expired unfilled' : complete ? `Filled ${quantity(filled)}` : `Filled ${quantity(filled)}; remainder expired`;
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${order.side === 'buy' ? 'Buy' : 'Sell'} ${quantity(order.quantity)}</td><td>${money(order.price)}</td><td class="${filled ? 'filled' : 'unfilled'}">${outcome}</td>`;
+    orders.appendChild(row);
   }
+  const trades = $('tradesbody'); trades.innerHTML = '';
+  if (!audit.fills.length) {
+    const row = document.createElement('tr'); row.innerHTML = '<td colspan="3">No customer limit crossed your resting quote.</td>'; trades.appendChild(row);
+  }
+  for (const event of audit.fills) {
+    const trade = event.trade, bought = trade.buyer_id === 'player', side = bought ? 'Bought' : 'Sold';
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${side} ${quantity(trade.quantity)}</td><td>${money(trade.price)}</td><td>Customer ${bought ? 'sell' : 'buy'} limit crossed your ${bought ? 'bid' : 'ask'}.</td>`;
+    trades.appendChild(row);
+  }
+  const tape = $('tapebody'); tape.innerHTML = '';
+  tape.parentElement.hidden = turnAudits.length < 2;
+  for (const item of turnAudits.slice(0, -1).reverse()) {
+    const entry = document.createElement('div'); entry.className = 'tape-entry';
+    const matches = item.fills.length ? item.fills.map(fill => `${fill.trade.buyer_id === 'player' ? 'bought' : 'sold'} ${quantity(fill.trade.quantity)} @ ${money(fill.trade.price)}`).join('; ') : 'no trades matched';
+    entry.textContent = `Turn ${item.turn}: ${item.flowOrders.length} customer order${item.flowOrders.length === 1 ? '' : 's'} arrived; ${matches}.`;
+    tape.appendChild(entry);
+  }
+}
+
+function clearAudit() {
+  auditGeneration++; turnAudits = []; $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet';
+}
+
+async function loadAuditHistory(id, epoch) {
+  const generation = auditGeneration, events = []; let after = 0, hasMore = true;
+  try {
+    while (hasMore) {
+      const response = await fetch(`/api/v2/games/${id}/events?after=${after}&limit=200`);
+      if (!response.ok) return;
+      const page = await response.json();
+      if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
+      events.push(...(page.events || [])); after = page.next_after; hasMore = page.has_more;
+    }
+  } catch (_) { return; }
+  const byCommand = new Map();
+  for (const event of events) {
+    if (!event.command_id) continue;
+    if (!byCommand.has(event.command_id)) byCommand.set(event.command_id, []);
+    byCommand.get(event.command_id).push(event);
+  }
+  const audits = [];
+  for (const commandEvents of byCommand.values()) {
+    const flowOrders = commandEvents.filter(event => event.type === 'flow_order' && event.order);
+    if (!flowOrders.length) continue;
+    audits.push({turn:audits.length + 1, playerOrders:commandEvents.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player'), flowOrders, fills:commandEvents.filter(event => event.type === 'trade' && event.trade)});
+  }
+  if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
+  turnAudits = audits;
+  if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
 }
 
 function applyScenario(snapshot) {
@@ -330,7 +424,7 @@ async function startNewGame(request) {
     if (attempt !== startAttempt) return;
     sessionEpoch++;
     gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
-    startingEquity = state.cash + state.inventory * state.mark; history = []; retryCreateRequest = null;
+    startingEquity = state.cash + state.inventory * state.mark; history = []; clearAudit(); retryCreateRequest = null;
     removeStored('mmg.pending_create');
     const savedGame = store('mmg.game_id', gameId) && store('mmg.starting_equity', String(startingEquity));
     if (!savedGame) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
@@ -383,12 +477,12 @@ function showSummary(state, recap) {
   $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
   $('gamesummary').style.display = 'block';
 }
-function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
+function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; clearAudit(); renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
 function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
   const id = stored('mmg.game_id'); if (!id) return;
   const epoch = sessionEpoch;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { removeStored('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; startingEquity=Number(stored('mmg.starting_equity')) || state.cash + state.inventory * state.mark; applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); } catch (_) { /* Keep ID for a later reconnect. */ }
+  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { removeStored('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; startingEquity=Number(stored('mmg.starting_equity')) || state.cash + state.inventory * state.mark; clearAudit(); applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); loadAuditHistory(id, epoch); } catch (_) { /* Keep ID for a later reconnect. */ }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
 async function initialize() { await loadScenarios(); const request = pendingCreate(); if (request) { selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); startNewGame(request); return; } resumeGame(); }

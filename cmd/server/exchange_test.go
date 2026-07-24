@@ -88,6 +88,48 @@ func TestV2CommandIsIdempotentAndRecoversAfterReload(t *testing.T) {
 	if first.Version != 1 || first.Command.Replayed || first.Scenario == nil || first.Coaching == nil {
 		t.Fatalf("first=%+v", first)
 	}
+	flowOrders := 0
+	for _, event := range first.Events {
+		if event.Type == "flow_order" && event.Order != nil {
+			flowOrders++
+		}
+	}
+	if flowOrders == 0 || flowOrders != first.Summary.OrdersReceived {
+		t.Fatalf("flow orders=%d summary=%+v", flowOrders, first.Summary)
+	}
+	eventsResp, err := http.Get(ts.URL + "/api/v2/games/" + testGameID + "/events?after=0&limit=200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventPage struct {
+		Events []struct {
+			Type      string `json:"type"`
+			CommandID string `json:"command_id"`
+			Sequence  uint64 `json:"sequence"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(eventsResp.Body).Decode(&eventPage); err != nil {
+		eventsResp.Body.Close()
+		t.Fatal(err)
+	}
+	eventsResp.Body.Close()
+	persistedFlowOrders := 0
+	lastSequence := uint64(0)
+	for _, event := range eventPage.Events {
+		if event.Sequence <= lastSequence {
+			t.Fatalf("event sequence=%d after=%d", event.Sequence, lastSequence)
+		}
+		lastSequence = event.Sequence
+		if event.Type == "flow_order" {
+			if event.CommandID != testQuoteID {
+				t.Fatalf("flow command id=%q", event.CommandID)
+			}
+			persistedFlowOrders++
+		}
+	}
+	if persistedFlowOrders != flowOrders {
+		t.Fatalf("persisted flow orders=%d response=%d", persistedFlowOrders, flowOrders)
+	}
 
 	resp, err = http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", bytes.NewBufferString(command))
 	if err != nil {
