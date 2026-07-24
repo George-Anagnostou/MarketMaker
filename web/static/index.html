@@ -130,6 +130,14 @@
   .scenario-option strong { display: block; font-size: 13px; margin-bottom: 4px; }
   .scenario-option span { display: block; color: var(--ink-soft); font-size: 11px; line-height: 1.35; }
   .objective { margin: 11px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
+  .lesson-plan { margin-top: 13px; padding: 13px; border: 1px solid #d8c58e; border-radius: 9px; background: #fffae9; }
+  .lesson-plan-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .lesson-plan h4 { margin: 3px 0 0; font: 500 17px/1 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
+  .lesson-steps { display: grid; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; counter-reset: lesson; }
+  .lesson-step { display: grid; grid-template-columns: 23px 1fr; gap: 8px; color: var(--ink-soft); font-size: 12px; line-height: 1.42; }
+  .lesson-step::before { counter-increment: lesson; content: counter(lesson); display: grid; place-items: center; align-self: start; width: 22px; height: 22px; border-radius: 50%; background: var(--gold); color: #fff; font: 700 11px/1 ui-monospace, monospace; }
+  .lesson-step strong { color: var(--ink); }
+  .lesson-check { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid #dfd0a3; color: #65501e; font-size: 12px; line-height: 1.4; }
   @media (max-width: 780px) {
     .shell { padding: 0 16px 32px; }
     .masthead { min-height: 72px; }
@@ -199,6 +207,11 @@
       <p id="scenario-brief" class="objective"></p>
       <div id="scenario-options" class="scenario-options"></div>
       <p id="scenario-objective" class="objective"></p>
+      <section id="lesson-plan" class="lesson-plan" hidden aria-labelledby="lesson-plan-title">
+        <div class="lesson-plan-head"><div><div class="section-label">Guided practice</div><h4 id="lesson-plan-title">First Spread tutorial</h4></div><span id="lesson-plan-progress" class="quiet"></span></div>
+        <ol id="lesson-steps" class="lesson-steps"></ol>
+        <p class="lesson-check">Before moving on, be able to explain why an order filled or expired, whether you are long or short, and what one quote change you made to manage that risk.</p>
+      </section>
     </section>
 
     <section class="turn-grid">
@@ -380,7 +393,18 @@ async function loadAuditHistory(id, epoch) {
 function applyScenario(snapshot) {
   if (!snapshot) return;
   $('scenario-title').textContent = snapshot.title; $('scenario-brief').textContent = snapshot.briefing;
-  $('scenario-objective').textContent = `Goal: ${snapshot.objective}`; $('scenario-turns').textContent = `${snapshot.turns} turns`;
+  $('scenario-objective').textContent = `Goal: ${snapshot.objective}`; $('scenario-turns').textContent = `${snapshot.turns} turns`; renderTutorial(snapshot);
+}
+function renderTutorial(snapshot) {
+  const plan = $('lesson-plan'), steps = snapshot?.tutorial || [];
+  plan.hidden = !steps.length;
+  if (!steps.length) return;
+  $('lesson-plan-title').textContent = `${snapshot.title} tutorial`; $('lesson-plan-progress').textContent = `${steps.length} guided steps`;
+  const list = $('lesson-steps'); list.innerHTML = '';
+  for (const step of steps) {
+    const item = document.createElement('li'); item.className = 'lesson-step';
+    item.innerHTML = `<div><strong>${step.title}</strong><br>${step.body}</div>`; list.appendChild(item);
+  }
 }
 function renderScenarios() {
   const list = $('scenario-options'); list.innerHTML = '';

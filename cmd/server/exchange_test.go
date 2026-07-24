@@ -46,14 +46,15 @@ func TestV2ListsServerOwnedScenarios(t *testing.T) {
 	}
 	var body struct {
 		Scenarios []struct {
-			ID    string `json:"id"`
-			Turns int    `json:"turns"`
+			ID       string                  `json:"id"`
+			Turns    int                     `json:"turns"`
+			Tutorial []scenario.TutorialStep `json:"tutorial"`
 		} `json:"scenarios"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Scenarios) != 3 || body.Scenarios[0].ID == "" || body.Scenarios[0].Turns == 0 {
+	if len(body.Scenarios) != 3 || body.Scenarios[0].ID == "" || body.Scenarios[0].Turns == 0 || len(body.Scenarios[0].Tutorial) != 4 {
 		t.Fatalf("scenarios=%+v", body.Scenarios)
 	}
 }
@@ -85,7 +86,7 @@ func TestV2CommandIsIdempotentAndRecoversAfterReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if first.Version != 1 || first.Command.Replayed || first.Scenario == nil || first.Coaching == nil {
+	if first.Version != 1 || first.Command.Replayed || first.Scenario == nil || len(first.Scenario.Tutorial) != 4 || first.Coaching == nil {
 		t.Fatalf("first=%+v", first)
 	}
 	flowOrders := 0

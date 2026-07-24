@@ -15,8 +15,12 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if len(List()) < 3 {
 		t.Fatal("expected initial lesson catalog")
 	}
-	if _, ok := Get("first-spread-v1"); !ok {
+	first, ok := Get("first-spread-v1")
+	if !ok {
 		t.Fatal("missing first scenario")
+	}
+	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 {
+		t.Fatalf("first tutorial=%+v", first.Snapshot().Tutorial)
 	}
 }
 

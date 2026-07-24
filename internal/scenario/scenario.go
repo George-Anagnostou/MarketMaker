@@ -16,18 +16,25 @@ type Definition struct {
 	Title     string
 	Briefing  string
 	Objective string
+	Tutorial  []TutorialStep
 	Config    exchange.Config
+}
+
+type TutorialStep struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // Snapshot is persisted with every game so its lesson cannot change when the
 // in-code catalog evolves.
 type Snapshot struct {
-	ID        string `json:"id"`
-	Revision  string `json:"revision"`
-	Title     string `json:"title"`
-	Briefing  string `json:"briefing"`
-	Objective string `json:"objective"`
-	Turns     int    `json:"turns"`
+	ID        string         `json:"id"`
+	Revision  string         `json:"revision"`
+	Title     string         `json:"title"`
+	Briefing  string         `json:"briefing"`
+	Objective string         `json:"objective"`
+	Tutorial  []TutorialStep `json:"tutorial,omitempty"`
+	Turns     int            `json:"turns"`
 }
 
 type Coaching struct {
@@ -49,10 +56,16 @@ type Recap struct {
 
 var catalog = []Definition{
 	{
-		ID: "first-spread-v1", Revision: "1", Title: "First Spread",
+		ID: "first-spread-v1", Revision: "2", Title: "First Spread",
 		Briefing:  "A calm opening desk with balanced customer flow. Learn how your quote width changes the chance of trading.",
 		Objective: "Finish with the highest marked equity you can while staying aware of every fill.",
-		Config:    config(8, 101, -25, 25, 5, 10),
+		Tutorial: []TutorialStep{
+			{Title: "Start with a balanced quote", Body: "For the first turn, try a bid of $99.50 and an ask of $100.50 around the $100 reference mark. This gives customers room to cross either side."},
+			{Title: "Read the customer tape", Body: "After you post, count the customer IOC orders in the turn audit. For each one, compare its limit with your bid or ask and explain why it filled or expired."},
+			{Title: "Name the inventory you earned", Body: "If you bought, you are long and the next price move can hurt you if the mark falls. If you sold, you are short and a rising mark can hurt. Check the position card before quoting again."},
+			{Title: "Make one deliberate change", Body: "While flat, tighten by one cent to invite more flow. While long, shift both prices down; while short, shift both prices up. Change one idea at a time, then use the next audit to judge it."},
+		},
+		Config: config(8, 101, -25, 25, 5, 10),
 	},
 	{
 		ID: "inventory-pressure-v1", Revision: "1", Title: "Inventory Pressure",
@@ -96,7 +109,8 @@ func Get(id string) (Definition, bool) {
 }
 
 func (d Definition) Snapshot() Snapshot {
-	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Turns: d.Config.NumTurns}
+	tutorial := append([]TutorialStep(nil), d.Tutorial...)
+	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: tutorial, Turns: d.Config.NumTurns}
 }
 
 func ValidateCatalog() error {
@@ -106,6 +120,11 @@ func ValidateCatalog() error {
 			return errors.New("invalid scenario catalog")
 		}
 		seen[definition.ID] = true
+		for _, step := range definition.Tutorial {
+			if step.Title == "" || step.Body == "" {
+				return fmt.Errorf("scenario %s has an invalid tutorial step", definition.ID)
+			}
+		}
 		if definition.Config.NumTurns <= 0 || definition.Config.Seed == 0 {
 			return fmt.Errorf("scenario %s must be a finite seeded lesson", definition.ID)
 		}
