@@ -49,12 +49,21 @@
   .price-field { border: 1px solid var(--line); background: var(--card); padding: 10px 12px; border-radius: 9px; }
   .price-field label { display: block; color: var(--ink-soft); font-weight: 700; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
   .price-field input { width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font: 500 26px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.07em; }
-  .quote-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--ink-soft); font-size: 12px; margin: 10px 0 13px; }
+  .quote-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-soft); font-size: 12px; margin: 10px 0 13px; }
   .quote-meta strong { color: var(--ink); font-variant-numeric: tabular-nums; }
   .primary { width: 100%; border: 0; border-radius: 8px; background: var(--pine); color: #fff; padding: 11px 16px; font-weight: 700; letter-spacing: .01em; }
   .primary:hover { background: #143e30; }
   .primary:disabled, .secondary:disabled { cursor: not-allowed; opacity: .55; }
   .risk-note { margin: 10px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
+  .guide { margin-top: 12px; padding: 16px; }
+  .guide-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; margin-bottom: 12px; }
+  .guide-head h2 { font-size: 21px; }
+  .guide-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .guide-card { padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #f8f5ed; }
+  .guide-card h3 { margin: 0 0 6px; font: 500 16px/1.1 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
+  .guide-card p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+  .guide-rule { margin-top: 9px !important; padding-top: 9px; border-top: 1px solid var(--line); color: var(--ink) !important; }
+  .guide-rule strong { color: var(--pine); }
   .snapshot { padding: 16px; display: grid; gap: 12px; }
   .metric { padding-bottom: 11px; border-bottom: 1px solid var(--line); }
   .metric:last-child { border: 0; padding: 0; }
@@ -107,7 +116,7 @@
     .masthead { min-height: 72px; }
     .intro, .quote-top { align-items: start; flex-direction: column; }
     .mark { text-align: left; }
-    .desk, .turn-grid { grid-template-columns: 1fr; }
+    .desk, .turn-grid, .guide-grid { grid-template-columns: 1fr; }
     .scenario-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } }
@@ -130,10 +139,10 @@
       <article class="card quote-card">
         <div class="quote-top"><div><div class="section-label">Your next decision</div><h2>Post a two-sided quote</h2></div><div class="mark"><span>Reference mark</span><strong id="mid">$0.00</strong></div></div>
         <div class="quote-grid">
-          <div class="price-field"><label for="bid">Bid · you buy</label><input id="bid" type="number" step="0.0001" value="99.50" inputmode="decimal"></div>
-          <div class="price-field"><label for="ask">Ask · you sell</label><input id="ask" type="number" step="0.0001" value="100.50" inputmode="decimal"></div>
+          <div class="price-field"><label for="bid">Bid · you buy</label><input id="bid" type="number" step="0.01" value="99.50" inputmode="decimal"></div>
+          <div class="price-field"><label for="ask">Ask · you sell</label><input id="ask" type="number" step="0.01" value="100.50" inputmode="decimal"></div>
         </div>
-        <div class="quote-meta"><span>Spread <strong id="spread">$1.00</strong></span><span id="quote-note">Quote around the reference mark.</span></div>
+        <div class="quote-meta"><span>Spread <strong id="spread">$1.00</strong></span><span id="quote-note">Quote around the reference mark.</span><span>$0.01 steps</span></div>
         <button id="submitbtn" class="primary" onclick="submitTurn()">Post quote for this turn</button>
         <p class="risk-note" id="risk-note">Start a session below to begin. Tighter quotes can trade more often; inventory makes the next price move matter.</p>
       </article>
@@ -143,6 +152,27 @@
         <div class="metric"><div class="metric-row"><span class="metric-name">Inventory</span><strong id="inventory" class="metric-value">0.00</strong></div><p id="position-caption" class="metric-caption">Flat. No inventory exposure yet.</p></div>
         <div class="metric"><div class="metric-row"><span class="metric-name">Session P&amp;L</span><strong id="pnl" class="metric-value">$0.00</strong></div><p id="cash-caption" class="metric-caption">Cash <span id="cash">$0.00</span></p></div>
       </aside>
+    </section>
+
+    <section class="card guide" aria-labelledby="guide-title">
+      <div class="guide-head"><div><div class="section-label">Desk guide</div><h2 id="guide-title">How to make a market well</h2></div><span class="quiet">Aim for marked P&amp;L, not just fills.</span></div>
+      <div class="guide-grid">
+        <article class="guide-card">
+          <h3>1. Quote two prices</h3>
+          <p>Your <strong>bid</strong> is the price where you buy. Your <strong>ask</strong> is where you sell. The ask minus the bid is the bid-ask spread.</p>
+          <p class="guide-rule"><strong>Spread is opportunity, not guaranteed profit.</strong> You earn it only if customer flow trades with you and later price moves do not overwhelm the position you carry.</p>
+        </article>
+        <article class="guide-card">
+          <h3>2. Trade flow for risk</h3>
+          <p><strong>Tighten</strong> the spread when you are flat and want more chance of trading. <strong>Widen</strong> it when the market feels volatile or you already carry enough inventory.</p>
+          <p class="guide-rule"><strong>Do not chase every fill.</strong> A wide quote may miss trades; a tight quote may fill quickly and leave you exposed to the next mark move.</p>
+        </article>
+        <article class="guide-card">
+          <h3>3. Move with inventory</h3>
+          <p><strong>Long?</strong> Shift both prices down: a lower ask helps you sell, and a lower bid discourages more buying. <strong>Short?</strong> Shift both up: a higher bid helps you buy back, and a higher ask discourages more selling.</p>
+          <p class="guide-rule"><strong>Flat?</strong> Keep a balanced quote around the reference mark. After every turn, use inventory, the mark, and coaching to decide whether to tighten, widen, or shift.</p>
+        </article>
+      </div>
     </section>
 
     <section class="card scenario-card" aria-label="Scenario selection">
