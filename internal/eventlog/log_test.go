@@ -1,9 +1,12 @@
 package eventlog
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/scenario"
 	"os"
 	"testing"
 )
@@ -116,5 +119,56 @@ func TestOpenRejectsTamperedRecord(t *testing.T) {
 	}
 	if _, _, err := Open(root, "game-1"); err == nil {
 		t.Fatal("expected tampered record rejection")
+	}
+}
+
+func TestOpenAcceptsPreScorecardRecap(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type legacyRecap struct {
+		Headline        string             `json:"headline"`
+		Body            string             `json:"body"`
+		FinalEquity     fixed.Money        `json:"final_equity"`
+		TotalPnL        fixed.Money        `json:"total_pnl"`
+		MaxAbsInventory fixed.Qty          `json:"max_abs_inventory"`
+		UnitsTraded     fixed.Qty          `json:"units_traded"`
+		StoragePaid     fixed.Money        `json:"storage_paid"`
+		EndReason       exchange.EndReason `json:"end_reason"`
+	}
+	type legacyRecord struct {
+		Schema           int                `json:"schema"`
+		Version          uint64             `json:"version"`
+		PreviousChecksum string             `json:"previous_checksum,omitempty"`
+		Checksum         string             `json:"checksum"`
+		Command          exchange.Command   `json:"command"`
+		Result           exchange.Result    `json:"result"`
+		Coaching         *scenario.Coaching `json:"coaching,omitempty"`
+		Recap            *legacyRecap       `json:"recap,omitempty"`
+	}
+	record := legacyRecord{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: &legacyRecap{Headline: "Review", EndReason: exchange.PlayerQuit}}
+	checksumRecord := record
+	checksumRecord.Checksum = ""
+	data, err := json.Marshal(checksumRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(append([]byte(record.PreviousChecksum), data...))
+	record.Checksum = fmt.Sprintf("%x", digest)
+	data, err = json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(log.Path()+"/events.jsonl", append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err := Open(root, "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Recap == nil || records[0].Recap.Scorecard != nil {
+		t.Fatalf("records=%+v", records)
 	}
 }

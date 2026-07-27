@@ -80,9 +80,6 @@
   .turn-status { color: var(--ink-soft); font-size: 12px; }
   .story { color: var(--ink-soft); line-height: 1.45; margin: 0 0 12px; font-size: 13px; }
   .coaching { margin: 0 0 12px; padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; font-size: 12px; line-height: 1.4; }
-  .fill-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
-  .fill { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 7px; background: #f6f2ea; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .fill strong { color: var(--ink); }
   .turn-empty { display: grid; place-items: center; min-height: 120px; text-align: center; color: var(--ink-soft); font: 18px/1.3 Georgia, "Times New Roman", serif; }
   .audit-card { margin-top: 12px; padding: 16px; }
   .audit-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }
@@ -112,13 +109,19 @@
   .summary { display: none; margin-top: 12px; padding: 17px; border: 1px solid #b7c8ba; background: #eef5ef; }
   .summary h2 { margin-bottom: 10px; }
   .summary-copy { color: var(--ink-soft); line-height: 1.55; }
+  .scorecard { margin-top: 13px; padding-top: 13px; border-top: 1px solid #b7c8ba; }
+  .scorecard-label { color: var(--ink-soft); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+  .score-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 8px; }
+  .score-metric { padding: 10px; border-radius: 8px; background: #fffdf8; }
+  .score-metric span { display: block; color: var(--ink-soft); font-size: 11px; }
+  .score-metric strong { display: block; margin-top: 4px; font: 500 20px/1 ui-monospace, monospace; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+  .score-note, .score-reflection { margin: 9px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+  .score-reflection { padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; }
   .actions { display: flex; gap: 8px; margin-top: 11px; flex-wrap: wrap; }
   .secondary { border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--ink); padding: 8px 11px; font-size: 12px; font-weight: 650; }
   .secondary:hover { background: #f7f2e9; }
   details { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
   summary { cursor: pointer; color: var(--ink-soft); font-size: 13px; font-weight: 650; }
-  .scenario-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin: 12px 0; }
-  .scenario-grid label { color: var(--ink-soft); font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
   .scenario-actions { display: flex; gap: 9px; }
   .quiet { color: var(--ink-soft); font-size: 12px; }
   .scenario-card { margin-top: 12px; padding: 14px 16px; }
@@ -143,7 +146,7 @@
     .masthead { min-height: 72px; }
     .intro, .quote-top { align-items: start; flex-direction: column; }
     .mark { text-align: left; }
-    .desk, .turn-grid, .guide-grid, .audit-grid { grid-template-columns: 1fr; }
+    .desk, .turn-grid, .guide-grid, .audit-grid, .score-grid { grid-template-columns: 1fr; }
     .scenario-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } }
@@ -239,7 +242,7 @@
       </div>
     </section>
 
-    <section id="gamesummary" class="card summary"><div class="section-label">Session complete</div><h2>Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
+    <section id="gamesummary" class="card summary"><div class="section-label">Session complete</div><h2>Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><section id="scorecard" class="scorecard" hidden tabindex="-1" aria-live="polite" aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
 
     <details>
       <summary>Session controls</summary>
@@ -410,7 +413,7 @@ function renderTutorial(snapshot) {
 function renderScenarios() {
   const list = $('scenario-options'); list.innerHTML = '';
   for (const snapshot of scenarios) {
-    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = startingSession || Boolean(retryCreateRequest); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
+    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = startingSession || Boolean(retryCreateRequest) || Boolean(gameId && !isOver); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
     button.innerHTML = `<strong>${snapshot.title}</strong><span>${snapshot.briefing}</span>`;
     button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(); };
     list.appendChild(button);
@@ -499,15 +502,23 @@ async function quitSession() {
 
 function showSummary(state, recap) {
   const equity = state.cash + state.inventory * state.mark, pnl = equity - startingEquity;
-  $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
   $('gamesummary').style.display = 'block';
+  $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
+  const scorecard = recap?.scorecard;
+  $('scorecard').hidden = !scorecard;
+  if (scorecard) {
+    $('score-pnl').textContent = money(recap.total_pnl); $('score-pnl').className = number(recap.total_pnl) >= 0 ? 'positive' : 'negative';
+    $('score-focus-label').textContent = scorecard.focus_label; $('score-focus-value').textContent = scorecard.focus_value;
+    $('score-focus-note').textContent = scorecard.focus_note; $('score-reflection').textContent = scorecard.reflection;
+    $('scorecard').focus();
+  }
 }
 function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').style.display='none'; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').innerHTML=''; clearAudit(); renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
 function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
   const id = stored('mmg.game_id'); if (!id) return;
   const epoch = sessionEpoch;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { removeStored('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; startingEquity=Number(stored('mmg.starting_equity')) || state.cash + state.inventory * state.mark; clearAudit(); applyScenario(data.scenario); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); loadAuditHistory(id, epoch); } catch (_) { /* Keep ID for a later reconnect. */ }
+  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { removeStored('mmg.game_id'); return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; isOver=state.isOver; const equity = state.cash + state.inventory * state.mark; startingEquity=Number(stored('mmg.starting_equity')) || (data.recap ? equity - number(data.recap.total_pnl) : equity); clearAudit(); if (data.scenario && scenarios.some(snapshot => snapshot.id === data.scenario.id)) selectedScenarioID=data.scenario.id; applyScenario(data.scenario); renderScenarios(); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); loadAuditHistory(id, epoch); } catch (_) { /* Keep ID for a later reconnect. */ }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
 async function initialize() { await loadScenarios(); const request = pendingCreate(); if (request) { selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); startNewGame(request); return; } resumeGame(); }

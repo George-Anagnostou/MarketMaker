@@ -196,7 +196,7 @@ func TestV2PersistsTerminalRecap(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	if terminal.Recap == nil || terminal.Coaching == nil || !terminal.State.IsOver {
+	if terminal.Recap == nil || terminal.Recap.Scorecard == nil || terminal.Coaching == nil || !terminal.State.IsOver {
 		t.Fatalf("terminal=%+v", terminal)
 	}
 	if terminal.Recap.UnitsTraded < terminal.Summary.UnitsTraded || terminal.Recap.StoragePaid < terminal.Summary.StorageCost || terminal.Recap.MaxAbsInventory < fixed.AbsQty(terminal.State.Position) {

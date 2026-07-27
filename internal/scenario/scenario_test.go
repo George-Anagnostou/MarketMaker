@@ -19,15 +19,15 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if !ok {
 		t.Fatal("missing first scenario")
 	}
-	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 || first.Snapshot().Reflection == "" {
+	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 || first.Snapshot().Reflection == "" || first.Snapshot().ScorecardKind != "matched_volume" {
 		t.Fatalf("first tutorial=%+v", first.Snapshot().Tutorial)
 	}
 	inventory, ok := Get("inventory-pressure-v1")
-	if !ok || inventory.Revision != "2" || len(inventory.Snapshot().Tutorial) != 5 || inventory.Snapshot().Reflection == "" {
+	if !ok || inventory.Revision != "2" || len(inventory.Snapshot().Tutorial) != 5 || inventory.Snapshot().Reflection == "" || inventory.Snapshot().ScorecardKind != "peak_inventory" {
 		t.Fatalf("inventory tutorial=%+v", inventory.Snapshot().Tutorial)
 	}
 	volatility, ok := Get("volatility-shock-v1")
-	if !ok || volatility.Revision != "2" || len(volatility.Snapshot().Tutorial) != 5 || volatility.Snapshot().Reflection == "" {
+	if !ok || volatility.Revision != "2" || len(volatility.Snapshot().Tutorial) != 5 || volatility.Snapshot().Reflection == "" || volatility.Snapshot().ScorecardKind != "adverse_selection_turns" {
 		t.Fatalf("volatility tutorial=%+v", volatility.Snapshot().Tutorial)
 	}
 }
@@ -49,7 +49,7 @@ func TestInventoryPressureCoachingSkewsInventory(t *testing.T) {
 
 func TestVolatilityShockCoachingPrioritizesProtection(t *testing.T) {
 	before := exchange.State{Mark: fixed.Price(1_000_000)}
-	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(990_000)}}
+	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(990_000)}, Summary: exchange.Summary{UnitsTraded: fixed.Qty(20_000)}}
 	if got := Coach(Snapshot{ID: "volatility-shock-v1"}, before, result); got.Code != "long-adverse-selection" {
 		t.Fatalf("coaching=%+v", got)
 	}
@@ -125,5 +125,45 @@ func TestBuildRecapIncludesEngineProducedTerminalTurn(t *testing.T) {
 	}
 	if recap.UnitsTraded != result.Summary.UnitsTraded || recap.StoragePaid != result.Summary.StorageCost || recap.MaxAbsInventory < fixed.AbsQty(result.State.Position) {
 		t.Fatalf("recap=%+v result=%+v", recap, result.Summary)
+	}
+	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Matched volume" || recap.Scorecard.FocusValue != recap.UnitsTraded.String() {
+		t.Fatalf("scorecard=%+v", recap.Scorecard)
+	}
+}
+
+func TestVolatilityScorecardCountsAdverseSelection(t *testing.T) {
+	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
+	final := exchange.Result{State: exchange.State{Cash: fixed.Money(9_000_000_000), Position: fixed.Qty(10_000), Mark: fixed.Price(90_000)}, Summary: exchange.Summary{UnitsTraded: fixed.Qty(10_000)}}
+	recap, err := BuildRecap(Snapshot{ID: "volatility-shock-v1", Reflection: "Reflect."}, cfg, nil, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recap.AdverseSelectionTurns != 1 || recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Adverse selection turns" || recap.Scorecard.FocusValue != "1" {
+		t.Fatalf("recap=%+v", recap)
+	}
+	reducedCfg := cfg
+	reducedCfg.StartingPosition = fixed.Qty(20_000)
+	reduced, err := BuildRecap(Snapshot{ID: "volatility-shock-v1"}, reducedCfg, nil, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reduced.AdverseSelectionTurns != 0 {
+		t.Fatalf("risk-reducing fill counted as adverse=%+v", reduced)
+	}
+	flippedCfg := cfg
+	flippedCfg.StartingPosition = fixed.Qty(10_000)
+	flipped := final
+	flipped.State.Position = fixed.Qty(-10_000)
+	flipped.State.Mark = fixed.Price(110_000)
+	flippedRecap, err := BuildRecap(Snapshot{ID: "volatility-shock-v1"}, flippedCfg, nil, flipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flippedRecap.AdverseSelectionTurns != 1 {
+		t.Fatalf("sign-flip risk not counted=%+v", flippedRecap)
+	}
+	before := exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(100_000)}
+	if got := Coach(Snapshot{ID: "volatility-shock-v1"}, before, final); got.Code != "shock-long-protect" {
+		t.Fatalf("risk-reducing coaching=%+v", got)
 	}
 }
