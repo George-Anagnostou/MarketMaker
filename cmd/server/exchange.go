@@ -204,7 +204,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	}
 	record := eventlog.Record{Schema: eventlog.SchemaVersion, Version: result.State.Version, Command: command, Result: result}
 	if entry.scenario != nil {
-		record.Coaching = scenario.Coach(before, result)
+		record.Coaching = scenario.Coach(*entry.scenario, before, result)
 	}
 	if entry.scenario != nil && result.State.IsOver {
 		recap, err := scenario.BuildRecap(*entry.scenario, entry.log.Meta().Config, priorResults(entry.commands), result)

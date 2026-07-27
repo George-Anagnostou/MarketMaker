@@ -46,15 +46,16 @@ func TestV2ListsServerOwnedScenarios(t *testing.T) {
 	}
 	var body struct {
 		Scenarios []struct {
-			ID       string                  `json:"id"`
-			Turns    int                     `json:"turns"`
-			Tutorial []scenario.TutorialStep `json:"tutorial"`
+			ID         string                  `json:"id"`
+			Turns      int                     `json:"turns"`
+			Tutorial   []scenario.TutorialStep `json:"tutorial"`
+			Reflection string                  `json:"reflection"`
 		} `json:"scenarios"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Scenarios) != 3 || body.Scenarios[0].ID == "" || body.Scenarios[0].Turns == 0 || len(body.Scenarios[0].Tutorial) != 4 {
+	if len(body.Scenarios) != 3 || body.Scenarios[0].ID == "" || body.Scenarios[0].Turns == 0 || len(body.Scenarios[0].Tutorial) != 4 || body.Scenarios[0].Reflection == "" || body.Scenarios[1].ID != "inventory-pressure-v1" || len(body.Scenarios[1].Tutorial) != 5 || body.Scenarios[1].Reflection == "" {
 		t.Fatalf("scenarios=%+v", body.Scenarios)
 	}
 }

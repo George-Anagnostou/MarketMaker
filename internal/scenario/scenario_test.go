@@ -19,15 +19,26 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if !ok {
 		t.Fatal("missing first scenario")
 	}
-	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 {
+	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 || first.Snapshot().Reflection == "" {
 		t.Fatalf("first tutorial=%+v", first.Snapshot().Tutorial)
+	}
+	inventory, ok := Get("inventory-pressure-v1")
+	if !ok || inventory.Revision != "2" || len(inventory.Snapshot().Tutorial) != 5 || inventory.Snapshot().Reflection == "" {
+		t.Fatalf("inventory tutorial=%+v", inventory.Snapshot().Tutorial)
 	}
 }
 
 func TestCoachPrioritizesInventory(t *testing.T) {
 	before := exchange.State{Position: 0, Mark: fixed.Price(1_000_000)}
 	result := exchange.Result{State: exchange.State{Position: fixed.Qty(10_000), Mark: fixed.Price(1_000_000)}}
-	if got := Coach(before, result); got.Code != "inventory-built" {
+	if got := Coach(Snapshot{ID: "first-spread-v1"}, before, result); got.Code != "inventory-built" {
+		t.Fatalf("coaching=%+v", got)
+	}
+}
+
+func TestInventoryPressureCoachingSkewsInventory(t *testing.T) {
+	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(1_000_000)}}
+	if got := Coach(Snapshot{ID: "inventory-pressure-v1"}, exchange.State{Mark: fixed.Price(1_000_000)}, result); got.Code != "long-skew" {
 		t.Fatalf("coaching=%+v", got)
 	}
 }

@@ -210,7 +210,7 @@
       <section id="lesson-plan" class="lesson-plan" hidden aria-labelledby="lesson-plan-title">
         <div class="lesson-plan-head"><div><div class="section-label">Guided practice</div><h4 id="lesson-plan-title">First Spread tutorial</h4></div><span id="lesson-plan-progress" class="quiet"></span></div>
         <ol id="lesson-steps" class="lesson-steps"></ol>
-        <p class="lesson-check">Before moving on, be able to explain why an order filled or expired, whether you are long or short, and what one quote change you made to manage that risk.</p>
+        <p id="lesson-check" class="lesson-check"></p>
       </section>
     </section>
 
@@ -400,6 +400,7 @@ function renderTutorial(snapshot) {
   plan.hidden = !steps.length;
   if (!steps.length) return;
   $('lesson-plan-title').textContent = `${snapshot.title} tutorial`; $('lesson-plan-progress').textContent = `${steps.length} guided steps`;
+  $('lesson-check').textContent = snapshot.reflection || 'Before moving on, explain the position you carried and the quote adjustment you made to manage it.';
   const list = $('lesson-steps'); list.innerHTML = '';
   for (const step of steps) {
     const item = document.createElement('li'); item.className = 'lesson-step';

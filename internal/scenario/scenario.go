@@ -11,13 +11,14 @@ import (
 )
 
 type Definition struct {
-	ID        string
-	Revision  string
-	Title     string
-	Briefing  string
-	Objective string
-	Tutorial  []TutorialStep
-	Config    exchange.Config
+	ID         string
+	Revision   string
+	Title      string
+	Briefing   string
+	Objective  string
+	Tutorial   []TutorialStep
+	Reflection string
+	Config     exchange.Config
 }
 
 type TutorialStep struct {
@@ -28,13 +29,14 @@ type TutorialStep struct {
 // Snapshot is persisted with every game so its lesson cannot change when the
 // in-code catalog evolves.
 type Snapshot struct {
-	ID        string         `json:"id"`
-	Revision  string         `json:"revision"`
-	Title     string         `json:"title"`
-	Briefing  string         `json:"briefing"`
-	Objective string         `json:"objective"`
-	Tutorial  []TutorialStep `json:"tutorial,omitempty"`
-	Turns     int            `json:"turns"`
+	ID         string         `json:"id"`
+	Revision   string         `json:"revision"`
+	Title      string         `json:"title"`
+	Briefing   string         `json:"briefing"`
+	Objective  string         `json:"objective"`
+	Tutorial   []TutorialStep `json:"tutorial,omitempty"`
+	Reflection string         `json:"reflection,omitempty"`
+	Turns      int            `json:"turns"`
 }
 
 type Coaching struct {
@@ -65,13 +67,22 @@ var catalog = []Definition{
 			{Title: "Name the inventory you earned", Body: "If you bought, you are long and the next price move can hurt you if the mark falls. If you sold, you are short and a rising mark can hurt. Check the position card before quoting again."},
 			{Title: "Make one deliberate change", Body: "While flat, tighten by one cent to invite more flow. While long, shift both prices down; while short, shift both prices up. Change one idea at a time, then use the next audit to judge it."},
 		},
-		Config: config(8, 101, -25, 25, 5, 10),
+		Reflection: "Before moving on, be able to explain why an order filled or expired, whether you are long or short, and what one quote change you made to manage that risk.",
+		Config:     config(8, 101, -25, 25, 5, 10),
 	},
 	{
-		ID: "inventory-pressure-v1", Revision: "1", Title: "Inventory Pressure",
+		ID: "inventory-pressure-v1", Revision: "2", Title: "Inventory Pressure",
 		Briefing:  "Larger customer clips and a livelier mark make every accumulated unit matter.",
 		Objective: "Earn P&L, but notice when your position becomes the real trade.",
-		Config:    config(10, 202, -90, 150, 6, 18),
+		Tutorial: []TutorialStep{
+			{Title: "Start controlled, then observe", Body: "Begin around the reference mark with a moderate spread. Customer clips are larger here, so one crossed quote can change inventory faster than in First Spread."},
+			{Title: "Call your position by name", Body: "After every fill, say it plainly: long means you own inventory; short means you owe it. Use the position card and turn audit to identify which customer order created it."},
+			{Title: "Skew to reduce, not to predict", Body: "Long inventory: lower both bid and ask, making your ask easier to hit while discouraging more buying. Short inventory: raise both prices, making your bid easier to hit while discouraging more selling."},
+			{Title: "Keep the spread deliberate", Body: "Do not automatically widen after a fill. First shift the quote in the direction that reduces risk. Widen only if you need less flow or more protection from the next mark move."},
+			{Title: "Judge the adjustment", Body: "Use the next turn audit as evidence. Did your skew attract the offsetting customer flow you wanted? Did it reduce inventory, or did the mark move against the risk you still carried?"},
+		},
+		Reflection: "Before moving on, identify your largest inventory, name the quote skew you used to reduce it, and explain whether it balanced risk without giving away more spread than necessary.",
+		Config:     config(10, 202, -90, 150, 6, 18),
 	},
 	{
 		ID: "volatility-shock-v1", Revision: "1", Title: "Volatility Shock",
@@ -110,7 +121,7 @@ func Get(id string) (Definition, bool) {
 
 func (d Definition) Snapshot() Snapshot {
 	tutorial := append([]TutorialStep(nil), d.Tutorial...)
-	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: tutorial, Turns: d.Config.NumTurns}
+	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: tutorial, Reflection: d.Reflection, Turns: d.Config.NumTurns}
 }
 
 func ValidateCatalog() error {
@@ -125,6 +136,9 @@ func ValidateCatalog() error {
 				return fmt.Errorf("scenario %s has an invalid tutorial step", definition.ID)
 			}
 		}
+		if len(definition.Tutorial) > 0 && definition.Reflection == "" {
+			return fmt.Errorf("scenario %s needs a tutorial reflection", definition.ID)
+		}
 		if definition.Config.NumTurns <= 0 || definition.Config.Seed == 0 {
 			return fmt.Errorf("scenario %s must be a finite seeded lesson", definition.ID)
 		}
@@ -135,7 +149,14 @@ func ValidateCatalog() error {
 	return nil
 }
 
-func Coach(before exchange.State, result exchange.Result) *Coaching {
+func Coach(snapshot Snapshot, before exchange.State, result exchange.Result) *Coaching {
+	if snapshot.ID == "inventory-pressure-v1" {
+		return coachInventoryPressure(before, result)
+	}
+	return coachGeneral(before, result)
+}
+
+func coachGeneral(before exchange.State, result exchange.Result) *Coaching {
 	after := result.State
 	if after.IsOver {
 		return &Coaching{Code: "terminal", Title: "Session complete", Body: "The scenario is over. Review the turns where inventory and the reference mark changed the outcome."}
@@ -153,6 +174,29 @@ func Coach(before exchange.State, result exchange.Result) *Coaching {
 		return &Coaching{Code: "carry-cost", Title: "Inventory has a carrying cost", Body: "Storage was charged on your position. Holding inventory needs to earn more than it costs."}
 	}
 	return &Coaching{Code: "fill-near-flat", Title: "You traded and stayed controlled", Body: "Customer flow reached your quote without leaving a large position. Keep watching whether that balance holds."}
+}
+
+func coachInventoryPressure(before exchange.State, result exchange.Result) *Coaching {
+	after := result.State
+	if after.IsOver {
+		return &Coaching{Code: "inventory-pressure-complete", Title: "Inventory review", Body: "Review your largest position, the quote skew you used, and whether it reduced risk before the next mark move."}
+	}
+	if after.Position > 0 && after.Mark < before.Mark {
+		return &Coaching{Code: "long-mark-against", Title: "Long inventory, lower mark", Body: "You are long and the mark fell. Next turn, lower both bid and ask to make your ask more competitive and avoid adding more inventory."}
+	}
+	if after.Position < 0 && after.Mark > before.Mark {
+		return &Coaching{Code: "short-mark-against", Title: "Short inventory, higher mark", Body: "You are short and the mark rose. Next turn, raise both bid and ask to make your bid more competitive and avoid selling more inventory."}
+	}
+	if after.Position > 0 {
+		return &Coaching{Code: "long-skew", Title: "Skew down to reduce a long", Body: fmt.Sprintf("You are long %s units. On the next quote, shift both prices down: the lower ask invites offsetting buys from customers, while the lower bid discourages more buying from you.", after.Position)}
+	}
+	if after.Position < 0 {
+		return &Coaching{Code: "short-skew", Title: "Skew up to reduce a short", Body: fmt.Sprintf("You are short %s units. On the next quote, shift both prices up: the higher bid invites offsetting sells from customers, while the higher ask discourages more selling from you.", abs(after.Position))}
+	}
+	if result.Summary.UnitsTraded == 0 {
+		return &Coaching{Code: "pressure-no-fill", Title: "No fill is information", Body: "Your quote did not cross any customer limit. If you are comfortable being flat, tighten by one cent to test for more flow; otherwise keep your protection."}
+	}
+	return &Coaching{Code: "pressure-flat", Title: "Flat after the flow", Body: "The larger clips did not leave you with inventory this turn. Keep the spread deliberate and use the audit before tightening for more flow."}
 }
 
 func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) (*Recap, error) {
