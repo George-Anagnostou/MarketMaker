@@ -85,10 +85,18 @@ var catalog = []Definition{
 		Config:     config(10, 202, -90, 150, 6, 18),
 	},
 	{
-		ID: "volatility-shock-v1", Revision: "1", Title: "Volatility Shock",
+		ID: "volatility-shock-v1", Revision: "2", Title: "Volatility Shock",
 		Briefing:  "The mark can move sharply after execution. Spread income is not protection from directional exposure.",
 		Objective: "Finish with the highest P&L through a more volatile price path.",
-		Config:    config(8, 303, -300, 425, 4, 12),
+		Tutorial: []TutorialStep{
+			{Title: "Start protective", Body: "Begin with enough spread to make each fill intentional. In this lesson the reference mark can move sharply after customer flow, so a tight quote is not automatically a better quote."},
+			{Title: "Spot adverse selection", Body: "When a customer fills you and the mark then moves against the inventory you received, treat the sequence as adverse selection. The fill earned spread, but the new position immediately became more expensive to carry."},
+			{Title: "Protect before pursuing flow", Body: "After an adverse move, widen first to slow new exposure. Then skew: long inventory means shift both prices down; short inventory means shift both prices up. Do not tighten just to win the next trade."},
+			{Title: "Separate two P&Ls", Body: "Use the turn narrative and audit to separate execution from marking. A trade can look favorable at its fill price while the reference mark makes the resulting inventory less valuable."},
+			{Title: "Use the quiet turns", Body: "No-fill turns can be useful protection. Decide whether your next quote should stay defensive, or whether inventory is controlled enough to cautiously invite flow again."},
+		},
+		Reflection: "Before moving on, identify the turn where a fill and mark move worked against you, explain why that was adverse selection, and describe how you widened or skewed the next quote to protect the desk.",
+		Config:     config(8, 303, -300, 425, 4, 12),
 	},
 }
 
@@ -153,6 +161,9 @@ func Coach(snapshot Snapshot, before exchange.State, result exchange.Result) *Co
 	if snapshot.ID == "inventory-pressure-v1" {
 		return coachInventoryPressure(before, result)
 	}
+	if snapshot.ID == "volatility-shock-v1" {
+		return coachVolatilityShock(before, result)
+	}
 	return coachGeneral(before, result)
 }
 
@@ -197,6 +208,29 @@ func coachInventoryPressure(before exchange.State, result exchange.Result) *Coac
 		return &Coaching{Code: "pressure-no-fill", Title: "No fill is information", Body: "Your quote did not cross any customer limit. If you are comfortable being flat, tighten by one cent to test for more flow; otherwise keep your protection."}
 	}
 	return &Coaching{Code: "pressure-flat", Title: "Flat after the flow", Body: "The larger clips did not leave you with inventory this turn. Keep the spread deliberate and use the audit before tightening for more flow."}
+}
+
+func coachVolatilityShock(before exchange.State, result exchange.Result) *Coaching {
+	after := result.State
+	if after.IsOver {
+		return &Coaching{Code: "volatility-shock-complete", Title: "Adverse selection review", Body: "Find the fill-and-mark sequence that created the most risk, then review whether your next quote widened and skewed enough to protect the desk."}
+	}
+	if after.Position > 0 && after.Mark < before.Mark {
+		return &Coaching{Code: "long-adverse-selection", Title: "Adverse selection: long into a drop", Body: "You were filled into a long position and the mark fell. Protect first: widen the spread, then shift both prices down to make your ask more competitive and avoid buying more."}
+	}
+	if after.Position < 0 && after.Mark > before.Mark {
+		return &Coaching{Code: "short-adverse-selection", Title: "Adverse selection: short into a rise", Body: "You were filled into a short position and the mark rose. Protect first: widen the spread, then shift both prices up to make your bid more competitive and avoid selling more."}
+	}
+	if after.Position > 0 {
+		return &Coaching{Code: "shock-long-protect", Title: "Long inventory is live risk", Body: "The mark can move sharply in this lesson. Keep a protective spread and shift both prices down until your long inventory is reduced; do not tighten merely to recover P&L."}
+	}
+	if after.Position < 0 {
+		return &Coaching{Code: "shock-short-protect", Title: "Short inventory is live risk", Body: "The mark can move sharply in this lesson. Keep a protective spread and shift both prices up until your short inventory is reduced; do not tighten merely to recover P&L."}
+	}
+	if result.Summary.UnitsTraded == 0 {
+		return &Coaching{Code: "shock-no-fill", Title: "A quiet turn can protect you", Body: "No customer limit crossed your quote. With no inventory, use this pause to decide whether your spread should remain defensive before inviting more flow."}
+	}
+	return &Coaching{Code: "shock-flat", Title: "Flat after the shock", Body: "You traded without carrying inventory into the next move. Keep distinguishing spread capture from mark risk before you tighten again."}
 }
 
 func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) (*Recap, error) {

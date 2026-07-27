@@ -26,6 +26,10 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if !ok || inventory.Revision != "2" || len(inventory.Snapshot().Tutorial) != 5 || inventory.Snapshot().Reflection == "" {
 		t.Fatalf("inventory tutorial=%+v", inventory.Snapshot().Tutorial)
 	}
+	volatility, ok := Get("volatility-shock-v1")
+	if !ok || volatility.Revision != "2" || len(volatility.Snapshot().Tutorial) != 5 || volatility.Snapshot().Reflection == "" {
+		t.Fatalf("volatility tutorial=%+v", volatility.Snapshot().Tutorial)
+	}
 }
 
 func TestCoachPrioritizesInventory(t *testing.T) {
@@ -39,6 +43,14 @@ func TestCoachPrioritizesInventory(t *testing.T) {
 func TestInventoryPressureCoachingSkewsInventory(t *testing.T) {
 	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(1_000_000)}}
 	if got := Coach(Snapshot{ID: "inventory-pressure-v1"}, exchange.State{Mark: fixed.Price(1_000_000)}, result); got.Code != "long-skew" {
+		t.Fatalf("coaching=%+v", got)
+	}
+}
+
+func TestVolatilityShockCoachingPrioritizesProtection(t *testing.T) {
+	before := exchange.State{Mark: fixed.Price(1_000_000)}
+	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(990_000)}}
+	if got := Coach(Snapshot{ID: "volatility-shock-v1"}, before, result); got.Code != "long-adverse-selection" {
 		t.Fatalf("coaching=%+v", got)
 	}
 }
