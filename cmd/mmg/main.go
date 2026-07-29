@@ -23,6 +23,7 @@ var (
 	storageCost       = flag.String("storage", "1", "storage cost per unit per turn")
 	seed              = flag.Uint64("seed", 42, "non-zero deterministic scenario seed")
 	vol               = flag.String("vol", "-0.5,3", `price movement as "min,max" percent`)
+	simulationVersion = flag.Int("simulation-version", 2, "simulation version (1 = legacy, 2 = adverse-selection)")
 	informedFlowBps   = flag.Int64("informed-flow-bps", 0, "informed customer flow probability in basis points after a mark move (0..10000)")
 )
 
@@ -40,7 +41,7 @@ func main() {
 	}
 
 	fmt.Println("=== Market Maker Exchange ===")
-	fmt.Printf("Scenario seed: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
+	fmt.Printf("Scenario seed: %d | simulation version: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, cfg.SimulationVersion, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
 	printState(os.Stdout, engine.State())
 	reader := bufio.NewReader(os.Stdin)
 	for !engine.State().IsOver {
@@ -104,7 +105,7 @@ func configFromFlags() (exchange.Config, error) {
 	if *seed == 0 {
 		return exchange.Config{}, fmt.Errorf("seed must be non-zero; use an explicit seed for replay")
 	}
-	cfg := exchange.Config{Instrument: "SIM", StartingCash: cash, StartingPosition: position, StartingMark: mark, StoragePerUnit: storage, NumTurns: *numTurns, InitialMarginBps: 5000, MaintenanceMarginBps: 2500, MaxPosition: fixed.Qty(10_000_000), MaxOrdersPerTurn: 5, MaxOrderQty: fixed.Qty(100_000), MaxFlowSlippageBps: 200, MinMoveBps: minMove, MaxMoveBps: maxMove, Seed: *seed, SimulationVersion: exchange.SimulationVersionAdverseSelection, InformedFlowBps: *informedFlowBps}
+	cfg := exchange.Config{Instrument: "SIM", StartingCash: cash, StartingPosition: position, StartingMark: mark, StoragePerUnit: storage, NumTurns: *numTurns, InitialMarginBps: 5000, MaintenanceMarginBps: 2500, MaxPosition: fixed.Qty(10_000_000), MaxOrdersPerTurn: 5, MaxOrderQty: fixed.Qty(100_000), MaxFlowSlippageBps: 200, MinMoveBps: minMove, MaxMoveBps: maxMove, Seed: *seed, SimulationVersion: exchange.SimulationVersion(*simulationVersion), InformedFlowBps: *informedFlowBps}
 	return cfg, cfg.Validate()
 }
 

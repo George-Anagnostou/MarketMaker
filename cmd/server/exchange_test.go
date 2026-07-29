@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
@@ -542,7 +545,7 @@ func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 		firstResult.Events[i].CommandID = firstCommand.ID
 	}
 	firstRecord := eventlog.Record{Schema: eventlog.SchemaVersion, Version: firstResult.State.Version, Command: firstCommand, Result: firstResult, Coaching: scenario.Coach(*entry.scenario, before, firstResult)}
-	if err := separateLog.Append(firstRecord); err != nil {
+	if _, err := separateLog.Append(firstRecord); err != nil {
 		t.Fatal(err)
 	}
 
@@ -662,6 +665,109 @@ func TestV2PersistsTerminalRecap(t *testing.T) {
 	resp.Body.Close()
 	if !reflect.DeepEqual(state.Recap, terminal.Recap) {
 		t.Fatalf("recap after reload=%+v", state.Recap)
+	}
+}
+
+func TestSchema1TerminalResponseUsesDurableProjectedRecord(t *testing.T) {
+	root := t.TempDir()
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing legacy scenario")
+	}
+	cfg := definition.Config
+	cfg.NumTurns = 1
+	cfg.MaxOrdersPerTurn = 0
+	cfg.StoragePerUnit = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := definition.Snapshot()
+	snapshot.Turns = 1
+	dir := filepath.Join(root, testGameID)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := eventlog.Meta{Schema: 1, GameID: testGameID, OwnerID: localPrincipal, CreateCommandID: testCreateID, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Config: cfg, Scenario: &snapshot}
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(metaData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := fmt.Sprintf(`{"id":"%s","type":"submit_quote","expected_version":0,"bid":"99","ask":"101"}`, testQuoteID)
+	postCommand := func(t *testing.T, serverURL string) exchangeResponse {
+		t.Helper()
+		resp, err := http.Post(serverURL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(command))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("command status=%d", resp.StatusCode)
+		}
+		var response exchangeResponse
+		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	normalizeReplay := func(response exchangeResponse) exchangeResponse {
+		response.Command.Replayed = false
+		return response
+	}
+
+	server := v2Server(root)
+	immediate := postCommand(t, server.URL)
+	if !immediate.State.IsOver || immediate.State.Reason != exchange.TurnsComplete {
+		t.Fatalf("terminal command did not complete legacy lesson: %+v", immediate)
+	}
+	unprojected, err := scenario.BuildRecap(snapshot, cfg, nil, exchange.Result{State: immediate.State, Summary: immediate.Summary, Events: immediate.Events})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unprojected.Scorecard == nil {
+		t.Fatalf("source recap did not contain a scorecard: %+v", unprojected)
+	}
+	if immediate.Recap == nil || immediate.Recap.Scorecard != nil {
+		t.Fatalf("immediate recap was not schema-1 projected: %+v", immediate.Recap)
+	}
+	inMemoryReplay := postCommand(t, server.URL)
+	if !inMemoryReplay.Command.Replayed || !reflect.DeepEqual(normalizeReplay(inMemoryReplay), normalizeReplay(immediate)) {
+		t.Fatalf("in-memory replay differs: immediate=%+v replay=%+v", immediate, inMemoryReplay)
+	}
+
+	_, records, err := eventlog.Open(root, testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || !reflect.DeepEqual(records[0].Recap, immediate.Recap) || records[0].Result.State != immediate.State || !reflect.DeepEqual(records[0].Result.Summary, immediate.Summary) || !reflect.DeepEqual(records[0].Result.Events, immediate.Events) {
+		t.Fatalf("durable record differs from immediate response: response=%+v records=%+v", immediate, records)
+	}
+	server.Close()
+
+	reloaded := v2Server(root)
+	defer reloaded.Close()
+	stateResp, err := http.Get(reloaded.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state exchangeStateResponse
+	if err := json.NewDecoder(stateResp.Body).Decode(&state); err != nil {
+		stateResp.Body.Close()
+		t.Fatal(err)
+	}
+	stateResp.Body.Close()
+	if !reflect.DeepEqual(state.Recap, immediate.Recap) || state.LatestTurn == nil || !reflect.DeepEqual(state.LatestTurn.Summary, immediate.Summary) || !reflect.DeepEqual(state.Coaching, immediate.Coaching) {
+		t.Fatalf("reloaded state differs from durable response: %+v", state)
+	}
+	reloadedReplay := postCommand(t, reloaded.URL)
+	if !reloadedReplay.Command.Replayed || !reflect.DeepEqual(normalizeReplay(reloadedReplay), normalizeReplay(immediate)) {
+		t.Fatalf("reloaded replay differs: immediate=%+v replay=%+v", immediate, reloadedReplay)
 	}
 }
 

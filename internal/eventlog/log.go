@@ -175,12 +175,12 @@ func cloneSnapshot(snapshot *scenario.Snapshot) *scenario.Snapshot {
 	return &copy
 }
 
-func (l *Log) Append(record Record) error {
+func (l *Log) Append(record Record) (Record, error) {
 	if (record.Schema != SchemaVersion && record.Schema != l.meta.Schema) || record.Command.ID == "" || record.Version != l.nextVersion {
-		return errors.New("invalid event record")
+		return Record{}, errors.New("invalid event record")
 	}
 	if _, exists := l.commandIDs[record.Command.ID]; exists {
-		return errors.New("duplicate event command id")
+		return Record{}, errors.New("duplicate event command id")
 	}
 	record.Schema = l.meta.Schema
 	record.PreviousChecksum = l.lastChecksum
@@ -202,31 +202,31 @@ func (l *Log) Append(record Record) error {
 	case schema2, SchemaVersion:
 		record.MetadataChecksum = l.meta.Checksum
 	default:
-		return errors.New("invalid event record")
+		return Record{}, errors.New("invalid event record")
 	}
 	checksum, err := recordChecksum(record)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
 	record.Checksum = checksum
 	data, err := json.Marshal(record)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
 	f, err := os.OpenFile(filepath.Join(l.dir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
 	defer f.Close()
 	if _, err := f.Write(append(data, '\n')); err != nil {
-		return err
+		return Record{}, err
 	}
 	if err := f.Sync(); err != nil {
-		return err
+		return Record{}, err
 	}
 	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
 	l.commandIDs[record.Command.ID] = struct{}{}
-	return nil
+	return record, nil
 }
 
 func (l *Log) Path() string { return l.dir }

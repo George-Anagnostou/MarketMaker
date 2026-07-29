@@ -10,10 +10,11 @@ import (
 	"market-maker/internal/fixed"
 )
 
-func TestConfigFromFlagsUsesAdverseSelectionAndValidatesInformedFlow(t *testing.T) {
-	original := *informedFlowBps
-	t.Cleanup(func() { *informedFlowBps = original })
+func TestConfigFromFlagsDefaultsToAdverseSelection(t *testing.T) {
+	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
+	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
 
+	*simulationVersion = 2
 	*informedFlowBps = 0
 	cfg, err := configFromFlags()
 	if err != nil {
@@ -22,12 +23,60 @@ func TestConfigFromFlagsUsesAdverseSelectionAndValidatesInformedFlow(t *testing.
 	if cfg.SimulationVersion != exchange.SimulationVersionAdverseSelection || cfg.InformedFlowBps != 0 {
 		t.Fatalf("version=%d informed_flow_bps=%d", cfg.SimulationVersion, cfg.InformedFlowBps)
 	}
+	versionFlag := flag.Lookup("simulation-version")
+	if versionFlag == nil || versionFlag.DefValue != "2" || !strings.Contains(versionFlag.Usage, "1 = legacy") {
+		t.Fatalf("flag=%+v", versionFlag)
+	}
 	configuredFlag := flag.Lookup("informed-flow-bps")
 	if configuredFlag == nil || configuredFlag.DefValue != "0" || !strings.Contains(configuredFlag.Usage, "0..10000") {
 		t.Fatalf("flag=%+v", configuredFlag)
 	}
+}
+
+func TestConfigFromFlagsAcceptsExplicitLegacy(t *testing.T) {
+	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
+	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
+
+	*simulationVersion = 1
+	*informedFlowBps = 0
+	cfg, err := configFromFlags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SimulationVersion != exchange.SimulationVersionLegacy {
+		t.Fatalf("version=%d", cfg.SimulationVersion)
+	}
+}
+
+func TestConfigFromFlagsRejectsUnsupportedSimulationVersion(t *testing.T) {
+	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
+	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
+
+	*simulationVersion = 3
+	*informedFlowBps = 0
+	if _, err := configFromFlags(); err == nil || !strings.Contains(err.Error(), "unsupported simulation version") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConfigFromFlagsRejectsInformedFlowForLegacy(t *testing.T) {
+	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
+	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
+
+	*simulationVersion = 1
+	*informedFlowBps = 1
+	if _, err := configFromFlags(); err == nil || !strings.Contains(err.Error(), "legacy simulation requires zero informed flow") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConfigFromFlagsValidatesAdverseSelectionInformedFlow(t *testing.T) {
+	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
+	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
+
+	*simulationVersion = 2
 	*informedFlowBps = 7_500
-	cfg, err = configFromFlags()
+	cfg, err := configFromFlags()
 	if err != nil || cfg.InformedFlowBps != 7_500 {
 		t.Fatalf("valid informed flow: config=%+v error=%v", cfg, err)
 	}

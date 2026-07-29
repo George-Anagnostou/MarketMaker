@@ -11,6 +11,7 @@ import (
 	"market-maker/internal/scenario"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestAppendAndOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: result}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: result}); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err := Open(root, "game-1")
@@ -80,7 +81,7 @@ func TestNewLogsUseSchema3AndV3ChecksumDomains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +145,7 @@ func TestOpenAppendAndReopenSchema2WithFrozenDomains(t *testing.T) {
 	if err != nil || len(records) != 1 {
 		t.Fatalf("open schema 2: records=%+v err=%v", records, err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -260,7 +261,7 @@ func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	if len(records) != 0 {
 		t.Fatal("partial record was replayed")
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: exchange.Result{}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}, Result: exchange.Result{}}); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err = Open(root, "game-1")
@@ -279,7 +280,7 @@ func TestOpenDropsUnterminatedCompleteTrailingRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}
-	if err := log.Append(record); err != nil {
+	if _, err := log.Append(record); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(log.Path(), "events.jsonl")
@@ -297,7 +298,7 @@ func TestOpenDropsUnterminatedCompleteTrailingRecord(t *testing.T) {
 	if len(records) != 0 {
 		t.Fatalf("unterminated records=%+v", records)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err = Open(root, "game-1")
@@ -313,7 +314,7 @@ func TestOpenRejectsTamperedRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandSubmitQuote, Bid: price(t, "99"), Ask: price(t, "101")}}
-	if err := log.Append(record); err != nil {
+	if _, err := log.Append(record); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err := Open(root, "game-1")
@@ -386,7 +387,7 @@ func TestOpenRejectsSchema3RecordBoundToDifferentMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(log.Path(), "events.jsonl")
@@ -422,7 +423,7 @@ func TestAppendDoesNotRecreateMissingEventsFile(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); !errors.Is(err, os.ErrNotExist) {
+	if record, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); !errors.Is(err, os.ErrNotExist) || !reflect.DeepEqual(record, Record{}) {
 		t.Fatalf("Append error = %v, want missing events error", err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -437,11 +438,11 @@ func TestRejectsDuplicateCommandID(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}
-	if err := log.Append(record); err != nil {
+	if _, err := log.Append(record); err != nil {
 		t.Fatal(err)
 	}
 	record.Version = 2
-	if err := log.Append(record); err == nil {
+	if _, err := log.Append(record); err == nil {
 		t.Fatal("expected duplicate command rejection")
 	}
 
@@ -522,7 +523,7 @@ func TestOpenAcceptsPreScorecardRecap(t *testing.T) {
 	if len(records) != 1 || records[0].Recap == nil || records[0].Recap.Scorecard != nil {
 		t.Fatalf("records=%+v", records)
 	}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
 		t.Fatal(err)
 	}
 	_, records, err = Open(root, "game-1")
@@ -534,6 +535,40 @@ func TestOpenAcceptsPreScorecardRecap(t *testing.T) {
 	}
 }
 
+func TestAppendReturnsSchemaProjectedDurableRecord(t *testing.T) {
+	root := t.TempDir()
+	log, err := createLegacyLog(root, "game-1", testConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, AdverseSelectionTurns: 3, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}, InformedOrders: 2, InformedOrdersFilled: 1, InformedUnitsTraded: qty(t, "1"), InformedFlowPnL: money(t, "-1")}
+	input := Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}, Result: exchange.Result{State: exchange.State{Version: 2}}, Recap: recap}
+	appended, err := log.Append(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appended.Schema != schema1 || appended.PreviousChecksum != first.Checksum || appended.Checksum == "" || appended.MetadataChecksum != "" {
+		t.Fatalf("returned record metadata was not projected: %+v", appended)
+	}
+	if appended.Recap == nil || appended.Recap.AdverseSelectionTurns != 0 || appended.Recap.Scorecard != nil || appended.Recap.InformedOrders != 0 || appended.Recap.InformedOrdersFilled != 0 || appended.Recap.InformedUnitsTraded != 0 || appended.Recap.InformedFlowPnL != 0 {
+		t.Fatalf("returned recap was not projected: %+v", appended.Recap)
+	}
+	if recap.Scorecard == nil || recap.AdverseSelectionTurns != 3 || recap.InformedOrders != 2 {
+		t.Fatalf("Append mutated its input recap: %+v", recap)
+	}
+	_, records, err := Open(root, "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || !reflect.DeepEqual(records[1], appended) {
+		t.Fatalf("returned record differs from durable record: returned=%+v records=%+v", appended, records)
+	}
+}
+
 func TestLegacyAppendOmitsScorecardFromWireFormat(t *testing.T) {
 	root := t.TempDir()
 	log, err := createLegacyLog(root, "game-1", testConfig(t))
@@ -541,7 +576,7 @@ func TestLegacyAppendOmitsScorecardFromWireFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, AdverseSelectionTurns: 3, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}, InformedOrders: 2, InformedOrdersFilled: 1, InformedUnitsTraded: qty(t, "1"), InformedFlowPnL: money(t, "-1")}
-	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: recap}); err != nil {
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: recap}); err != nil {
 		t.Fatal(err)
 	}
 

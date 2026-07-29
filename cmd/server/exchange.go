@@ -278,7 +278,8 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		}
 		record.Recap = recap
 	}
-	if err := entry.log.Append(record); err != nil {
+	record, err = entry.log.Append(record)
+	if err != nil {
 		// A write or sync error leaves commit status uncertain. Rebuild so a
 		// retry can be answered idempotently, but never acknowledge the command
 		// here because durability was not confirmed.
@@ -290,10 +291,10 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	}
 	entry.commands[command.ID] = record
 	if command.Type == exchange.CommandSubmitQuote {
-		entry.latestTurn = &latestTurn{Turn: result.State.Turn, Summary: result.Summary, Coaching: record.Coaching}
+		entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 	}
 	entry.coaching, entry.recap = record.Coaching, record.Recap
-	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false, entry))
+	writeJSON(w, http.StatusOK, exchangeResult(id, record.Result, command, false, entry))
 }
 
 func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Request, entry *exchangeEntry) {
