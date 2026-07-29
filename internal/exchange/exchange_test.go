@@ -1,9 +1,11 @@
 package exchange
 
 import (
+	"encoding/json"
 	"market-maker/internal/fixed"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -396,6 +398,394 @@ func TestDeterministicResults(t *testing.T) {
 		if r1.State != r2.State || r1.Summary != r2.Summary || !reflect.DeepEqual(r1.Events, r2.Events) || !reflect.DeepEqual(r1.Ledger, r2.Ledger) {
 			t.Fatal("same scenario diverged")
 		}
+	}
+}
+
+func TestSimulationVersionConfigValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  SimulationVersion
+		informed int64
+		wantErr  bool
+	}{
+		{name: "zero is legacy"},
+		{name: "explicit legacy", version: SimulationVersionLegacy},
+		{name: "legacy rejects informed flow", version: SimulationVersionLegacy, informed: 1, wantErr: true},
+		{name: "zero rejects informed flow", informed: 1, wantErr: true},
+		{name: "v2 zero", version: SimulationVersionAdverseSelection},
+		{name: "v2 maximum", version: SimulationVersionAdverseSelection, informed: 10_000},
+		{name: "v2 negative", version: SimulationVersionAdverseSelection, informed: -1, wantErr: true},
+		{name: "v2 above maximum", version: SimulationVersionAdverseSelection, informed: 10_001, wantErr: true},
+		{name: "unknown version", version: 3, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.SimulationVersion = test.version
+			cfg.InformedFlowBps = test.informed
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestLegacyVersionPreservesResultsAndJSONShape(t *testing.T) {
+	implicitConfig := config(t)
+	explicitConfig := implicitConfig
+	explicitConfig.SimulationVersion = SimulationVersionLegacy
+	implicit, err := New(implicitConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicit, err := New(explicitConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		implicitResult, err := implicit.SubmitQuote(mustPrice(t, "99.50"), mustPrice(t, "100.50"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		explicitResult, err := explicit.SubmitQuote(mustPrice(t, "99.50"), mustPrice(t, "100.50"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(implicitResult, explicitResult) {
+			t.Fatalf("implicit and explicit legacy results differ\nimplicit=%+v\nexplicit=%+v", implicitResult, explicitResult)
+		}
+		data, err := json.Marshal(implicitResult)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"informed", "previous_mark", "pnl_attribution", "informed_orders", "informed_units_traded", "informed_flow_pnl"} {
+			if strings.Contains(string(data), `"`+field+`"`) {
+				t.Fatalf("legacy result unexpectedly contains %q: %s", field, data)
+			}
+		}
+		for _, event := range implicitResult.Events {
+			if event.Type == "mark_updated" {
+				if event.PreviousMark != 0 || event.Message != "previous=100.0000" {
+					t.Fatalf("legacy mark event=%+v", event)
+				}
+			}
+		}
+	}
+	configData, err := json.Marshal(implicitConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(configData), "simulation_version") || strings.Contains(string(configData), "informed_flow_bps") {
+		t.Fatalf("zero-value version fields changed legacy config JSON: %s", configData)
+	}
+}
+
+func TestV2DeterministicResults(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.InformedFlowBps = 4_000
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	one, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		oneResult, err := one.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		twoResult, err := two.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(oneResult, twoResult) {
+			t.Fatal("same v2 scenario diverged")
+		}
+		if oneResult.Summary.PnLAttribution == nil {
+			t.Fatal("v2 omitted zero-valued attribution")
+		}
+	}
+}
+
+func TestV2MarkStreamIsIndependentFromFlowSettings(t *testing.T) {
+	quietConfig := config(t)
+	quietConfig.SimulationVersion = SimulationVersionAdverseSelection
+	quietConfig.MaxOrdersPerTurn = 0
+	quietConfig.MinMoveBps, quietConfig.MaxMoveBps = -100, 100
+	busyConfig := quietConfig
+	busyConfig.MaxOrdersPerTurn = 7
+	busyConfig.MaxOrderQty = mustQty(t, "3")
+	busyConfig.MaxFlowSlippageBps = 250
+	quiet, err := New(quietConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := New(busyConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for turn := 1; turn <= 8; turn++ {
+		quietResult, err := quiet.SubmitQuote(mustPrice(t, "50"), mustPrice(t, "150"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		busyResult, err := busy.SubmitQuote(mustPrice(t, "50"), mustPrice(t, "150"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if quietResult.State.Mark != busyResult.State.Mark {
+			t.Fatalf("turn %d marks differ: quiet=%s busy=%s", turn, quietResult.State.Mark, busyResult.State.Mark)
+		}
+	}
+}
+
+func TestV2InformedDirectionMetricsAndEvents(t *testing.T) {
+	tests := []struct {
+		name       string
+		move       int64
+		bid        string
+		ask        string
+		wantSide   Side
+		wantMark   string
+		buyingFlow bool
+	}{
+		{name: "up move buys", move: 100, bid: "99", ask: "100", wantSide: Buy, wantMark: "101", buyingFlow: true},
+		{name: "down move sells", move: -100, bid: "100", ask: "101", wantSide: Sell, wantMark: "99"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.SimulationVersion = SimulationVersionAdverseSelection
+			cfg.InformedFlowBps = 10_000
+			cfg.MaxOrderQty = mustQty(t, "1")
+			cfg.MaxFlowSlippageBps = 0
+			cfg.MinMoveBps, cfg.MaxMoveBps = test.move, test.move
+			e, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := e.SubmitQuote(mustPrice(t, test.bid), mustPrice(t, test.ask))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var flowOrder *Order
+			var flowTrade *Trade
+			var markEvent *Event
+			for i := range result.Events {
+				event := &result.Events[i]
+				switch event.Type {
+				case "flow_order":
+					flowOrder = event.Order
+				case "trade":
+					if event.Trade.Informed {
+						flowTrade = event.Trade
+					}
+				case "mark_updated":
+					markEvent = event
+				}
+			}
+			if flowOrder == nil || !flowOrder.Informed || flowOrder.Side != test.wantSide || flowOrder.TIF != IOC {
+				t.Fatalf("flow order=%+v", flowOrder)
+			}
+			if flowTrade == nil || !flowTrade.Informed {
+				t.Fatalf("informed trade=%+v events=%+v", flowTrade, result.Events)
+			}
+			if result.Summary.InformedOrders != 1 || result.Summary.InformedOrdersFilled != 1 || result.Summary.InformedUnitsTraded != flowTrade.Quantity || result.Summary.UnitsTraded != flowTrade.Quantity {
+				t.Fatalf("summary=%+v trade=%+v", result.Summary, flowTrade)
+			}
+			if test.buyingFlow {
+				if result.Summary.BuyVolume != flowTrade.Quantity || result.Summary.SellVolume != 0 {
+					t.Fatalf("legacy volume meanings changed: %+v", result.Summary)
+				}
+			} else if result.Summary.SellVolume != flowTrade.Quantity || result.Summary.BuyVolume != 0 {
+				t.Fatalf("legacy volume meanings changed: %+v", result.Summary)
+			}
+			wantMark := mustPrice(t, test.wantMark)
+			if markEvent == nil || markEvent.PreviousMark != mustPrice(t, "100") || markEvent.Mark != wantMark || result.State.Mark != wantMark {
+				t.Fatalf("mark event=%+v state=%+v", markEvent, result.State)
+			}
+			wantInformedPnL, err := playerFillPnL(*flowTrade, wantMark)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Summary.InformedFlowPnL != wantInformedPnL || result.Summary.TurnPnL != wantInformedPnL {
+				t.Fatalf("informed pnl=%s turn pnl=%s want=%s", result.Summary.InformedFlowPnL, result.Summary.TurnPnL, wantInformedPnL)
+			}
+		})
+	}
+}
+
+func TestV2InformedArrivalCanRemainUnfilled(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.InformedFlowBps = 10_000
+	cfg.MaxOrdersPerTurn = 1
+	cfg.MaxFlowSlippageBps = 0
+	cfg.MinMoveBps, cfg.MaxMoveBps = 100, 100
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.InformedOrders != 1 || result.Summary.InformedOrdersFilled != 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.UnitsTraded != 0 {
+		t.Fatalf("summary=%+v", result.Summary)
+	}
+	for _, event := range result.Events {
+		if event.Type == "flow_order" && (event.Order == nil || !event.Order.Informed || event.Order.Side != Buy) {
+			t.Fatalf("flow event=%+v", event)
+		}
+	}
+}
+
+func TestV2InformedMetricsExcludeCompetingLiquidity(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.InformedFlowBps = 10_000
+	cfg.MaxOrdersPerTurn = 1
+	cfg.MaxOrderQty = mustQty(t, "1")
+	cfg.MaxFlowSlippageBps = 0
+	cfg.MinMoveBps, cfg.MaxMoveBps = 100, 100
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAccount("competitor", mustMoney(t, "100000"), mustQty(t, "1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("competitor", Sell, mustPrice(t, "99"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.SubmitQuote(mustPrice(t, "98"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.InformedOrders != 1 || result.Summary.InformedOrdersFilled != 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.InformedFlowPnL != 0 {
+		t.Fatalf("player metrics included competing fill: %+v", result.Summary)
+	}
+	if result.Summary.UnitsTraded <= 0 {
+		t.Fatalf("legacy venue volume changed: %+v", result.Summary)
+	}
+}
+
+func TestV2FlatActualMarkMoveIsNotInformed(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.InformedFlowBps = 10_000
+	cfg.StartingMark = fixed.Price(1)
+	cfg.MinMoveBps, cfg.MaxMoveBps = 1, 1
+	cfg.MaxOrdersPerTurn = 1
+	cfg.MaxFlowSlippageBps = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.SubmitQuote(fixed.Price(1), fixed.Price(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State.Mark != cfg.StartingMark || result.Summary.InformedOrders != 0 {
+		t.Fatalf("state=%+v summary=%+v", result.State, result.Summary)
+	}
+	for _, event := range result.Events {
+		if event.Type == "flow_order" && event.Order.Informed {
+			t.Fatalf("flat actual mark classified informed: %+v", event.Order)
+		}
+	}
+}
+
+func TestV2ExactAttributionIncludesImmediateExecutionsAndStorage(t *testing.T) {
+	tests := []struct {
+		name          string
+		makerSide     Side
+		makerPrice    string
+		move          int64
+		wantPosition  string
+		wantExecution string
+		wantInventory string
+		wantStorage   string
+		wantTurn      string
+	}{
+		{name: "player buy", makerSide: Sell, makerPrice: "90", move: 100, wantPosition: "3", wantExecution: "10", wantInventory: "3", wantStorage: "-1.5", wantTurn: "11.5"},
+		{name: "player sell", makerSide: Buy, makerPrice: "110", move: -100, wantPosition: "1", wantExecution: "10", wantInventory: "-1", wantStorage: "-0.5", wantTurn: "8.5"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.SimulationVersion = SimulationVersionAdverseSelection
+			cfg.StartingPosition = mustQty(t, "2")
+			cfg.MaxOrderQty = mustQty(t, "1")
+			cfg.MaxOrdersPerTurn = 0
+			cfg.StoragePerUnit = mustPrice(t, "0.5")
+			cfg.MinMoveBps, cfg.MaxMoveBps = test.move, test.move
+			e, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.PlaceLimit(FlowAccount, test.makerSide, mustPrice(t, test.makerPrice), mustQty(t, "1"), GTC); err != nil {
+				t.Fatal(err)
+			}
+			result, err := e.SubmitQuote(mustPrice(t, "95"), mustPrice(t, "105"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			attribution := result.Summary.PnLAttribution
+			if attribution == nil {
+				t.Fatal("missing attribution")
+			}
+			if attribution.ExecutionEdge != mustMoney(t, test.wantExecution) || attribution.InventoryMarkPnL != mustMoney(t, test.wantInventory) || attribution.StoragePnL != mustMoney(t, test.wantStorage) || result.Summary.TurnPnL != mustMoney(t, test.wantTurn) {
+				t.Fatalf("attribution=%+v summary=%+v", attribution, result.Summary)
+			}
+			if result.State.Position != mustQty(t, test.wantPosition) || result.Summary.StorageCost != -attribution.StoragePnL {
+				t.Fatalf("state=%+v summary=%+v", result.State, result.Summary)
+			}
+			if result.Summary.UnitsTraded != 0 || result.Summary.NetFillCash != 0 {
+				t.Fatalf("immediate fills changed synthetic-flow legacy metrics: %+v", result.Summary)
+			}
+		})
+	}
+}
+
+func TestV2ArithmeticFailureRollsBackStateAndStreams(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.StartingPosition = mustQty(t, "1")
+	cfg.MaxOrdersPerTurn = 1
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := e.State()
+	e.cfg.StoragePerUnit = fixed.Price(math.MaxInt64)
+	if _, err := e.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101")); err == nil {
+		t.Fatal("expected checked storage arithmetic failure")
+	}
+	if e.State() != before || len(e.OpenOrders(PlayerAccount)) != 0 {
+		t.Fatal("failed v2 turn changed live venue")
+	}
+	e.cfg.StoragePerUnit = cfg.StoragePerUnit
+	got, err := e.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := fresh.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("failed transaction consumed v2 RNG state")
 	}
 }
 
