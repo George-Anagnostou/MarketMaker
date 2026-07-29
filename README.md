@@ -11,7 +11,10 @@ go run ./cmd/server
 # Open http://127.0.0.1:8080
 
 go run ./cmd/mmg -seed 42 -turns 10
+go run ./cmd/mmg -seed 304 -turns 8 -informed-flow-bps 6000
 ```
+
+The CLI defaults to simulation version 2. Use `-simulation-version 1` to reproduce a legacy seeded CLI path; informed flow requires version 2.
 
 Or use the project workflows:
 
@@ -30,12 +33,19 @@ The server intentionally binds only to loopback. Durable game records are stored
 - One simulated instrument, `SIM`, has a server-owned reference mark.
 - The player maintains one bid and one ask, each with a configured quote size.
 - Simulated customers submit deterministic IOC limit orders around the reference mark. An order executes only when its limit crosses a resting quote.
+- Simulation version 2 separates the customer-flow, reference-mark, and informed-flow random streams. Informed customers know the direction of the next mark move, but they still trade only when their willingness price crosses a quote.
 - The book is price-time priority. Execution occurs at the resting maker price. Partial fills and residual GTC quotes are explicit.
 - Cash, quantity, price, and execution notional use fixed-point integers. API decimal values are serialized as strings, never JSON floating-point values.
 - The engine reserves full cash for a resting buy quote and applies configurable initial and maintenance margin to gross exposure. Position limits are enforced before quotes are accepted.
 - Storage is charged against absolute inventory each simulation turn. Insolvency and maintenance-margin failure end the game; there is no forced liquidation yet.
 
-`net_fill_cash` is cash movement, not realized P&L. Equity is marked as `cash + position * reference_mark`.
+`net_fill_cash` is cash movement, not realized P&L. Equity is marked as `cash + position * reference_mark`. Version-2 turns reconcile exact fixed-point attribution:
+
+```text
+turn P&L = execution edge + inventory mark P&L + storage P&L
+```
+
+Execution edge values player fills against the opening mark, inventory mark P&L applies the mark move to ending inventory, and storage P&L is the signed carrying-cost charge. Informed-flow P&L separately values player fills with informed customers at the closing mark.
 
 ## Durable API
 
@@ -73,11 +83,11 @@ Each response includes the persisted scenario snapshot. Quote outcomes also incl
 
 Retrying the same command returns its original result without advancing the market. Reusing a command ID with another payload and submitting a stale version both return `409`.
 
-`GET /api/v2/games/{game_id}` returns the durable state, scenario, latest coaching, and recap. Create and command endpoints include their command acknowledgement; command results additionally include the turn summary and events. Event cursors use canonical unsigned integers, for example `?after=42`.
+`GET /api/v2/games/{game_id}` returns the durable state, scenario, latest coaching, recap, and the latest completed quote turn with its summary and coaching. Create and command endpoints include their command acknowledgement; command results additionally include the turn summary and events. Event cursors use canonical unsigned integers, for example `?after=42`.
 
-Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. New games are atomically published from a staging directory, and schema-2 records are bound to a checksummed metadata snapshot. Scenario snapshots, coaching, recaps, and scorecards are durable parts of that history. Existing schema-1 games remain replayable; a partial final write is ignored.
+Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. New games are atomically published from a staging directory, and schema-3 records are bound to a checksummed metadata snapshot. Scenario snapshots, simulation configuration, coaching, recaps, scorecards, and P&L attribution are durable parts of that history. Existing schema-1 and schema-2 games remain replayable and appendable; a partial final write is ignored.
 
-Event schemas are append-only wire formats: a new persisted field requires a new schema version rather than silently changing checksum preimages. Schema-1 logs are retained for compatibility and schema-2 is used for new games.
+Event schemas are append-only wire formats: a new persisted field requires a new schema version rather than silently changing checksum preimages. Each schema retains its checksum domain, and schema 3 is used for new games.
 
 The JSONL store is local-first and single-process. Production multi-instance hosting is deferred to PostgreSQL, where transactional optimistic concurrency or row locking will serialize game mutations.
 
