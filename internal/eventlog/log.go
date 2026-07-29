@@ -10,14 +10,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"market-maker/internal/exchange"
 	"market-maker/internal/scenario"
 )
 
-const SchemaVersion = 1
+const (
+	// SchemaVersion is used for newly created logs. Schema 1 remains readable
+	// and appendable so existing games retain their original wire format.
+	SchemaVersion       = 2
+	legacySchemaVersion = 1
+)
 
 type Meta struct {
 	Schema          int                `json:"schema"`
@@ -27,6 +31,7 @@ type Meta struct {
 	CreatedAt       time.Time          `json:"created_at"`
 	Config          exchange.Config    `json:"config"`
 	Scenario        *scenario.Snapshot `json:"scenario,omitempty"`
+	Checksum        string             `json:"checksum,omitempty"`
 }
 
 type Record struct {
@@ -34,6 +39,7 @@ type Record struct {
 	Version          uint64             `json:"version"`
 	PreviousChecksum string             `json:"previous_checksum,omitempty"`
 	Checksum         string             `json:"checksum"`
+	MetadataChecksum string             `json:"metadata_checksum,omitempty"`
 	Command          exchange.Command   `json:"command"`
 	Result           exchange.Result    `json:"result"`
 	Coaching         *scenario.Coaching `json:"coaching,omitempty"`
@@ -45,37 +51,50 @@ type Log struct {
 	meta         Meta
 	lastChecksum string
 	nextVersion  uint64
+	commandIDs   map[string]struct{}
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(root, gameID)
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, os.ErrExist
-		}
-		return nil, err
-	}
-	if err := syncDir(root); err != nil {
 		return nil, err
 	}
 	if createCommandID == "" {
 		return nil, errors.New("create command id is required")
 	}
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg, Scenario: snapshot}
+	dir := filepath.Join(root, gameID)
+	if _, err := os.Lstat(dir); err == nil {
+		return nil, os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	stagingDir, err := os.MkdirTemp(root, ".eventlog-staging-")
+	if err != nil {
+		return nil, err
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+
+	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg, Scenario: cloneSnapshot(snapshot)}
+	checksum, err := metadataChecksum(meta)
+	if err != nil {
+		return nil, err
+	}
+	meta.Checksum = checksum
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeAtomic(filepath.Join(dir, "meta.json"), append(data, '\n')); err != nil {
+	if err := writeAtomic(filepath.Join(stagingDir, "meta.json"), append(data, '\n')); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "events.jsonl"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(filepath.Join(stagingDir, "events.jsonl"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -86,10 +105,20 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, 
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := syncDir(stagingDir); err != nil {
 		return nil, err
 	}
-	return &Log{dir: dir, meta: meta, nextVersion: 1}, nil
+	if err := os.Rename(stagingDir, dir); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, os.ErrExist
+		}
+		return nil, err
+	}
+	published = true
+	if err := syncDir(root); err != nil {
+		return nil, err
+	}
+	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: make(map[string]struct{})}, nil
 }
 
 func Open(root, gameID string) (*Log, []Record, error) {
@@ -102,30 +131,68 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, nil, fmt.Errorf("decode game metadata: %w", err)
 	}
-	if meta.Schema != SchemaVersion || meta.GameID != gameID {
+	if (meta.Schema != legacySchemaVersion && meta.Schema != SchemaVersion) || meta.GameID != gameID {
 		return nil, nil, errors.New("unsupported or mismatched game metadata")
+	}
+	if meta.Schema == SchemaVersion {
+		checksum, err := metadataChecksum(meta)
+		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
+			return nil, nil, errors.New("invalid game metadata checksum")
+		}
 	}
 	if err := meta.Config.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("invalid stored config: %w", err)
 	}
-	records, err := loadRecords(filepath.Join(dir, "events.jsonl"))
+	records, err := loadRecords(filepath.Join(dir, "events.jsonl"), meta.Schema, meta.Checksum)
 	if err != nil {
 		return nil, nil, err
 	}
-	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1)}
+	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records))}
 	if len(records) > 0 {
 		log.lastChecksum = records[len(records)-1].Checksum
+	}
+	for _, record := range records {
+		log.commandIDs[record.Command.ID] = struct{}{}
 	}
 	return log, records, nil
 }
 
-func (l *Log) Meta() Meta { return l.meta }
+func (l *Log) Meta() Meta {
+	meta := l.meta
+	meta.Scenario = cloneSnapshot(meta.Scenario)
+	return meta
+}
+
+func cloneSnapshot(snapshot *scenario.Snapshot) *scenario.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	copy := *snapshot
+	copy.Tutorial = append([]scenario.TutorialStep(nil), snapshot.Tutorial...)
+	return &copy
+}
 
 func (l *Log) Append(record Record) error {
-	if record.Schema != SchemaVersion || record.Command.ID == "" || record.Version != l.nextVersion {
+	if (record.Schema != SchemaVersion && record.Schema != l.meta.Schema) || record.Command.ID == "" || record.Version != l.nextVersion {
 		return errors.New("invalid event record")
 	}
+	if _, exists := l.commandIDs[record.Command.ID]; exists {
+		return errors.New("duplicate event command id")
+	}
+	record.Schema = l.meta.Schema
 	record.PreviousChecksum = l.lastChecksum
+	if record.Schema == legacySchemaVersion && record.Recap != nil {
+		// Schema 1 checksums must remain readable by binaries that predate
+		// scorecards, so retain its original recap wire format.
+		recap := *record.Recap
+		recap.Scorecard = nil
+		record.Recap = &recap
+	}
+	if record.Schema == SchemaVersion {
+		record.MetadataChecksum = l.meta.Checksum
+	} else {
+		record.MetadataChecksum = ""
+	}
 	checksum, err := recordChecksum(record)
 	if err != nil {
 		return err
@@ -135,7 +202,7 @@ func (l *Log) Append(record Record) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(l.dir, "events.jsonl"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(filepath.Join(l.dir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -147,42 +214,49 @@ func (l *Log) Append(record Record) error {
 		return err
 	}
 	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
+	l.commandIDs[record.Command.ID] = struct{}{}
 	return nil
 }
 
 func (l *Log) Path() string { return l.dir }
 
-func loadRecords(path string) ([]Record, error) {
+func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Record, error) {
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, err
 	}
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
 	previousChecksum := ""
+	commandIDs := make(map[string]struct{})
 	for i, line := range lines {
 		rawLine := line
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
+		// A complete append is newline-terminated before it is synced. Do not
+		// treat an unterminated final line as committed: it may be a torn write.
+		if i == len(lines)-1 && !bytes.HasSuffix(data, []byte("\n")) {
+			if err := truncateAndSync(path, int64(len(data)-len(rawLine))); err != nil {
+				return nil, err
+			}
+			break
+		}
 		var record Record
 		if err := json.Unmarshal(line, &record); err != nil {
 			// A power loss may leave only the final append partial. It was never
 			// fsynced as a complete record, so replay ignores that trailing data.
-			if i == len(lines)-1 && !strings.HasSuffix(string(data), "\n") {
-				if err := truncateAndSync(path, int64(len(data)-len(rawLine))); err != nil {
-					return nil, err
-				}
-				break
-			}
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
 		}
-		if record.Schema != SchemaVersion || record.Version != uint64(len(records)+1) || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
+		if record.Schema != schema || record.Version != uint64(len(records)+1) || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
 			return nil, fmt.Errorf("invalid event record %d", i+1)
+		}
+		if schema == SchemaVersion && record.MetadataChecksum != expectedMetadataChecksum {
+			return nil, fmt.Errorf("event record %d is bound to different metadata", i+1)
+		}
+		if _, exists := commandIDs[record.Command.ID]; exists {
+			return nil, fmt.Errorf("duplicate event command id at record %d", i+1)
 		}
 		checksum, err := recordChecksum(record)
 		if err != nil || record.Checksum == "" || record.Checksum != checksum {
@@ -190,6 +264,7 @@ func loadRecords(path string) ([]Record, error) {
 		}
 		records = append(records, record)
 		previousChecksum = record.Checksum
+		commandIDs[record.Command.ID] = struct{}{}
 	}
 	return records, nil
 }
@@ -235,7 +310,22 @@ func recordChecksum(record Record) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(append([]byte(record.PreviousChecksum), data...))
+	input := []byte(record.PreviousChecksum)
+	if record.Schema == SchemaVersion {
+		input = append([]byte("market-maker/eventlog/record/v2\x00"), input...)
+		input = append(input, record.MetadataChecksum...)
+	}
+	digest := sha256.Sum256(append(input, data...))
+	return fmt.Sprintf("%x", digest), nil
+}
+
+func metadataChecksum(meta Meta) (string, error) {
+	meta.Checksum = ""
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("market-maker/eventlog/meta/v2\x00"), data...))
 	return fmt.Sprintf("%x", digest), nil
 }
 

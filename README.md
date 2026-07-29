@@ -73,7 +73,13 @@ Each response includes the persisted scenario snapshot. Quote outcomes also incl
 
 Retrying the same command returns its original result without advancing the market. Reusing a command ID with another payload and submitting a stale version both return `409`.
 
-Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. Scenario snapshots, coaching, and recaps are durable parts of that history. Restarting the server replays the persisted configuration; a partial final write is ignored.
+`GET /api/v2/games/{game_id}` returns the durable state, scenario, latest coaching, and recap. Create and command endpoints include their command acknowledgement; command results additionally include the turn summary and events. Event cursors use canonical unsigned integers, for example `?after=42`.
+
+Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. New games are atomically published from a staging directory, and schema-2 records are bound to a checksummed metadata snapshot. Scenario snapshots, coaching, recaps, and scorecards are durable parts of that history. Existing schema-1 games remain replayable; a partial final write is ignored.
+
+Event schemas are append-only wire formats: a new persisted field requires a new schema version rather than silently changing checksum preimages. Schema-1 logs are retained for compatibility and schema-2 is used for new games.
+
+The JSONL store is local-first and single-process. Production multi-instance hosting is deferred to PostgreSQL, where transactional optimistic concurrency or row locking will serialize game mutations.
 
 ## Venue Boundary
 

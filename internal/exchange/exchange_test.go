@@ -536,3 +536,27 @@ func TestConfigRejectsUnrepresentableStorage(t *testing.T) {
 		t.Fatal("expected storage overflow rejection")
 	}
 }
+
+func TestConfigRejectsMinInt64StartingPosition(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingPosition = fixed.Qty(math.MinInt64)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unrepresentable starting position rejection")
+	}
+}
+
+func TestAddAccountRejectsMinInt64Position(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingMark = fixed.Price(1)
+	cfg.MaxPosition = fixed.Qty(math.MaxInt64)
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddAccount("unsafe", mustMoney(t, "100000"), fixed.Qty(math.MinInt64)); err == nil {
+		t.Fatal("expected unrepresentable position rejection")
+	}
+	if _, ok := e.Account("unsafe"); ok {
+		t.Fatal("rejected account was added")
+	}
+}

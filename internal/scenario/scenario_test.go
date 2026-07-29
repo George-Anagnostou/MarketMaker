@@ -32,6 +32,26 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	}
 }
 
+func TestCatalogTutorialsAreCloned(t *testing.T) {
+	definition, ok := Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	definition.Tutorial[0].Title = "mutated"
+	definition.Tutorial = definition.Tutorial[:1]
+
+	fresh, ok := Get("first-spread-v1")
+	if !ok || len(fresh.Tutorial) != 4 || fresh.Tutorial[0].Title == "mutated" {
+		t.Fatalf("catalog was mutated: %+v", fresh.Tutorial)
+	}
+
+	snapshot := fresh.Snapshot()
+	snapshot.Tutorial[0].Title = "mutated snapshot"
+	if fresh.Tutorial[0].Title == "mutated snapshot" {
+		t.Fatalf("snapshot aliases definition tutorial: %+v", fresh.Tutorial)
+	}
+}
+
 func TestCoachPrioritizesInventory(t *testing.T) {
 	before := exchange.State{Position: 0, Mark: fixed.Price(1_000_000)}
 	result := exchange.Result{State: exchange.State{Position: fixed.Qty(10_000), Mark: fixed.Price(1_000_000)}}
@@ -43,6 +63,13 @@ func TestCoachPrioritizesInventory(t *testing.T) {
 func TestInventoryPressureCoachingSkewsInventory(t *testing.T) {
 	result := exchange.Result{State: exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(1_000_000)}}
 	if got := Coach(Snapshot{ID: "inventory-pressure-v1"}, exchange.State{Mark: fixed.Price(1_000_000)}, result); got.Code != "long-skew" {
+		t.Fatalf("coaching=%+v", got)
+	}
+}
+
+func TestCoachingHandlesMinInt64Inventory(t *testing.T) {
+	result := exchange.Result{State: exchange.State{Position: fixed.Qty(math.MinInt64), Mark: fixed.Price(1_000_000)}}
+	if got := Coach(Snapshot{ID: "inventory-pressure-v1"}, exchange.State{Mark: fixed.Price(1_000_000)}, result); got.Code != "short-skew" || got.Body == "" {
 		t.Fatalf("coaching=%+v", got)
 	}
 }
@@ -98,6 +125,31 @@ func TestBuildRecapTracksIntraTurnInventoryAndRejectsOverflow(t *testing.T) {
 	_, err = BuildRecap(snapshot, cfg, []exchange.Result{{Summary: exchange.Summary{UnitsTraded: fixed.Qty(math.MaxInt64)}}}, exchange.Result{Summary: exchange.Summary{UnitsTraded: 1}})
 	if err == nil {
 		t.Fatal("expected recap overflow")
+	}
+}
+
+func TestBuildRecapPropagatesUnrepresentableMagnitudeAndPnL(t *testing.T) {
+	snapshot := Snapshot{Objective: "Test arithmetic failures."}
+	base := exchange.Config{StartingCash: fixed.Money(1), StartingMark: 0}
+	for _, test := range []struct {
+		name string
+		cfg  exchange.Config
+	}{
+		{name: "starting inventory magnitude", cfg: exchange.Config{StartingCash: fixed.Money(1), StartingMark: 0, StartingPosition: fixed.Qty(math.MinInt64)}},
+		{name: "PnL subtraction", cfg: exchange.Config{StartingCash: fixed.Money(math.MinInt64), StartingMark: 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := BuildRecap(snapshot, test.cfg, nil, exchange.Result{}); err == nil {
+				t.Fatal("BuildRecap accepted unrepresentable arithmetic")
+			}
+		})
+	}
+
+	if _, err := BuildRecap(snapshot, base, nil, exchange.Result{Events: []exchange.Event{{Trade: &exchange.Trade{SellerID: exchange.PlayerAccount, Quantity: fixed.Qty(math.MinInt64)}}}}); err == nil {
+		t.Fatal("BuildRecap accepted unrepresentable trade subtraction")
+	}
+	if _, err := BuildRecap(snapshot, base, nil, exchange.Result{State: exchange.State{Position: fixed.Qty(math.MinInt64)}}); err == nil {
+		t.Fatal("BuildRecap accepted unrepresentable final inventory magnitude")
 	}
 }
 
@@ -165,5 +217,35 @@ func TestVolatilityScorecardCountsAdverseSelection(t *testing.T) {
 	before := exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(100_000)}
 	if got := Coach(Snapshot{ID: "volatility-shock-v1"}, before, final); got.Code != "shock-long-protect" {
 		t.Fatalf("risk-reducing coaching=%+v", got)
+	}
+}
+
+func TestLegacyScorecardFallbacks(t *testing.T) {
+	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
+	final := exchange.Result{State: exchange.State{Cash: fixed.Money(10_000_000_000), Mark: fixed.Price(100_000)}}
+	for _, test := range []struct {
+		id    string
+		label string
+	}{
+		{id: "first-spread-v1", label: "Matched volume"},
+		{id: "inventory-pressure-v1", label: "Peak inventory"},
+		{id: "volatility-shock-v1", label: "Adverse selection turns"},
+	} {
+		t.Run(test.id, func(t *testing.T) {
+			recap, err := BuildRecap(Snapshot{ID: test.id}, cfg, nil, final)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recap.Scorecard == nil || recap.Scorecard.FocusLabel != test.label || recap.Scorecard.Reflection == "" {
+				t.Fatalf("scorecard=%+v", recap.Scorecard)
+			}
+		})
+	}
+	unknown, err := BuildRecap(Snapshot{ID: "unknown"}, cfg, nil, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.Scorecard != nil {
+		t.Fatalf("unexpected scorecard=%+v", unknown.Scorecard)
 	}
 }

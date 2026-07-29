@@ -81,7 +81,11 @@ func (c Config) Validate() error {
 	if c.MaxPosition <= 0 {
 		return errors.New("max position must be positive")
 	}
-	if fixed.AbsQty(c.StartingPosition) > c.MaxPosition {
+	startingPositionAbs, err := fixed.AbsQtyChecked(c.StartingPosition)
+	if err != nil {
+		return errors.New("starting position exceeds supported range")
+	}
+	if startingPositionAbs > c.MaxPosition {
 		return errors.New("starting position exceeds maximum position")
 	}
 	if c.MaxOrdersPerTurn < 0 || c.MaxOrdersPerTurn > 1_000 || !c.MaxOrderQty.Positive() || c.MaxFlowSlippageBps < 0 || c.MaxFlowSlippageBps > 10_000 {
@@ -104,7 +108,7 @@ func (c Config) Validate() error {
 	if err != nil || startingEquity <= 0 {
 		return errors.New("starting account has non-positive equity")
 	}
-	startingGross, err := fixed.Notional(c.StartingMark, fixed.AbsQty(c.StartingPosition))
+	startingGross, err := fixed.Notional(c.StartingMark, startingPositionAbs)
 	if err != nil {
 		return errors.New("starting exposure exceeds supported range")
 	}
@@ -577,14 +581,23 @@ func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
 	if err != nil {
 		return false
 	}
-	if fixed.AbsQty(longPosition) > e.cfg.MaxPosition || fixed.AbsQty(shortPosition) > e.cfg.MaxPosition {
+	longPositionAbs, err := fixed.AbsQtyChecked(longPosition)
+	if err != nil || longPositionAbs > e.cfg.MaxPosition {
+		return false
+	}
+	shortPositionAbs, err := fixed.AbsQtyChecked(shortPosition)
+	if err != nil || shortPositionAbs > e.cfg.MaxPosition {
 		return false
 	}
 	equity, err := e.equity(player)
 	if err != nil {
 		return false
 	}
-	positionNotional, err := fixed.Notional(e.mark, fixed.AbsQty(player.Position))
+	positionAbs, err := fixed.AbsQtyChecked(player.Position)
+	if err != nil {
+		return false
+	}
+	positionNotional, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -646,14 +659,23 @@ func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Pric
 	if positionErr != nil {
 		return false
 	}
-	if fixed.AbsQty(longWorst) > e.cfg.MaxPosition || fixed.AbsQty(shortWorst) > e.cfg.MaxPosition {
+	longWorstAbs, err := fixed.AbsQtyChecked(longWorst)
+	if err != nil || longWorstAbs > e.cfg.MaxPosition {
+		return false
+	}
+	shortWorstAbs, err := fixed.AbsQtyChecked(shortWorst)
+	if err != nil || shortWorstAbs > e.cfg.MaxPosition {
 		return false
 	}
 	equity, err := e.equity(account)
 	if err != nil {
 		return false
 	}
-	gross, err := fixed.Notional(e.mark, fixed.AbsQty(account.Position))
+	positionAbs, err := fixed.AbsQtyChecked(account.Position)
+	if err != nil {
+		return false
+	}
+	gross, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -783,14 +805,15 @@ func (e *Engine) accountWithinLimits(accountID string, maintenance bool) bool {
 	if a.External {
 		return true
 	}
-	if fixed.AbsQty(a.Position) > e.cfg.MaxPosition {
+	positionAbs, err := fixed.AbsQtyChecked(a.Position)
+	if err != nil || positionAbs > e.cfg.MaxPosition {
 		return false
 	}
 	eq, err := e.equity(a)
 	if err != nil || eq <= 0 {
 		return false
 	}
-	gross, err := fixed.Notional(e.mark, fixed.AbsQty(a.Position))
+	gross, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -844,7 +867,11 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 		}
 	}
 	player := e.accounts[PlayerAccount]
-	storage, err := fixed.Notional(e.cfg.StoragePerUnit, fixed.AbsQty(player.Position))
+	positionAbs, err := fixed.AbsQtyChecked(player.Position)
+	if err != nil {
+		return Summary{}, err
+	}
+	storage, err := fixed.Notional(e.cfg.StoragePerUnit, positionAbs)
 	if err != nil {
 		return Summary{}, err
 	}

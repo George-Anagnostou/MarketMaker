@@ -87,7 +87,35 @@ func AddQty(a, b Qty) (Qty, error) {
 	return a + b, nil
 }
 
-func SubQty(a, b Qty) (Qty, error) { return AddQty(a, -b) }
+// NegMoney returns the additive inverse of v when it is representable.
+func NegMoney(v Money) (Money, error) {
+	if v == Money(math.MinInt64) {
+		return 0, errors.New("money negation overflows range")
+	}
+	return -v, nil
+}
+
+// NegQty returns the additive inverse of v when it is representable.
+func NegQty(v Qty) (Qty, error) {
+	if v == Qty(math.MinInt64) {
+		return 0, errors.New("quantity negation overflows range")
+	}
+	return -v, nil
+}
+
+func SubMoney(a, b Money) (Money, error) {
+	if (b > 0 && a < Money(math.MinInt64)+b) || (b < 0 && a > Money(math.MaxInt64)+b) {
+		return 0, errors.New("money overflows range")
+	}
+	return a - b, nil
+}
+
+func SubQty(a, b Qty) (Qty, error) {
+	if (b > 0 && a < Qty(math.MinInt64)+b) || (b < 0 && a > Qty(math.MaxInt64)+b) {
+		return 0, errors.New("quantity overflows range")
+	}
+	return a - b, nil
+}
 
 // ScaleMoney returns amount * numerator / denominator without overflowing the
 // intermediate product. It truncates toward zero, matching integer settlement.
@@ -127,11 +155,22 @@ func ScalePrice(price Price, numerator, denominator int64) (Price, error) {
 	return Price(quotient*numerator + remainder*numerator/denominator), nil
 }
 
-func AbsQty(v Qty) Qty {
+// AbsQtyChecked returns the magnitude of v when it is representable as a Qty.
+func AbsQtyChecked(v Qty) (Qty, error) {
 	if v < 0 {
-		return -v
+		return NegQty(v)
 	}
-	return v
+	return v, nil
+}
+
+// AbsQty returns the magnitude of v. Call AbsQtyChecked when the input can be
+// untrusted; the magnitude of MinInt64 cannot be represented as a Qty.
+func AbsQty(v Qty) Qty {
+	abs, err := AbsQtyChecked(v)
+	if err != nil {
+		panic(err)
+	}
+	return abs
 }
 
 func parse(s string, scale int64) (int64, error) {

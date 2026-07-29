@@ -135,6 +135,7 @@ func List() []Snapshot {
 func Get(id string) (Definition, bool) {
 	for _, definition := range catalog {
 		if definition.ID == id {
+			definition.Tutorial = cloneTutorial(definition.Tutorial)
 			return definition, true
 		}
 	}
@@ -142,8 +143,11 @@ func Get(id string) (Definition, bool) {
 }
 
 func (d Definition) Snapshot() Snapshot {
-	tutorial := append([]TutorialStep(nil), d.Tutorial...)
-	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: tutorial, Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns}
+	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: cloneTutorial(d.Tutorial), Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns}
+}
+
+func cloneTutorial(tutorial []TutorialStep) []TutorialStep {
+	return append([]TutorialStep(nil), tutorial...)
 }
 
 func ValidateCatalog() error {
@@ -189,7 +193,7 @@ func coachGeneral(before exchange.State, result exchange.Result) *Coaching {
 	if after.IsOver {
 		return &Coaching{Code: "terminal", Title: "Session complete", Body: "The scenario is over. Review the turns where inventory and the reference mark changed the outcome."}
 	}
-	if abs(after.Position) > abs(before.Position) && abs(after.Position) > 0 {
+	if hasGreaterMagnitude(after.Position, before.Position) && after.Position != 0 {
 		return &Coaching{Code: "inventory-built", Title: "Inventory increased", Body: fmt.Sprintf("You now carry %s units. The next reference-price move matters more than it did before.", after.Position)}
 	}
 	if (before.Position > 0 && after.Mark < before.Mark) || (before.Position < 0 && after.Mark > before.Mark) {
@@ -219,7 +223,7 @@ func coachInventoryPressure(before exchange.State, result exchange.Result) *Coac
 		return &Coaching{Code: "long-skew", Title: "Skew down to reduce a long", Body: fmt.Sprintf("You are long %s units. On the next quote, shift both prices down: the lower ask invites offsetting buys from customers, while the lower bid discourages more buying from you.", after.Position)}
 	}
 	if after.Position < 0 {
-		return &Coaching{Code: "short-skew", Title: "Skew up to reduce a short", Body: fmt.Sprintf("You are short %s units. On the next quote, shift both prices up: the higher bid invites offsetting sells from customers, while the higher ask discourages more selling from you.", abs(after.Position))}
+		return &Coaching{Code: "short-skew", Title: "Skew up to reduce a short", Body: fmt.Sprintf("You are short %s units. On the next quote, shift both prices up: the higher bid invites offsetting sells from customers, while the higher ask discourages more selling from you.", magnitudeString(after.Position))}
 	}
 	if result.Summary.UnitsTraded == 0 {
 		return &Coaching{Code: "pressure-no-fill", Title: "No fill is information", Body: "Your quote did not cross any customer limit. If you are comfortable being flat, tighten by one cent to test for more flow; otherwise keep your protection."}
@@ -262,7 +266,28 @@ func addedRisk(before, after fixed.Qty) bool {
 	if before == 0 || (before > 0 && after < 0) || (before < 0 && after > 0) {
 		return true
 	}
-	return abs(after) > abs(before)
+	return hasGreaterMagnitude(after, before)
+}
+
+func hasGreaterMagnitude(after, before fixed.Qty) bool {
+	afterMagnitude, afterErr := fixed.AbsQtyChecked(after)
+	beforeMagnitude, beforeErr := fixed.AbsQtyChecked(before)
+	if afterErr != nil {
+		return beforeErr == nil
+	}
+	if beforeErr != nil {
+		return false
+	}
+	return afterMagnitude > beforeMagnitude
+}
+
+func magnitudeString(value fixed.Qty) string {
+	magnitude, err := fixed.AbsQtyChecked(value)
+	if err == nil {
+		return magnitude.String()
+	}
+	// Qty.String handles MinInt64 without negating it; remove its sign for prose.
+	return value.String()[1:]
 }
 
 func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) (*Recap, error) {
@@ -278,13 +303,20 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 	adverseSelectionTurns := 0
 	position := cfg.StartingPosition
 	previousMark := cfg.StartingMark
-	includePosition := func(next fixed.Qty) {
-		position = next
-		if abs(position) > maxInventory {
-			maxInventory = abs(position)
+	includePosition := func(next fixed.Qty) error {
+		magnitude, err := fixed.AbsQtyChecked(next)
+		if err != nil {
+			return err
 		}
+		position = next
+		if magnitude > maxInventory {
+			maxInventory = magnitude
+		}
+		return nil
 	}
-	includePosition(position)
+	if err := includePosition(position); err != nil {
+		return nil, err
+	}
 	include := func(result exchange.Result) error {
 		priorPosition := position
 		for _, event := range result.Events {
@@ -296,20 +328,27 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 				if err != nil {
 					return err
 				}
-				includePosition(next)
+				if err := includePosition(next); err != nil {
+					return err
+				}
 			}
 			if event.Trade.SellerID == exchange.PlayerAccount {
 				next, err := fixed.SubQty(position, event.Trade.Quantity)
 				if err != nil {
 					return err
 				}
-				includePosition(next)
+				if err := includePosition(next); err != nil {
+					return err
+				}
 			}
 		}
-		if abs(result.State.Position) > maxInventory {
-			maxInventory = abs(result.State.Position)
+		stateMagnitude, err := fixed.AbsQtyChecked(result.State.Position)
+		if err != nil {
+			return err
 		}
-		var err error
+		if stateMagnitude > maxInventory {
+			maxInventory = stateMagnitude
+		}
 		units, err = fixed.AddQty(units, result.Summary.UnitsTraded)
 		if err != nil {
 			return err
@@ -341,7 +380,7 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 	if err != nil {
 		return nil, err
 	}
-	pnl, err := fixed.AddMoney(finalEquity, -startEquity)
+	pnl, err := fixed.SubMoney(finalEquity, startEquity)
 	if err != nil {
 		return nil, err
 	}
@@ -401,11 +440,4 @@ func legacyReflection(scenarioID string) string {
 	default:
 		return "Review the risk carried and the quote adjustment used to manage it."
 	}
-}
-
-func abs(value fixed.Qty) fixed.Qty {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
