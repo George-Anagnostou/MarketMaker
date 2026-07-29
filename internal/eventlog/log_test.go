@@ -540,7 +540,7 @@ func TestLegacyAppendOmitsScorecardFromWireFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, AdverseSelectionTurns: 3, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}}
+	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, AdverseSelectionTurns: 3, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}, InformedOrders: 2, InformedOrdersFilled: 1, InformedUnitsTraded: qty(t, "1"), InformedFlowPnL: money(t, "-1")}
 	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: recap}); err != nil {
 		t.Fatal(err)
 	}

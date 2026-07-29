@@ -2,6 +2,8 @@ package scenario
 
 import (
 	"math"
+	"reflect"
+	"strings"
 	"testing"
 
 	"market-maker/internal/exchange"
@@ -12,8 +14,8 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if err := ValidateCatalog(); err != nil {
 		t.Fatal(err)
 	}
-	if len(List()) < 3 {
-		t.Fatal("expected initial lesson catalog")
+	if len(List()) != 4 {
+		t.Fatal("expected four lessons in catalog")
 	}
 	first, ok := Get("first-spread-v1")
 	if !ok {
@@ -29,6 +31,16 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	volatility, ok := Get("volatility-shock-v1")
 	if !ok || volatility.Revision != "2" || len(volatility.Snapshot().Tutorial) != 5 || volatility.Snapshot().Reflection == "" || volatility.Snapshot().ScorecardKind != "adverse_selection_turns" {
 		t.Fatalf("volatility tutorial=%+v", volatility.Snapshot().Tutorial)
+	}
+	if volatility.Title != "Volatility Shock" || !reflect.DeepEqual(volatility.Config, config(8, 303, -300, 425, 4, 12)) {
+		t.Fatalf("volatility v1 changed: %+v", volatility)
+	}
+	informed, ok := Get("volatility-shock-v2")
+	if !ok || informed.Revision != "1" || informed.Title != "Volatility Shock: Informed Flow" || len(informed.Snapshot().Tutorial) != 5 || informed.Snapshot().Reflection == "" || informed.Snapshot().ScorecardKind != "informed_flow_pnl" {
+		t.Fatalf("informed scenario=%+v", informed)
+	}
+	if informed.Config.NumTurns != 8 || informed.Config.Seed != 304 || informed.Config.SimulationVersion != exchange.SimulationVersionAdverseSelection || informed.Config.InformedFlowBps != 6_000 || informed.Config.MinMoveBps != volatility.Config.MinMoveBps || informed.Config.MaxMoveBps != volatility.Config.MaxMoveBps {
+		t.Fatalf("informed config=%+v", informed.Config)
 	}
 }
 
@@ -82,6 +94,94 @@ func TestVolatilityShockCoachingPrioritizesProtection(t *testing.T) {
 	}
 }
 
+func TestInformedFlowCoachingUsesAuthoritativeEvidence(t *testing.T) {
+	buyFill := exchange.Result{
+		State:   exchange.State{Position: fixed.Qty(-10_000), Mark: fixed.Price(101_000)},
+		Summary: exchange.Summary{InformedOrders: 1, InformedOrdersFilled: 1, InformedUnitsTraded: fixed.Qty(10_000), InformedFlowPnL: fixed.Money(-10_000_000)},
+		Events:  []exchange.Event{{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.FlowAccount, SellerID: exchange.PlayerAccount, Quantity: fixed.Qty(10_000), Informed: true}}},
+	}
+	sellFill := exchange.Result{
+		State:   exchange.State{Position: fixed.Qty(20_000), Mark: fixed.Price(99_000)},
+		Summary: exchange.Summary{InformedOrders: 1, InformedOrdersFilled: 1, InformedUnitsTraded: fixed.Qty(20_000), InformedFlowPnL: fixed.Money(-20_000_000)},
+		Events:  []exchange.Event{{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.PlayerAccount, SellerID: exchange.FlowAccount, Quantity: fixed.Qty(20_000), Informed: true}}},
+	}
+	avoided := exchange.Result{
+		Summary: exchange.Summary{InformedOrders: 1},
+		Events:  []exchange.Event{{Type: "flow_order", Order: &exchange.Order{AccountID: exchange.FlowAccount, Side: exchange.Buy, Informed: true}}},
+	}
+	ordinary := exchange.Result{
+		State:   exchange.State{Mark: fixed.Price(90_000)},
+		Summary: exchange.Summary{UnitsTraded: fixed.Qty(10_000)},
+		Events:  []exchange.Event{{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.PlayerAccount, SellerID: exchange.FlowAccount, Quantity: fixed.Qty(10_000)}}},
+	}
+	terminalBuy := buyFill
+	terminalBuy.State.IsOver = true
+	terminalBuy.State.Reason = exchange.TurnsComplete
+	containedBuy := buyFill
+	containedBuy.Summary.InformedFlowPnL = fixed.Money(10_000_000)
+
+	for _, test := range []struct {
+		name       string
+		result     exchange.Result
+		wantCode   string
+		wantTitle  string
+		wantInBody []string
+	}{
+		{name: "informed buy", result: buyFill, wantCode: "informed-buy-filled", wantTitle: "You sold before the rise", wantInBody: []string{"1.0000", "-0.10000000"}},
+		{name: "informed sell", result: sellFill, wantCode: "informed-sell-filled", wantTitle: "You bought before the fall", wantInBody: []string{"2.0000", "-0.20000000"}},
+		{name: "avoided informed order", result: avoided, wantCode: "informed-flow-avoided", wantInBody: []string{"0.0000", "0.00000000"}},
+		{name: "contained informed buy", result: containedBuy, wantCode: "informed-buy-contained", wantTitle: "Your ask contained the informed buy", wantInBody: []string{"0.10000000"}},
+		{name: "ordinary flow", result: ordinary, wantCode: "ordinary-flow"},
+		{name: "terminal informed evidence", result: terminalBuy, wantCode: "informed-buy-filled", wantTitle: "You sold before the rise"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := Coach(Snapshot{ID: "volatility-shock-v2"}, exchange.State{Mark: fixed.Price(100_000)}, test.result)
+			if got.Code != test.wantCode || test.wantTitle != "" && got.Title != test.wantTitle {
+				t.Fatalf("coaching=%+v", got)
+			}
+			for _, text := range test.wantInBody {
+				if !strings.Contains(got.Body, text) {
+					t.Fatalf("coaching body %q does not contain %q", got.Body, text)
+				}
+			}
+		})
+	}
+}
+
+func TestInformedScenarioSeedExercisesBothDirections(t *testing.T) {
+	definition, ok := Get("volatility-shock-v2")
+	if !ok {
+		t.Fatal("missing informed-flow scenario")
+	}
+	engine, err := exchange.New(definition.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	informedBuys, informedSells, informedFills := 0, 0, 0
+	for !engine.State().IsOver {
+		mark := engine.State().Mark
+		result, err := engine.SubmitQuote(mark-fixed.Price(5_000), mark+fixed.Price(5_000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range result.Events {
+			if event.Type == "flow_order" && event.Order != nil && event.Order.Informed {
+				if event.Order.Side == exchange.Buy {
+					informedBuys++
+				} else {
+					informedSells++
+				}
+			}
+			if event.Type == "trade" && event.Trade != nil && event.Trade.Informed && (event.Trade.BuyerID == exchange.PlayerAccount || event.Trade.SellerID == exchange.PlayerAccount) {
+				informedFills++
+			}
+		}
+	}
+	if informedBuys == 0 || informedSells == 0 || informedFills == 0 {
+		t.Fatalf("seed did not exercise lesson: buys=%d sells=%d fills=%d", informedBuys, informedSells, informedFills)
+	}
+}
+
 func TestBuildRecapIncludesTerminalTurn(t *testing.T) {
 	snapshot := Snapshot{Objective: "Test the final turn."}
 	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
@@ -102,6 +202,61 @@ func TestBuildRecapIncludesTerminalTurn(t *testing.T) {
 	}
 	if recap.MaxAbsInventory != fixed.Qty(20_000) || recap.UnitsTraded != fixed.Qty(30_000) || recap.StoragePaid != fixed.Money(300_000_000) {
 		t.Fatalf("recap=%+v", recap)
+	}
+}
+
+func TestBuildRecapAggregatesMeasuredInformedFlow(t *testing.T) {
+	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
+	records := []exchange.Result{{
+		State: exchange.State{Cash: fixed.Money(10_000_000_000), Mark: fixed.Price(100_000)},
+		Summary: exchange.Summary{
+			InformedOrders: 2, InformedOrdersFilled: 1, InformedUnitsTraded: fixed.Qty(10_000), InformedFlowPnL: fixed.Money(-100_000_000),
+		},
+	}}
+	final := exchange.Result{
+		State: exchange.State{Cash: fixed.Money(10_000_000_000), Mark: fixed.Price(100_000), Reason: exchange.TurnsComplete},
+		Summary: exchange.Summary{
+			InformedOrders: 3, InformedOrdersFilled: 2, InformedUnitsTraded: fixed.Qty(20_000), InformedFlowPnL: fixed.Money(50_000_000),
+		},
+	}
+	recap, err := BuildRecap(Snapshot{ID: "volatility-shock-v2", ScorecardKind: "informed_flow_pnl", Reflection: "Reflect."}, cfg, records, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recap.InformedOrders != 5 || recap.InformedOrdersFilled != 3 || recap.InformedUnitsTraded != fixed.Qty(30_000) || recap.InformedFlowPnL != fixed.Money(-50_000_000) || recap.AdverseSelectionTurns != 1 {
+		t.Fatalf("recap=%+v", recap)
+	}
+	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Informed-flow P&L" || recap.Scorecard.FocusValue != recap.InformedFlowPnL.String() {
+		t.Fatalf("scorecard=%+v", recap.Scorecard)
+	}
+	for _, text := range []string{"5 informed orders", "3 filled", "3.0000 units", "More negative", "total P&L", "matched volume"} {
+		if !strings.Contains(recap.Scorecard.FocusNote, text) {
+			t.Fatalf("scorecard note %q does not contain %q", recap.Scorecard.FocusNote, text)
+		}
+	}
+}
+
+func TestBuildRecapRejectsInformedMetricOverflow(t *testing.T) {
+	snapshot := Snapshot{ID: "volatility-shock-v2"}
+	cfg := exchange.Config{StartingCash: fixed.Money(1), StartingMark: fixed.Price(1)}
+	maxInt := int(^uint(0) >> 1)
+	tests := []struct {
+		name   string
+		prior  exchange.Summary
+		latest exchange.Summary
+	}{
+		{name: "informed PnL", prior: exchange.Summary{InformedFlowPnL: fixed.Money(math.MaxInt64)}, latest: exchange.Summary{InformedFlowPnL: 1}},
+		{name: "informed quantity", prior: exchange.Summary{InformedUnitsTraded: fixed.Qty(math.MaxInt64)}, latest: exchange.Summary{InformedUnitsTraded: 1}},
+		{name: "informed order count", prior: exchange.Summary{InformedOrders: maxInt}, latest: exchange.Summary{InformedOrders: 1}},
+		{name: "informed filled count", prior: exchange.Summary{InformedOrdersFilled: maxInt}, latest: exchange.Summary{InformedOrdersFilled: 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := BuildRecap(snapshot, cfg, []exchange.Result{{Summary: test.prior}}, exchange.Result{Summary: test.latest})
+			if err == nil {
+				t.Fatal("BuildRecap accepted overflowing informed metrics")
+			}
+		})
 	}
 }
 
@@ -183,6 +338,36 @@ func TestBuildRecapIncludesEngineProducedTerminalTurn(t *testing.T) {
 	}
 }
 
+func TestBuildRecapIncludesEngineProducedV2TerminalLesson(t *testing.T) {
+	definition, ok := Get("volatility-shock-v2")
+	if !ok {
+		t.Fatal("missing informed-flow scenario")
+	}
+	cfg := definition.Config
+	cfg.NumTurns = 1
+	engine, err := exchange.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.SubmitQuote(fixed.Price(995_000), fixed.Price(1_005_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.State.IsOver || result.State.Reason != exchange.TurnsComplete || result.Summary.PnLAttribution == nil {
+		t.Fatalf("terminal result=%+v summary=%+v", result.State, result.Summary)
+	}
+	recap, err := BuildRecap(definition.Snapshot(), cfg, nil, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recap.InformedOrders != result.Summary.InformedOrders || recap.InformedOrdersFilled != result.Summary.InformedOrdersFilled || recap.InformedUnitsTraded != result.Summary.InformedUnitsTraded || recap.InformedFlowPnL != result.Summary.InformedFlowPnL {
+		t.Fatalf("recap=%+v summary=%+v", recap, result.Summary)
+	}
+	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Informed-flow P&L" || recap.Scorecard.FocusValue != result.Summary.InformedFlowPnL.String() {
+		t.Fatalf("scorecard=%+v", recap.Scorecard)
+	}
+}
+
 func TestVolatilityScorecardCountsAdverseSelection(t *testing.T) {
 	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
 	final := exchange.Result{State: exchange.State{Cash: fixed.Money(9_000_000_000), Position: fixed.Qty(10_000), Mark: fixed.Price(90_000)}, Summary: exchange.Summary{UnitsTraded: fixed.Qty(10_000)}}
@@ -230,6 +415,7 @@ func TestLegacyScorecardFallbacks(t *testing.T) {
 		{id: "first-spread-v1", label: "Matched volume"},
 		{id: "inventory-pressure-v1", label: "Peak inventory"},
 		{id: "volatility-shock-v1", label: "Adverse selection turns"},
+		{id: "volatility-shock-v2", label: "Informed-flow P&L"},
 	} {
 		t.Run(test.id, func(t *testing.T) {
 			recap, err := BuildRecap(Snapshot{ID: test.id}, cfg, nil, final)

@@ -190,6 +190,10 @@ func (l *Log) Append(record Record) error {
 		recap := *record.Recap
 		recap.AdverseSelectionTurns = 0
 		recap.Scorecard = nil
+		recap.InformedOrders = 0
+		recap.InformedOrdersFilled = 0
+		recap.InformedUnitsTraded = 0
+		recap.InformedFlowPnL = 0
 		record.Recap = &recap
 	}
 	switch record.Schema {
