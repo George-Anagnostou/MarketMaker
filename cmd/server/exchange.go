@@ -37,6 +37,7 @@ type exchangeEntry struct {
 	engine        *exchange.Engine
 	log           *eventlog.Log
 	commands      map[string]eventlog.Record
+	latestTurn    *latestTurn
 	scenario      *scenario.Snapshot
 	coaching      *scenario.Coaching
 	recap         *scenario.Recap
@@ -72,12 +73,18 @@ type exchangeResponse struct {
 }
 
 type exchangeStateResponse struct {
-	GameID   string             `json:"game_id"`
-	Version  uint64             `json:"version"`
-	State    exchange.State     `json:"state"`
-	Scenario *scenario.Snapshot `json:"scenario,omitempty"`
-	Coaching *scenario.Coaching `json:"coaching,omitempty"`
-	Recap    *scenario.Recap    `json:"recap,omitempty"`
+	GameID     string             `json:"game_id"`
+	Version    uint64             `json:"version"`
+	State      exchange.State     `json:"state"`
+	LatestTurn *latestTurn        `json:"latest_turn,omitempty"`
+	Scenario   *scenario.Snapshot `json:"scenario,omitempty"`
+	Coaching   *scenario.Coaching `json:"coaching,omitempty"`
+	Recap      *scenario.Recap    `json:"recap,omitempty"`
+}
+
+type latestTurn struct {
+	Turn    int              `json:"turn"`
+	Summary exchange.Summary `json:"summary"`
 }
 
 type exchangeCreateResponse struct {
@@ -208,9 +215,9 @@ func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, 
 		return
 	}
 	state := entry.engine.State()
-	snapshot, coaching, recap := entry.scenario, entry.coaching, entry.recap
+	latest, snapshot, coaching, recap := entry.latestTurn, entry.scenario, entry.coaching, entry.recap
 	entry.mu.Unlock()
-	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, State: state, Scenario: snapshot, Coaching: coaching, Recap: recap})
+	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap})
 }
 
 func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
@@ -281,6 +288,9 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		return
 	}
 	entry.commands[command.ID] = record
+	if command.Type == exchange.CommandSubmitQuote {
+		entry.latestTurn = &latestTurn{Turn: result.State.Turn, Summary: result.Summary}
+	}
 	entry.coaching, entry.recap = record.Coaching, record.Recap
 	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false, entry))
 }
@@ -439,6 +449,7 @@ func (entry *exchangeEntry) recover() error {
 	entry.engine = rebuilt.engine
 	entry.log = rebuilt.log
 	entry.commands = rebuilt.commands
+	entry.latestTurn = rebuilt.latestTurn
 	entry.scenario = rebuilt.scenario
 	entry.coaching = rebuilt.coaching
 	entry.recap = rebuilt.recap
@@ -453,6 +464,9 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	}
 	entry := &exchangeEntry{engine: engine, log: log, commands: commands, scenario: log.Meta().Scenario}
 	for _, record := range records {
+		if record.Command.Type == exchange.CommandSubmitQuote {
+			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary}
+		}
 		if record.Coaching != nil {
 			entry.coaching = record.Coaching
 		}
@@ -477,12 +491,24 @@ func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.En
 		for i := range result.Events {
 			result.Events[i].CommandID = record.Command.ID
 		}
-		if result.State != record.Result.State || result.Summary != record.Result.Summary || !reflect.DeepEqual(result.Events, record.Result.Events) || !reflect.DeepEqual(result.Ledger, record.Result.Ledger) {
+		if !durableResultsEqual(result, record.Result) {
 			return nil, nil, fmt.Errorf("replay result mismatch at version %d", record.Version)
 		}
 		commands[record.Command.ID] = record
 	}
 	return engine, commands, nil
+}
+
+func durableResultsEqual(left, right exchange.Result) bool {
+	// An empty ledger is omitted on the wire and decodes as nil. Both represent
+	// a successful command with no journal entries.
+	if len(left.Ledger) == 0 {
+		left.Ledger = nil
+	}
+	if len(right.Ledger) == 0 {
+		right.Ledger = nil
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {

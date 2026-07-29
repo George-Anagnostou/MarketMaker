@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	// SchemaVersion is used for newly created logs. Schema 1 remains readable
-	// and appendable so existing games retain their original wire format.
-	SchemaVersion       = 2
-	legacySchemaVersion = 1
+	// SchemaVersion is used for newly created logs. Schemas 1 and 2 remain
+	// readable and appendable so existing games retain their wire formats.
+	schema1       = 1
+	schema2       = 2
+	SchemaVersion = 3
 )
 
 type Meta struct {
@@ -131,10 +132,12 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, nil, fmt.Errorf("decode game metadata: %w", err)
 	}
-	if (meta.Schema != legacySchemaVersion && meta.Schema != SchemaVersion) || meta.GameID != gameID {
+	if !supportedSchema(meta.Schema) || meta.GameID != gameID {
 		return nil, nil, errors.New("unsupported or mismatched game metadata")
 	}
-	if meta.Schema == SchemaVersion {
+	switch meta.Schema {
+	case schema1:
+	case schema2, SchemaVersion:
 		checksum, err := metadataChecksum(meta)
 		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
 			return nil, nil, errors.New("invalid game metadata checksum")
@@ -181,17 +184,21 @@ func (l *Log) Append(record Record) error {
 	}
 	record.Schema = l.meta.Schema
 	record.PreviousChecksum = l.lastChecksum
-	if record.Schema == legacySchemaVersion && record.Recap != nil {
+	if record.Schema == schema1 && record.Recap != nil {
 		// Schema 1 checksums must remain readable by binaries that predate
-		// scorecards, so retain its original recap wire format.
+		// lesson-specific recap fields, so retain its original recap wire format.
 		recap := *record.Recap
+		recap.AdverseSelectionTurns = 0
 		recap.Scorecard = nil
 		record.Recap = &recap
 	}
-	if record.Schema == SchemaVersion {
-		record.MetadataChecksum = l.meta.Checksum
-	} else {
+	switch record.Schema {
+	case schema1:
 		record.MetadataChecksum = ""
+	case schema2, SchemaVersion:
+		record.MetadataChecksum = l.meta.Checksum
+	default:
+		return errors.New("invalid event record")
 	}
 	checksum, err := recordChecksum(record)
 	if err != nil {
@@ -252,8 +259,14 @@ func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Re
 		if record.Schema != schema || record.Version != uint64(len(records)+1) || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
 			return nil, fmt.Errorf("invalid event record %d", i+1)
 		}
-		if schema == SchemaVersion && record.MetadataChecksum != expectedMetadataChecksum {
-			return nil, fmt.Errorf("event record %d is bound to different metadata", i+1)
+		switch schema {
+		case schema1:
+		case schema2, SchemaVersion:
+			if record.MetadataChecksum != expectedMetadataChecksum {
+				return nil, fmt.Errorf("event record %d is bound to different metadata", i+1)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported event record schema %d", schema)
 		}
 		if _, exists := commandIDs[record.Command.ID]; exists {
 			return nil, fmt.Errorf("duplicate event command id at record %d", i+1)
@@ -311,9 +324,16 @@ func recordChecksum(record Record) (string, error) {
 		return "", err
 	}
 	input := []byte(record.PreviousChecksum)
-	if record.Schema == SchemaVersion {
+	switch record.Schema {
+	case schema1:
+	case schema2:
 		input = append([]byte("market-maker/eventlog/record/v2\x00"), input...)
 		input = append(input, record.MetadataChecksum...)
+	case SchemaVersion:
+		input = append([]byte("market-maker/eventlog/record/v3\x00"), input...)
+		input = append(input, record.MetadataChecksum...)
+	default:
+		return "", errors.New("unsupported event record schema")
 	}
 	digest := sha256.Sum256(append(input, data...))
 	return fmt.Sprintf("%x", digest), nil
@@ -325,8 +345,26 @@ func metadataChecksum(meta Meta) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(append([]byte("market-maker/eventlog/meta/v2\x00"), data...))
+	var domain []byte
+	switch meta.Schema {
+	case schema2:
+		domain = []byte("market-maker/eventlog/meta/v2\x00")
+	case SchemaVersion:
+		domain = []byte("market-maker/eventlog/meta/v3\x00")
+	default:
+		return "", errors.New("unsupported game metadata schema")
+	}
+	digest := sha256.Sum256(append(domain, data...))
 	return fmt.Sprintf("%x", digest), nil
+}
+
+func supportedSchema(schema int) bool {
+	switch schema {
+	case schema1, schema2, SchemaVersion:
+		return true
+	default:
+		return false
+	}
 }
 
 func syncDir(path string) error {

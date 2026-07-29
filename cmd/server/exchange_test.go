@@ -93,6 +93,9 @@ func TestV2EndpointSemantics(t *testing.T) {
 			t.Fatalf("state response contains command-only field %q", field)
 		}
 	}
+	if _, exists := state["latest_turn"]; exists {
+		t.Fatal("state response contains latest_turn before the first turn")
+	}
 
 	methodTests := []struct {
 		path   string
@@ -276,6 +279,234 @@ func TestV2CommandIsIdempotentAndRecoversAfterReload(t *testing.T) {
 	}
 }
 
+func TestV2AdverseSelectionLatestTurnPersistsAcrossReload(t *testing.T) {
+	root := t.TempDir()
+	base, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing base scenario")
+	}
+	definition := scenario.Definition{
+		ID:            "test-adverse-selection-v2",
+		Revision:      "1",
+		Title:         "Test adverse selection",
+		Briefing:      "Test briefing",
+		Objective:     "Test objective",
+		Reflection:    "Test reflection",
+		ScorecardKind: "adverse_selection_turns",
+		Config:        base.Config,
+	}
+	definition.Config.NumTurns = 3
+	definition.Config.Seed = 909
+	definition.Config.SimulationVersion = exchange.SimulationVersionAdverseSelection
+	definition.Config.InformedFlowBps = 10_000
+	definition.Config.MaxOrdersPerTurn = 1
+	definition.Config.MaxOrderQty = fixed.Qty(10_000)
+	definition.Config.MaxFlowSlippageBps = 0
+	definition.Config.MinMoveBps = 100
+	definition.Config.MaxMoveBps = 100
+
+	svc := newExchangeService(root)
+	svc.lookupScenario = func(id string) (scenario.Definition, bool) {
+		return definition, id == definition.ID
+	}
+	ts := v2ServerForService(svc)
+	createBody := fmt.Sprintf(`{"game_id":"%s","command_id":"%s","scenario_id":"%s"}`, testGameID, testCreateID, definition.ID)
+	resp, err := http.Post(ts.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initial exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&initial); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if initial.LatestTurn != nil {
+		t.Fatalf("new game latest turn=%+v", initial.LatestTurn)
+	}
+
+	quote := fmt.Sprintf(`{"id":"%s","type":"submit_quote","expected_version":0,"bid":"99","ask":"100"}`, testQuoteID)
+	resp, err = http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(quote))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first exchangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&first); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if first.Summary.PnLAttribution == nil || len(first.Events) == 0 {
+		t.Fatalf("quote response omitted v2 attribution/events: %+v", first)
+	}
+
+	resp, err = http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(quote))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed exchangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&replayed); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !replayed.Command.Replayed || !reflect.DeepEqual(replayed.Summary, first.Summary) || !reflect.DeepEqual(replayed.Events, first.Events) {
+		t.Fatalf("idempotent response diverged: first=%+v replayed=%+v", first, replayed)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterQuote exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&afterQuote); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	wantLatest := &latestTurn{Turn: first.State.Turn, Summary: first.Summary}
+	if !reflect.DeepEqual(afterQuote.LatestTurn, wantLatest) {
+		t.Fatalf("latest turn=%+v want=%+v", afterQuote.LatestTurn, wantLatest)
+	}
+
+	quit := fmt.Sprintf(`{"id":"%s","type":"quit","expected_version":1}`, testQuitID)
+	resp, err = http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(quit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("quit status=%d", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterQuit exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&afterQuit); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !reflect.DeepEqual(afterQuit.LatestTurn, wantLatest) {
+		t.Fatalf("quit changed latest turn: %+v", afterQuit.LatestTurn)
+	}
+
+	type eventPage struct {
+		Events []exchange.Event `json:"events"`
+	}
+	resp, err = http.Get(ts.URL + "/api/v2/games/" + testGameID + "/events?limit=200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeReloadEvents eventPage
+	if err := json.NewDecoder(resp.Body).Decode(&beforeReloadEvents); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	ts.Close()
+
+	metaLog, records, err := eventlog.Open(root, testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metaLog.Meta().Schema != eventlog.SchemaVersion || eventlog.SchemaVersion != 3 || len(records) != 2 || metaLog.Meta().Config.SimulationVersion != exchange.SimulationVersionAdverseSelection {
+		t.Fatalf("persisted schema/config/records changed: meta=%+v records=%d", metaLog.Meta(), len(records))
+	}
+
+	reloaded := v2Server(root)
+	defer reloaded.Close()
+	resp, err = http.Get(reloaded.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recovered exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&recovered); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !reflect.DeepEqual(recovered.LatestTurn, wantLatest) || recovered.LatestTurn.Summary.PnLAttribution == nil {
+		t.Fatalf("recovered latest turn=%+v", recovered.LatestTurn)
+	}
+
+	resp, err = http.Get(reloaded.URL + "/api/v2/games/" + testGameID + "/events?limit=200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterReloadEvents eventPage
+	if err := json.NewDecoder(resp.Body).Decode(&afterReloadEvents); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !reflect.DeepEqual(afterReloadEvents.Events, beforeReloadEvents.Events) {
+		t.Fatalf("events changed after reload: before=%+v after=%+v", beforeReloadEvents.Events, afterReloadEvents.Events)
+	}
+}
+
+func TestReplayTreatsOmittedEmptyLedgerAsEquivalent(t *testing.T) {
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing scenario")
+	}
+	cfg := definition.Config
+	cfg.NumTurns = 0
+	cfg.MaxOrdersPerTurn = 0
+	cfg.StoragePerUnit = 0
+	engine, err := exchange.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := []exchange.Command{
+		{ID: testQuoteID, Type: exchange.CommandSubmitQuote, ExpectedVersion: 0, Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)},
+		{ID: "55555555-5555-4555-8555-555555555555", Type: exchange.CommandSubmitQuote, ExpectedVersion: 1, Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)},
+	}
+	records := make([]eventlog.Record, 0, len(commands))
+	for _, command := range commands {
+		result, err := engine.Execute(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range result.Events {
+			result.Events[i].CommandID = command.ID
+		}
+		records = append(records, eventlog.Record{Schema: eventlog.SchemaVersion, Version: result.State.Version, Command: command, Result: result})
+	}
+	if records[1].Result.Ledger == nil || len(records[1].Result.Ledger) != 0 {
+		t.Fatalf("second quote ledger=%+v, want non-nil empty slice", records[1].Result.Ledger)
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []eventlog.Record
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded[1].Result.Ledger != nil {
+		t.Fatalf("omitted ledger decoded as %+v", decoded[1].Result.Ledger)
+	}
+	replayed, _, err := replayRecords(cfg, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.State() != engine.State() {
+		t.Fatalf("replayed=%+v want=%+v", replayed.State(), engine.State())
+	}
+}
+
 func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 	root := t.TempDir()
 	svc := newExchangeService(root)
@@ -334,7 +565,7 @@ func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("stale append status=%d body=%s", response.Code, response.Body.String())
 	}
-	if entry.log == staleLog || entry.engine.State().Version != 1 || entry.commands[firstCommand.ID].Version != 1 || !reflect.DeepEqual(entry.coaching, firstRecord.Coaching) {
+	if entry.log == staleLog || entry.engine.State().Version != 1 || entry.commands[firstCommand.ID].Version != 1 || !reflect.DeepEqual(entry.coaching, firstRecord.Coaching) || entry.latestTurn == nil || !reflect.DeepEqual(entry.latestTurn.Summary, firstRecord.Result.Summary) {
 		t.Fatalf("recovered entry did not replace all persisted state: %+v", entry)
 	}
 

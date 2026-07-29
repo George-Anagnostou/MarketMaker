@@ -1,6 +1,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,144 @@ func TestAppendAndOpen(t *testing.T) {
 	}
 	if records[0].MetadataChecksum == "" || records[0].MetadataChecksum != log.Meta().Checksum {
 		t.Fatalf("record is not bound to metadata: %+v", records[0])
+	}
+}
+
+func TestNewLogsUseSchema3AndV3ChecksumDomains(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatal(err)
+	}
+
+	metaData, err := os.ReadFile(filepath.Join(log.Path(), "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta Meta
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Schema != 3 || SchemaVersion != 3 {
+		t.Fatalf("metadata schema=%d current=%d", meta.Schema, SchemaVersion)
+	}
+	if got := independentMetadataChecksum(t, meta, "market-maker/eventlog/meta/v3\x00"); got != meta.Checksum {
+		t.Fatalf("metadata checksum=%q want=%q", meta.Checksum, got)
+	}
+
+	recordData, err := os.ReadFile(filepath.Join(log.Path(), "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record Record
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Schema != 3 || record.MetadataChecksum != meta.Checksum {
+		t.Fatalf("record is not schema 3 metadata-bound: %+v", record)
+	}
+	if got := independentRecordChecksum(t, record, "market-maker/eventlog/record/v3\x00"); got != record.Checksum {
+		t.Fatalf("record checksum=%q want=%q", record.Checksum, got)
+	}
+}
+
+func TestOpenAppendAndReopenSchema2WithFrozenDomains(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "game-1")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := Meta{Schema: schema2, GameID: "game-1", OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Config: testConfig(t)}
+	meta.Checksum = independentMetadataChecksum(t, meta, "market-maker/eventlog/meta/v2\x00")
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(metaData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := Record{Schema: schema2, Version: 1, MetadataChecksum: meta.Checksum, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}
+	first.Checksum = independentRecordChecksum(t, first, "market-maker/eventlog/record/v2\x00")
+	firstData, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), append(firstData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 1 {
+		t.Fatalf("open schema 2: records=%+v err=%v", records, err)
+	}
+	if err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatal(err)
+	}
+
+	eventsData, err := os.ReadFile(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimSpace(eventsData), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatalf("event lines=%d", len(lines))
+	}
+	for i, line := range lines {
+		var record Record
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Schema != schema2 || record.MetadataChecksum != meta.Checksum {
+			t.Fatalf("schema 2 record %d changed format: %+v", i+1, record)
+		}
+		if got := independentRecordChecksum(t, record, "market-maker/eventlog/record/v2\x00"); got != record.Checksum {
+			t.Fatalf("schema 2 record %d checksum=%q want=%q", i+1, record.Checksum, got)
+		}
+	}
+	_, records, err = Open(root, "game-1")
+	if err != nil || len(records) != 2 || records[1].Command.ID != "c-2" {
+		t.Fatalf("reopen schema 2: records=%+v err=%v", records, err)
+	}
+
+	var tampered Record
+	if err := json.Unmarshal(lines[1], &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered.MetadataChecksum = strings.Repeat("0", 64)
+	tampered.Checksum = independentRecordChecksum(t, tampered, "market-maker/eventlog/record/v2\x00")
+	tamperedData, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), append(append(lines[0], '\n'), append(tamperedData, '\n')...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil {
+		t.Fatal("expected schema 2 metadata-binding rejection")
+	}
+}
+
+func TestOpenRejectsUnknownSchema(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "game-1")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metaData, err := json.Marshal(Meta{Schema: 4, GameID: "game-1", OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Now().UTC(), Config: testConfig(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(metaData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil {
+		t.Fatal("expected unknown schema rejection")
 	}
 }
 
@@ -213,7 +352,7 @@ func TestScenarioMetadataIsCopied(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsTamperedSchema2Metadata(t *testing.T) {
+func TestOpenRejectsTamperedSchema3Metadata(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
 	if err != nil {
@@ -241,7 +380,7 @@ func TestOpenRejectsTamperedSchema2Metadata(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsSchema2RecordBoundToDifferentMetadata(t *testing.T) {
+func TestOpenRejectsSchema3RecordBoundToDifferentMetadata(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
 	if err != nil {
@@ -260,10 +399,7 @@ func TestOpenRejectsSchema2RecordBoundToDifferentMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	record.MetadataChecksum = strings.Repeat("0", 64)
-	record.Checksum, err = recordChecksum(record)
-	if err != nil {
-		t.Fatal(err)
-	}
+	record.Checksum = independentRecordChecksum(t, record, "market-maker/eventlog/record/v3\x00")
 	data, err = json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +499,7 @@ func TestOpenAcceptsPreScorecardRecap(t *testing.T) {
 		Coaching         *scenario.Coaching `json:"coaching,omitempty"`
 		Recap            *legacyRecap       `json:"recap,omitempty"`
 	}
-	record := legacyRecord{Schema: legacySchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: &legacyRecap{Headline: "Review", EndReason: exchange.PlayerQuit}}
+	record := legacyRecord{Schema: schema1, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: &legacyRecap{Headline: "Review", EndReason: exchange.PlayerQuit}}
 	checksumRecord := record
 	checksumRecord.Checksum = ""
 	data, err := json.Marshal(checksumRecord)
@@ -393,7 +529,7 @@ func TestOpenAcceptsPreScorecardRecap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 2 || records[1].Schema != legacySchemaVersion || records[1].MetadataChecksum != "" {
+	if len(records) != 2 || records[1].Schema != schema1 || records[1].MetadataChecksum != "" {
 		t.Fatalf("legacy append changed format: %+v", records)
 	}
 }
@@ -404,7 +540,7 @@ func TestLegacyAppendOmitsScorecardFromWireFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}}
+	recap := &scenario.Recap{Headline: "Review", EndReason: exchange.PlayerQuit, AdverseSelectionTurns: 3, Scorecard: &scenario.Scorecard{FocusLabel: "Risk", FocusValue: "Low"}}
 	if err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}, Recap: recap}); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +593,7 @@ func createLegacyLog(root, gameID string, cfg exchange.Config) (*Log, error) {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
-	meta := Meta{Schema: legacySchemaVersion, GameID: gameID, OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Now().UTC(), Config: cfg}
+	meta := Meta{Schema: schema1, GameID: gameID, OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Now().UTC(), Config: cfg}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
@@ -470,4 +606,28 @@ func createLegacyLog(root, gameID string, cfg exchange.Config) (*Log, error) {
 	}
 	log, _, err := Open(root, gameID)
 	return log, err
+}
+
+func independentMetadataChecksum(t *testing.T, meta Meta, domain string) string {
+	t.Helper()
+	meta.Checksum = ""
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(append([]byte(domain), data...))
+	return fmt.Sprintf("%x", digest)
+}
+
+func independentRecordChecksum(t *testing.T, record Record, domain string) string {
+	t.Helper()
+	record.Checksum = ""
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := append([]byte(domain), record.PreviousChecksum...)
+	input = append(input, record.MetadataChecksum...)
+	digest := sha256.Sum256(append(input, data...))
+	return fmt.Sprintf("%x", digest)
 }
