@@ -80,6 +80,14 @@
   .turn-status { color: var(--ink-soft); font-size: 12px; }
   .story { color: var(--ink-soft); line-height: 1.45; margin: 0 0 12px; font-size: 13px; }
   .coaching { margin: 0 0 12px; padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; font-size: 12px; line-height: 1.4; }
+  .attribution { margin: 0 0 12px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #f8f5ed; }
+  .attribution-title { margin-bottom: 7px; color: var(--ink); font-size: 12px; font-weight: 700; }
+  .attribution-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line); }
+  .attribution-row:first-of-type { border-top: 0; }
+  .attribution-row strong { font-size: 12px; }
+  .attribution-row span { font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  .attribution-row small { grid-column: 1 / -1; color: var(--ink-soft); font-size: 10px; line-height: 1.35; }
+  .informed-flow { margin: 0 0 12px; padding: 8px 10px; border-left: 3px solid var(--navy); background: #e8eef0; color: var(--navy); font-size: 11px; line-height: 1.45; }
   .turn-empty { display: grid; place-items: center; min-height: 120px; text-align: center; color: var(--ink-soft); font: 18px/1.3 Georgia, "Times New Roman", serif; }
   .audit-card { margin-top: 12px; padding: 16px; }
   .audit-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }
@@ -127,7 +135,7 @@
   .scenario-card { margin-top: 12px; padding: 14px 16px; }
   .scenario-card-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
   .scenario-card h3 { margin: 3px 0 0; font: 500 20px/1 Georgia, "Times New Roman", serif; letter-spacing: -.025em; }
-  .scenario-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+  .scenario-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
   .scenario-option { text-align: left; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); padding: 10px; min-height: 86px; }
   .scenario-option:hover, .scenario-option[aria-pressed="true"] { border-color: var(--pine); background: var(--pine-soft); }
   .scenario-option strong { display: block; font-size: 13px; margin-bottom: 4px; }
@@ -219,9 +227,20 @@
 
     <section class="turn-grid">
       <article class="card turn-card">
-        <div class="turn-heading"><div><div class="section-label">What just happened</div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status">No turn submitted</span></div>
+        <div class="turn-heading"><div><div class="section-label">What just happened</div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status" role="status" aria-live="polite">No turn submitted</span></div>
         <div id="turn-empty" class="turn-empty">Your next quote will turn market flow into a short, reviewable story.</div>
-        <div id="turn-detail" hidden><p id="turn-story" class="story"></p><p id="coaching" class="coaching" hidden></p></div>
+        <div id="turn-detail" hidden>
+          <p id="turn-story" class="story"></p>
+          <section id="turn-attribution" class="attribution" hidden aria-labelledby="turn-attribution-title" role="status" aria-live="polite">
+            <div id="turn-attribution-title" class="attribution-title">Turn P&amp;L attribution</div>
+            <div class="attribution-row"><strong>Execution edge</strong><span id="attribution-execution-edge"></span><small>Value captured or conceded versus the opening mark on filled trades.</small></div>
+            <div class="attribution-row"><strong>Inventory mark</strong><span id="attribution-inventory-mark"></span><small>Impact of the mark move on the inventory carried through the turn.</small></div>
+            <div class="attribution-row"><strong>Storage</strong><span id="attribution-storage"></span><small>Signed carrying-cost impact charged by the exchange.</small></div>
+            <div class="attribution-row"><strong>Turn P&amp;L</strong><span id="attribution-total"></span><small>The exchange's authoritative total for this turn.</small></div>
+          </section>
+          <p id="informed-flow" class="informed-flow" hidden></p>
+          <p id="coaching" class="coaching" hidden></p>
+        </div>
       </article>
       <article class="card history-card">
         <div class="section-label" style="margin-bottom:14px">Session path</div>
@@ -242,7 +261,7 @@
       </div>
     </section>
 
-    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><div class="section-label">Session complete</div><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
+    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><div class="section-label">Session complete</div><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><p id="recap-informed-flow" class="informed-flow" hidden></p><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
 
     <details>
       <summary>Session controls</summary>
@@ -270,6 +289,11 @@ function formatFixed(value, scale, displayScale) {
 }
 const money = (value, scale = 8) => typeof value === 'bigint' ? '$' + formatFixed(value, scale, 2) : '$' + number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
 const quantity = value => typeof value === 'bigint' ? formatFixed(value, 4, 2) : number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+function signedMoney(value) {
+  const amount = number(value);
+  const formatted = money(Math.abs(amount));
+  return formatted === money(0) ? formatted : `${amount > 0 ? '+' : amount < 0 ? '-' : ''}${formatted}`;
+}
 function uiState(state) { return {turn:state.turn, cash:number(state.cash), inventory:number(state.position), mark:number(state.mark), isOver:state.is_over, reason:state.reason}; }
 function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
 function store(key, value) { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } }
@@ -328,20 +352,58 @@ function renderHistory() {
   body.replaceChildren(...rows);
 }
 
+function renderCoaching(coaching) {
+  $('coaching').hidden = !coaching;
+  $('coaching').textContent = coaching ? `${coaching.title}: ${coaching.body}` : '';
+}
+
+function renderAttribution(summary) {
+  const attribution = summary?.pnl_attribution;
+  $('turn-attribution').hidden = !attribution;
+  if (attribution) {
+    for (const [id, value] of [['attribution-execution-edge', attribution.execution_edge], ['attribution-inventory-mark', attribution.inventory_mark_pnl], ['attribution-storage', attribution.storage_pnl], ['attribution-total', summary.turn_pnl]]) {
+      const element = $(id), amount = number(value);
+      element.textContent = signedMoney(value); element.className = amount > 0 ? 'positive' : amount < 0 ? 'negative' : '';
+    }
+  } else {
+    for (const id of ['attribution-execution-edge', 'attribution-inventory-mark', 'attribution-storage', 'attribution-total']) { $(id).textContent = ''; $(id).className = ''; }
+  }
+  const arrivals = number(summary?.informed_orders || 0), informed = $('informed-flow');
+  informed.hidden = arrivals <= 0;
+  informed.textContent = arrivals > 0 ? `Informed flow: ${arrivals} order${arrivals === 1 ? '' : 's'} arrived; ${number(summary.informed_orders_filled || 0)} filled for ${quantity(summary.informed_units_traded || 0)} units; informed-flow P&L ${signedMoney(summary.informed_flow_pnl || 0)}. Negative means value conceded; positive means your quote contained the directional edge.` : '';
+}
+
+function customerOrderLabel(side, informed) {
+  if (informed) return side === 'buy' ? 'Informed customer buy' : 'Informed customer sell';
+  return side === 'buy' ? 'Customer buy' : 'Customer sell';
+}
+
+function resetLatestTurn() {
+  $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('turn-status').textContent = 'No turn submitted'; $('turn-story').textContent = '';
+  renderAttribution(null); renderCoaching(null);
+}
+
+function renderLatestTurn(latestTurn) {
+  const summary = latestTurn.summary;
+  $('turn-empty').hidden = true; $('turn-detail').hidden = false;
+  $('turn-status').textContent = `Turn ${latestTurn.turn} · turn P&L ${signedMoney(summary.turn_pnl)}`;
+  $('turn-story').textContent = `Restored the latest completed turn from this session.`;
+  renderAttribution(summary); renderCoaching(latestTurn.coaching);
+}
+
 function renderTurn(result) {
   const state = uiState(result.state), summary = result.summary || {}, events = result.events || [];
-  const fills = events.filter(event => event.type === 'trade' && event.trade);
+  const fills = events.filter(event => event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player'));
   const flowOrders = events.filter(event => event.type === 'flow_order' && event.order);
   const playerOrders = events.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player');
   const mark = events.find(event => event.type === 'mark_updated');
   const storage = number(summary.storage_cost || 0), turnPnl = number(summary.turn_pnl || 0);
   $('turn-empty').hidden = true; $('turn-detail').hidden = false;
-  $('turn-status').textContent = `Mark ${money(state.mark)} · turn P&L ${money(turnPnl)}`;
+  $('turn-status').textContent = `Mark ${money(state.mark)} · turn P&L ${signedMoney(turnPnl)}`;
   const flow = fills.length ? `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived and ${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived, but none crossed your quote.`;
   const move = mark ? ` The reference mark finished at ${money(state.mark)}.` : '';
   $('turn-story').textContent = `${flow}${storage > 0 ? ` Storage cost ${money(storage)}.` : ''}${move}`;
-  if (result.coaching) { $('coaching').hidden = false; $('coaching').textContent = `${result.coaching.title}: ${result.coaching.body}`; }
-  else { $('coaching').hidden = true; }
+  renderAttribution(summary); renderCoaching(result.coaching);
   const audit = {turn:state.turn, playerOrders, flowOrders, fills}; auditGeneration++; turnAudits.push(audit); renderAudit(audit);
 }
 
@@ -360,7 +422,7 @@ function renderAudit(audit) {
     const order = event.order, filled = audit.fills.filter(fill => fill.trade.taker_order_id === order.id).reduce((total, fill) => total + number(fill.trade.quantity), 0);
     const complete = filled >= number(order.quantity), outcome = filled === 0 ? 'Expired unfilled' : complete ? `Filled ${quantity(filled)}` : `Filled ${quantity(filled)}; remainder expired`;
     const row = document.createElement('tr');
-    appendCell(row, `${order.side === 'buy' ? 'Buy' : 'Sell'} ${quantity(order.quantity)}`);
+    appendCell(row, `${customerOrderLabel(order.side, order.informed)} ${quantity(order.quantity)}`);
     appendCell(row, money(order.price)); appendCell(row, outcome, filled ? 'filled' : 'unfilled');
     orders.appendChild(row);
   }
@@ -371,14 +433,14 @@ function renderAudit(audit) {
   for (const event of audit.fills) {
     const trade = event.trade, bought = trade.buyer_id === 'player', side = bought ? 'Bought' : 'Sold';
     const row = document.createElement('tr');
-    appendCell(row, `${side} ${quantity(trade.quantity)}`); appendCell(row, money(trade.price)); appendCell(row, `Customer ${bought ? 'sell' : 'buy'} limit crossed your ${bought ? 'bid' : 'ask'}.`);
+    appendCell(row, `${side} ${quantity(trade.quantity)}`); appendCell(row, money(trade.price)); appendCell(row, `You ${bought ? 'bought' : 'sold'} when ${trade.informed ? 'an informed customer' : 'a customer'} ${bought ? 'sell' : 'buy'} limit crossed your ${bought ? 'bid' : 'ask'}.`);
     trades.appendChild(row);
   }
   const tape = $('tapebody'); tape.replaceChildren();
   tape.parentElement.hidden = turnAudits.length < 2;
   for (const item of turnAudits.slice(0, -1).reverse()) {
     const entry = document.createElement('div'); entry.className = 'tape-entry';
-    const matches = item.fills.length ? item.fills.map(fill => `${fill.trade.buyer_id === 'player' ? 'bought' : 'sold'} ${quantity(fill.trade.quantity)} @ ${money(fill.trade.price)}`).join('; ') : 'no trades matched';
+    const matches = item.fills.length ? item.fills.map(fill => `${customerOrderLabel(fill.trade.buyer_id === 'player' ? 'sell' : 'buy', fill.trade.informed)}: you ${fill.trade.buyer_id === 'player' ? 'bought' : 'sold'} ${quantity(fill.trade.quantity)} @ ${money(fill.trade.price)}`).join('; ') : 'no trades matched';
     entry.textContent = `Turn ${item.turn}: ${item.flowOrders.length} customer order${item.flowOrders.length === 1 ? '' : 's'} arrived; ${matches}.`;
     tape.appendChild(entry);
   }
@@ -421,7 +483,7 @@ async function loadAuditHistory(id, epoch, finalState) {
   for (const commandEvents of byCommand.values()) {
     const flowOrders = commandEvents.filter(event => event.type === 'flow_order' && event.order);
     if (!flowOrders.length) continue;
-    audits.push({turn:audits.length + 1, playerOrders:commandEvents.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player'), flowOrders, fills:commandEvents.filter(event => event.type === 'trade' && event.trade)});
+    audits.push({turn:audits.length + 1, playerOrders:commandEvents.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player'), flowOrders, fills:commandEvents.filter(event => event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player'))});
   }
   if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
   turnAudits = audits;
@@ -456,7 +518,7 @@ function restoreHistory(events, finalState) {
     if (markEvent) {
       const mark = parseFixed(markEvent.mark, 4);
       if (mark === null) return null;
-      snapshots.push({cash:state.cash, inventory:state.inventory, mark, previousMark:previousMark(markEvent.message)});
+      snapshots.push({cash:state.cash, inventory:state.inventory, mark, previousMark:parseFixed(markEvent.previous_mark, 4) ?? previousMark(markEvent.message)});
     }
     for (const event of commandEvents.slice().reverse()) {
       if (event.type === 'storage_charged') {
@@ -572,7 +634,7 @@ async function startNewGame(request) {
     removeStored('mmg.pending_create');
     const savedGame = store('mmg.game_id', gameId) && store('mmg.starting_equity', String(startingEquity));
     if (!savedGame) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
-    applyScenario(data.scenario); $('turn-empty').hidden = false; $('turn-detail').hidden = true; $('coaching').hidden = true; $('gamesummary').hidden = true; $('historybody').replaceChildren();
+    applyScenario(data.scenario); resetLatestTurn(); $('gamesummary').hidden = true; $('historybody').replaceChildren();
     setState(state, null, data.recap); addHistory(state);
   } catch (_) {
     if (attempt === startAttempt) alert(savedCreate ? 'Network error. Start the lesson again to safely retry.' : 'Network error. Start the lesson again to safely retry; browser storage is unavailable, so keep this tab open.');
@@ -620,6 +682,10 @@ function showSummary(state, recap) {
   const equity = state.cash + state.inventory * state.mark, pnl = equity - startingEquity;
   $('gamesummary').hidden = false;
   $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
+  const informedFields = ['informed_orders', 'informed_orders_filled', 'informed_units_traded', 'informed_flow_pnl'];
+  const hasInformedRecap = recap && (recap.scorecard?.focus_label === 'Informed-flow P&L' || informedFields.some(field => Object.prototype.hasOwnProperty.call(recap, field)));
+  $('recap-informed-flow').hidden = !hasInformedRecap;
+  $('recap-informed-flow').textContent = hasInformedRecap ? `Informed flow: ${number(recap.informed_orders || 0)} orders arrived; ${number(recap.informed_orders_filled || 0)} filled for ${quantity(recap.informed_units_traded || 0)} units; informed-flow P&L ${signedMoney(recap.informed_flow_pnl || 0)}. Negative means value conceded; positive means quotes contained the directional edge.` : '';
   const scorecard = recap?.scorecard;
   $('scorecard').hidden = !scorecard;
   if (scorecard) {
@@ -629,12 +695,12 @@ function showSummary(state, recap) {
   }
   $('gamesummary').focus();
 }
-function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').hidden=true; $('turn-empty').hidden=false; $('turn-detail').hidden=true; $('coaching').hidden=true; $('historybody').replaceChildren(); clearAudit(); renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
+function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').hidden=true; resetLatestTurn(); $('historybody').replaceChildren(); clearAudit(); renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
 function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
   const id = stored('mmg.game_id'); if (!id) return;
   const epoch = sessionEpoch;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { if (response.status === 404) { removeStored('mmg.game_id'); removeStored('mmg.starting_equity'); } return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; isOver=state.isOver; const equity = state.cash + state.inventory * state.mark; startingEquity=Number(stored('mmg.starting_equity')) || (data.recap ? equity - number(data.recap.total_pnl) : equity); clearAudit(); if (data.scenario && scenarios.some(snapshot => snapshot.id === data.scenario.id)) selectedScenarioID=data.scenario.id; applyScenario(data.scenario); renderScenarios(); if (data.coaching) { $('coaching').hidden=false; $('coaching').textContent=`${data.coaching.title}: ${data.coaching.body}`; } setState(state, null, data.recap); addHistory(state); loadAuditHistory(id, epoch, state); } catch (_) { /* Keep ID for a later reconnect. */ }
+  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { if (response.status === 404) { removeStored('mmg.game_id'); removeStored('mmg.starting_equity'); } return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; isOver=state.isOver; const equity = state.cash + state.inventory * state.mark; startingEquity=Number(stored('mmg.starting_equity')) || (data.recap ? equity - number(data.recap.total_pnl) : equity); clearAudit(); if (data.scenario && scenarios.some(snapshot => snapshot.id === data.scenario.id)) selectedScenarioID=data.scenario.id; applyScenario(data.scenario); renderScenarios(); if (data.latest_turn) renderLatestTurn(data.latest_turn); else resetLatestTurn(); setState(state, data.latest_turn?.summary, data.recap); addHistory(state, data.latest_turn?.summary); loadAuditHistory(id, epoch, state); } catch (_) { /* Keep ID for a later reconnect. */ }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
 async function initialize() { await loadScenarios(); const request = pendingCreate(); if (request) { selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); startNewGame(request); return; } resumeGame(); }

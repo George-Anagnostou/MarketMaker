@@ -373,7 +373,7 @@ func TestV2AdverseSelectionLatestTurnPersistsAcrossReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	wantLatest := &latestTurn{Turn: first.State.Turn, Summary: first.Summary}
+	wantLatest := &latestTurn{Turn: first.State.Turn, Summary: first.Summary, Coaching: first.Coaching}
 	if !reflect.DeepEqual(afterQuote.LatestTurn, wantLatest) {
 		t.Fatalf("latest turn=%+v want=%+v", afterQuote.LatestTurn, wantLatest)
 	}

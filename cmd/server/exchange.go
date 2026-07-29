@@ -83,8 +83,9 @@ type exchangeStateResponse struct {
 }
 
 type latestTurn struct {
-	Turn    int              `json:"turn"`
-	Summary exchange.Summary `json:"summary"`
+	Turn     int                `json:"turn"`
+	Summary  exchange.Summary   `json:"summary"`
+	Coaching *scenario.Coaching `json:"coaching,omitempty"`
 }
 
 type exchangeCreateResponse struct {
@@ -289,7 +290,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	}
 	entry.commands[command.ID] = record
 	if command.Type == exchange.CommandSubmitQuote {
-		entry.latestTurn = &latestTurn{Turn: result.State.Turn, Summary: result.Summary}
+		entry.latestTurn = &latestTurn{Turn: result.State.Turn, Summary: result.Summary, Coaching: record.Coaching}
 	}
 	entry.coaching, entry.recap = record.Coaching, record.Recap
 	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false, entry))
@@ -465,7 +466,7 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	entry := &exchangeEntry{engine: engine, log: log, commands: commands, scenario: log.Meta().Scenario}
 	for _, record := range records {
 		if record.Command.Type == exchange.CommandSubmitQuote {
-			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary}
+			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 		}
 		if record.Coaching != nil {
 			entry.coaching = record.Coaching
