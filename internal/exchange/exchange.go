@@ -604,7 +604,10 @@ func (e *Engine) submitQuoteLegacy(bid, ask fixed.Price) (Result, error) {
 	if !e.canPlaceQuotePair(bid, ask, qty) {
 		return Result{State: e.State()}, errors.New("quote would violate cash, position, or initial-margin limits")
 	}
-	before, _ := e.equity(e.accounts[PlayerAccount])
+	before, err := e.equity(e.accounts[PlayerAccount])
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
 	events := e.cancelAccountOrders(PlayerAccount)
 	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
 		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
@@ -624,8 +627,14 @@ func (e *Engine) submitQuoteLegacy(bid, ask fixed.Price) (Result, error) {
 	if err != nil {
 		return Result{State: e.State()}, err
 	}
-	after, _ := e.equity(e.accounts[PlayerAccount])
-	summary.TurnPnL = after - before
+	after, err := e.equity(e.accounts[PlayerAccount])
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	summary.TurnPnL, err = fixed.SubMoney(after, before)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
 	e.version++
 	return Result{State: e.State(), Summary: summary, Events: events}, nil
 }
@@ -980,16 +989,8 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 			}
 			for _, trade := range trades {
 				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
-				s.UnitsTraded += trade.Quantity
-				if trade.BuyerID == PlayerAccount {
-					s.SellVolume += trade.Quantity
-					n, _ := fixed.Notional(trade.Price, trade.Quantity)
-					s.NetFillCash -= n
-				}
-				if trade.SellerID == PlayerAccount {
-					s.BuyVolume += trade.Quantity
-					n, _ := fixed.Notional(trade.Price, trade.Quantity)
-					s.NetFillCash += n
+				if err := addLegacyFlowTrade(&s, trade); err != nil {
+					return Summary{}, err
 				}
 			}
 			*events = append(*events, e.emitLifecycle(lifecycle)...)
@@ -1211,6 +1212,9 @@ func (e *Engine) flowLimitV2(side Side, slip int64) (fixed.Price, error) {
 }
 
 func addFlowTrade(summary *Summary, trade Trade) error {
+	if !isPlayerTrade(trade) {
+		return nil
+	}
 	var err error
 	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
 	if err != nil {
@@ -1232,6 +1236,43 @@ func addFlowTrade(summary *Summary, trade Trade) error {
 	}
 	if trade.SellerID == PlayerAccount {
 		summary.BuyVolume, err = fixed.AddQty(summary.BuyVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.AddMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addLegacyFlowTrade(summary *Summary, trade Trade) error {
+	var err error
+	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	if trade.BuyerID == PlayerAccount {
+		summary.SellVolume, err = fixed.AddQty(summary.SellVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		notional, err := fixed.Notional(trade.Price, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.SubMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	if trade.SellerID == PlayerAccount {
+		summary.BuyVolume, err = fixed.AddQty(summary.BuyVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		notional, err := fixed.Notional(trade.Price, trade.Quantity)
 		if err != nil {
 			return err
 		}

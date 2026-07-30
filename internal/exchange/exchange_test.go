@@ -481,6 +481,122 @@ func TestLegacyVersionPreservesResultsAndJSONShape(t *testing.T) {
 	}
 }
 
+func TestLegacyFlowSummaryPreservesVenueWideUnits(t *testing.T) {
+	summary := Summary{}
+	competitorTrade := Trade{Price: mustPrice(t, "100"), Quantity: mustQty(t, "2"), BuyerID: FlowAccount, SellerID: "competitor"}
+	playerTrade := Trade{Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), BuyerID: FlowAccount, SellerID: PlayerAccount}
+	for _, trade := range []Trade{competitorTrade, playerTrade} {
+		if err := addLegacyFlowTrade(&summary, trade); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantCash, err := fixed.Notional(playerTrade.Price, playerTrade.Quantity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUnits, err := fixed.AddQty(competitorTrade.Quantity, playerTrade.Quantity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.UnitsTraded != wantUnits || summary.BuyVolume != playerTrade.Quantity || summary.SellVolume != 0 || summary.NetFillCash != wantCash {
+		t.Fatalf("legacy summary=%+v", summary)
+	}
+}
+
+func TestLegacyEquityDeltaOverflowRollsBackTransaction(t *testing.T) {
+	const startingPosition = fixed.Qty(-10)
+	cfg := config(t)
+	cfg.StartingCash = fixed.Money(math.MaxInt64)
+	cfg.StartingPosition = startingPosition
+	cfg.StartingMark = fixed.Price(math.MaxInt64 / 20)
+	cfg.StoragePerUnit = fixed.Price(math.MaxInt64 / 11)
+	cfg.MaxPosition = fixed.Qty(11)
+	cfg.MaxOrderQty = fixed.Qty(1)
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+	cfg.MaxOrdersPerTurn = 0
+	cfg.MinMoveBps, cfg.MaxMoveBps = 10_000, 10_000
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeState := e.State()
+	beforeLedger := e.LedgerEntries()
+	beforeRNG, err := e.pcg.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+
+	if _, err := e.SubmitQuote(fixed.Price(1), fixed.Price(2)); err == nil {
+		t.Fatal("expected legacy equity delta overflow")
+	}
+	afterRNG, err := e.pcg.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.State() != beforeState || len(e.OpenOrders(PlayerAccount)) != 0 || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) {
+		t.Fatal("equity delta overflow changed live venue")
+	}
+	if e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent || !reflect.DeepEqual(afterRNG, beforeRNG) {
+		t.Fatal("equity delta overflow consumed counters or RNG")
+	}
+}
+
+func TestLegacyFlowSummaryOverflowRollsBackTransaction(t *testing.T) {
+	maxFlowQty := fixed.Qty(math.MaxInt64 / 4)
+	cfg := config(t)
+	cfg.StartingCash = fixed.Money(math.MaxInt64)
+	cfg.StartingMark = fixed.Price(2)
+	cfg.MaxPosition = maxFlowQty
+	cfg.MaxOrderQty = maxFlowQty
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+	cfg.MaxOrdersPerTurn = 20
+	cfg.MaxFlowSlippageBps = 0
+	cfg.Seed = 3569
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		id := string(rune('a' + i))
+		e.accounts[id] = &Account{ID: id, External: true}
+		if _, err := e.PlaceLimit(id, Sell, fixed.Price(2), fixed.Qty(math.MaxInt64/2), GTC); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeState := e.State()
+	beforeOrders := e.book.Orders("")
+	beforeLedger := e.LedgerEntries()
+	beforeAccounts := make(map[string]Account, len(e.accounts))
+	for id, account := range e.accounts {
+		beforeAccounts[id] = *account
+	}
+	beforeRNG, err := e.pcg.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+
+	if _, err := e.SubmitQuote(fixed.Price(1), fixed.Price(3)); err == nil {
+		t.Fatal("expected legacy venue-flow unit overflow")
+	}
+	afterRNG, err := e.pcg.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.State() != beforeState || !reflect.DeepEqual(e.book.Orders(""), beforeOrders) || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) {
+		t.Fatal("flow summary overflow changed live venue")
+	}
+	for id, before := range beforeAccounts {
+		if *e.accounts[id] != before {
+			t.Fatalf("flow summary overflow changed account %q", id)
+		}
+	}
+	if e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent || !reflect.DeepEqual(afterRNG, beforeRNG) {
+		t.Fatal("flow summary overflow consumed counters or RNG")
+	}
+}
+
 func TestV2DeterministicResults(t *testing.T) {
 	cfg := config(t)
 	cfg.SimulationVersion = SimulationVersionAdverseSelection
@@ -670,8 +786,30 @@ func TestV2InformedMetricsExcludeCompetingLiquidity(t *testing.T) {
 	if result.Summary.InformedOrders != 1 || result.Summary.InformedOrdersFilled != 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.InformedFlowPnL != 0 {
 		t.Fatalf("player metrics included competing fill: %+v", result.Summary)
 	}
-	if result.Summary.UnitsTraded <= 0 {
-		t.Fatalf("legacy venue volume changed: %+v", result.Summary)
+	if result.Summary.UnitsTraded != 0 {
+		t.Fatalf("player volume included competing fill: %+v", result.Summary)
+	}
+}
+
+func TestV2FlowMetricsIncludeOnlyPlayerTrades(t *testing.T) {
+	summary := Summary{}
+	competitorTrade := Trade{Price: mustPrice(t, "100"), Quantity: mustQty(t, "2"), BuyerID: FlowAccount, SellerID: "competitor"}
+	playerTrade := Trade{Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), BuyerID: FlowAccount, SellerID: PlayerAccount}
+	if err := addFlowTrade(&summary, competitorTrade); err != nil {
+		t.Fatal(err)
+	}
+	if err := addFlowTrade(&summary, playerTrade); err != nil {
+		t.Fatal(err)
+	}
+	if summary.UnitsTraded != playerTrade.Quantity || summary.BuyVolume != playerTrade.Quantity || summary.SellVolume != 0 {
+		t.Fatalf("volume metrics=%+v", summary)
+	}
+	wantCash, err := fixed.Notional(playerTrade.Price, playerTrade.Quantity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.NetFillCash != wantCash {
+		t.Fatalf("net fill cash=%s want %s", summary.NetFillCash, wantCash)
 	}
 }
 
@@ -786,6 +924,59 @@ func TestV2ArithmeticFailureRollsBackStateAndStreams(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("failed transaction consumed v2 RNG state")
+	}
+}
+
+func TestV2FlowLimitOverflowRollsBackTransactionAndStreams(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.MaxOrdersPerTurn = 1
+	cfg.MaxFlowSlippageBps = 10_000
+	cfg.MinMoveBps, cfg.MaxMoveBps = 0, 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.mark = fixed.Price(math.MaxInt64/2 + 1)
+
+	for state := uint64(0); ; state++ {
+		probe := splitMix64{state: state}
+		probe.bounded(1)
+		side := probe.bounded(2)
+		probe.bounded(uint64(cfg.MaxOrderQty))
+		slip := probe.bounded(uint64(cfg.MaxFlowSlippageBps + 1))
+		if side == 0 && slip == uint64(cfg.MaxFlowSlippageBps) {
+			e.flowRNG.state = state
+			break
+		}
+	}
+
+	beforeState := e.State()
+	beforeOrders := e.book.Orders("")
+	beforeLedger := e.LedgerEntries()
+	beforeAccounts := make(map[string]Account, len(e.accounts))
+	for id, account := range e.accounts {
+		beforeAccounts[id] = *account
+	}
+	beforeFlowRNG, beforeMarkRNG, beforeInformedRNG := e.flowRNG, e.markRNG, e.informedRNG
+	beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+
+	if _, err := e.SubmitQuote(fixed.Price(1), fixed.Price(2)); err == nil {
+		t.Fatal("expected overflowing v2 flow limit to fail instead of clamping to price 1")
+	}
+	if e.State() != beforeState || !reflect.DeepEqual(e.book.Orders(""), beforeOrders) || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) {
+		t.Fatal("overflowing v2 flow limit changed venue state")
+	}
+	for id, before := range beforeAccounts {
+		if *e.accounts[id] != before {
+			t.Fatalf("overflowing v2 flow limit changed account %q", id)
+		}
+	}
+	if e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent {
+		t.Fatal("overflowing v2 flow limit consumed counters")
+	}
+	if e.flowRNG != beforeFlowRNG || e.markRNG != beforeMarkRNG || e.informedRNG != beforeInformedRNG {
+		t.Fatal("overflowing v2 flow limit consumed RNG streams")
 	}
 }
 
