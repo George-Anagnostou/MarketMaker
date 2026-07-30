@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -22,6 +23,9 @@ const (
 	schema1       = 1
 	schema2       = 2
 	SchemaVersion = 3
+
+	maxMetadataBytes = 1 << 20
+	maxEventsBytes   = 64 << 20
 )
 
 type Meta struct {
@@ -56,6 +60,10 @@ type Log struct {
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
+	return createAt(root, gameID, ownerID, createCommandID, cfg, snapshot, time.Now().UTC())
+}
+
+func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, createdAt time.Time) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -82,7 +90,7 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, 
 		}
 	}()
 
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: time.Now().UTC(), Config: cfg, Scenario: cloneSnapshot(snapshot)}
+	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot)}
 	checksum, err := metadataChecksum(meta)
 	if err != nil {
 		return nil, err
@@ -91,6 +99,9 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, 
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)+1) > maxMetadataBytes {
+		return nil, fmt.Errorf("game metadata exceeds %d-byte limit", maxMetadataBytes)
 	}
 	if err := writeAtomic(filepath.Join(stagingDir, "meta.json"), append(data, '\n')); err != nil {
 		return nil, err
@@ -119,17 +130,17 @@ func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, 
 	if err := syncDir(root); err != nil {
 		return nil, err
 	}
-	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: make(map[string]struct{})}, nil
+	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: map[string]struct{}{createCommandID: {}}}, nil
 }
 
 func Open(root, gameID string) (*Log, []Record, error) {
 	dir := filepath.Join(root, gameID)
-	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	data, err := readFileBounded(filepath.Join(dir, "meta.json"), "game metadata", maxMetadataBytes)
 	if err != nil {
 		return nil, nil, err
 	}
 	var meta Meta
-	if err := json.Unmarshal(data, &meta); err != nil {
+	if err := decodeStrictJSON(data, &meta); err != nil {
 		return nil, nil, fmt.Errorf("decode game metadata: %w", err)
 	}
 	if !supportedSchema(meta.Schema) || meta.GameID != gameID {
@@ -150,7 +161,8 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records))}
+	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records)+1)}
+	log.commandIDs[meta.CreateCommandID] = struct{}{}
 	if len(records) > 0 {
 		log.lastChecksum = records[len(records)-1].Checksum
 	}
@@ -213,11 +225,19 @@ func (l *Log) Append(record Record) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	lineBytes := int64(len(data) + 1)
 	f, err := os.OpenFile(filepath.Join(l.dir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return Record{}, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Record{}, err
+	}
+	if lineBytes > maxEventsBytes || info.Size() > maxEventsBytes-lineBytes {
+		return Record{}, fmt.Errorf("event log exceeds %d-byte limit", maxEventsBytes)
+	}
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return Record{}, err
 	}
@@ -231,8 +251,23 @@ func (l *Log) Append(record Record) (Record, error) {
 
 func (l *Log) Path() string { return l.dir }
 
+// Sync establishes a fresh durability barrier for all files and directory
+// entries needed to discover and replay this game after a crash.
+func (l *Log) Sync() error {
+	if err := syncFile(filepath.Join(l.dir, "events.jsonl")); err != nil {
+		return fmt.Errorf("sync events file: %w", err)
+	}
+	if err := syncDir(l.dir); err != nil {
+		return fmt.Errorf("sync game directory: %w", err)
+	}
+	if err := syncDir(filepath.Dir(l.dir)); err != nil {
+		return fmt.Errorf("sync event log root: %w", err)
+	}
+	return nil
+}
+
 func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Record, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileBounded(path, "event log", maxEventsBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +290,7 @@ func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Re
 			break
 		}
 		var record Record
-		if err := json.Unmarshal(line, &record); err != nil {
+		if err := decodeStrictJSON(line, &record); err != nil {
 			// A power loss may leave only the final append partial. It was never
 			// fsynced as a complete record, so replay ignores that trailing data.
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
@@ -284,6 +319,105 @@ func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Re
 		commandIDs[record.Command.ID] = struct{}{}
 	}
 	return records, nil
+}
+
+func readFileBounded(path, description string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes)
+	}
+	return data, nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	if err := validateUniqueJSONKeys(data); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("must contain exactly one JSON value")
+		}
+		return fmt.Errorf("invalid trailing JSON: %w", err)
+	}
+	return nil
+}
+
+func validateUniqueJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("must contain exactly one JSON value")
+		}
+		return fmt.Errorf("invalid trailing JSON: %w", err)
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			token, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := token.(string)
+			if !ok {
+				return errors.New("JSON object key must be a string")
+			}
+			if _, exists := keys[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func truncateAndSync(path string, size int64) error {
@@ -378,4 +512,13 @@ func syncDir(path string) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }

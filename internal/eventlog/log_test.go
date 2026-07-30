@@ -381,6 +381,95 @@ func TestOpenRejectsTamperedSchema3Metadata(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsUnknownMetadataFields(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path []string
+	}{
+		{name: "top-level"},
+		{name: "nested", path: []string{"config"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "meta.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = addUnknownJSONField(t, data, test.path...)
+			if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "unknown field") {
+				t.Fatalf("Open error = %v, want unknown field rejection", err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsDuplicateMetadataKeys(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "top-level",
+			mutate: func(data []byte) []byte {
+				return bytes.Replace(data, []byte("{"), []byte(`{"schema":3,`), 1)
+			},
+		},
+		{
+			name: "nested",
+			mutate: func(data []byte) []byte {
+				return bytes.Replace(data, []byte(`"config":{`), []byte(`"config":{"instrument":"SIM",`), 1)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "meta.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = test.mutate(bytes.TrimSpace(data))
+			if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "duplicate JSON object key") {
+				t.Fatalf("Open error = %v, want duplicate key rejection", err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsTrailingMetadataJSON(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(log.Path(), "meta.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("{}\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "exactly one JSON value") {
+		t.Fatalf("Open error = %v, want trailing JSON rejection", err)
+	}
+}
+
 func TestOpenRejectsSchema3RecordBoundToDifferentMetadata(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
@@ -410,6 +499,105 @@ func TestOpenRejectsSchema3RecordBoundToDifferentMetadata(t *testing.T) {
 	}
 	if _, _, err := Open(root, "game-1"); err == nil {
 		t.Fatal("expected metadata-binding rejection")
+	}
+}
+
+func TestOpenRejectsUnknownRecordFields(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path []string
+	}{
+		{name: "top-level"},
+		{name: "nested", path: []string{"command"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "events.jsonl")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = addUnknownJSONField(t, data, test.path...)
+			if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "unknown field") {
+				t.Fatalf("Open error = %v, want unknown field rejection", err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsDuplicateRecordKeys(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "top-level",
+			mutate: func(data []byte) []byte {
+				return bytes.Replace(data, []byte("{"), []byte(`{"schema":3,`), 1)
+			},
+		},
+		{
+			name: "nested",
+			mutate: func(data []byte) []byte {
+				return bytes.Replace(data, []byte(`"command":{`), []byte(`"command":{"id":"c-1",`), 1)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "events.jsonl")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = test.mutate(bytes.TrimSpace(data))
+			if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "duplicate JSON object key") {
+				t.Fatalf("Open error = %v, want duplicate key rejection", err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsTrailingRecordJSON(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(log.Path(), "events.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	if err := os.WriteFile(path, append(data, []byte(" {}\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "exactly one JSON value") {
+		t.Fatalf("Open error = %v, want trailing JSON rejection", err)
 	}
 }
 
@@ -471,6 +659,150 @@ func TestRejectsDuplicateCommandID(t *testing.T) {
 	}
 	if _, _, err := Open(root, "game-1"); err == nil {
 		t.Fatal("expected duplicate persisted record rejection")
+	}
+}
+
+func TestOpenAcceptsHistoricalCreateCommandIDCollision(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "create-1", Type: exchange.CommandQuit}}
+	if _, err := log.Append(record); err == nil {
+		t.Fatal("Append accepted the create command id")
+	}
+
+	record.MetadataChecksum = log.Meta().Checksum
+	record.Checksum, err = recordChecksum(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(log.Path(), "events.jsonl"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 1 || records[0].Command.ID != "create-1" {
+		t.Fatalf("Open records = %+v, error = %v", records, err)
+	}
+	if _, err := reopened.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "create-1", Type: exchange.CommandQuit}}); err == nil {
+		t.Fatal("Append accepted the create command id after historical replay")
+	}
+}
+
+func TestCreateEnforcesMetadataWriteLimit(t *testing.T) {
+	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 678901234, time.UTC)
+	base := Meta{Schema: SchemaVersion, GameID: "game-1", OwnerID: "", CreateCommandID: "create-1", CreatedAt: createdAt, Config: testConfig(t)}
+	checksum, err := metadataChecksum(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.Checksum = checksum
+	data, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerBytes := int(maxMetadataBytes) - len(data) - 1
+	if ownerBytes < 1 {
+		t.Fatal("metadata fixture already exceeds limit")
+	}
+
+	root := t.TempDir()
+	log, err := createAt(root, "game-1", strings.Repeat("x", ownerBytes), "create-1", testConfig(t), nil, createdAt)
+	if err != nil {
+		t.Fatalf("boundary Create error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(log.Path(), "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != maxMetadataBytes {
+		t.Fatalf("metadata size = %d, want %d", info.Size(), maxMetadataBytes)
+	}
+
+	oversizeRoot := t.TempDir()
+	if _, err := createAt(oversizeRoot, "game-1", strings.Repeat("x", ownerBytes+1), "create-1", testConfig(t), nil, createdAt); err == nil || !strings.Contains(err.Error(), "game metadata exceeds") {
+		t.Fatalf("oversize Create error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(oversizeRoot, "game-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oversize game was published: %v", err)
+	}
+}
+
+func TestAppendEnforcesEventWriteLimit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		extraBytes int64
+		wantError  bool
+	}{
+		{name: "boundary"},
+		{name: "oversize", extraBytes: 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}
+			lineBytes := encodedRecordLineBytes(t, log, record)
+			path := filepath.Join(log.Path(), "events.jsonl")
+			initialSize := maxEventsBytes - lineBytes + test.extraBytes
+			if err := os.Truncate(path, initialSize); err != nil {
+				t.Fatal(err)
+			}
+			_, err = log.Append(record)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "event log exceeds") {
+					t.Fatalf("Append error = %v, want size rejection", err)
+				}
+			} else if err != nil {
+				t.Fatalf("boundary Append error = %v", err)
+			}
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			wantSize := initialSize
+			if !test.wantError {
+				wantSize = maxEventsBytes
+			}
+			if info.Size() != wantSize {
+				t.Fatalf("event size = %d, want %d", info.Size(), wantSize)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsOversizedMetadata(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(log.Path(), "meta.json"), maxMetadataBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "game metadata exceeds 1048576-byte limit") {
+		t.Fatalf("Open error = %v, want metadata size limit", err)
+	}
+}
+
+func TestOpenRejectsOversizedEvents(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(log.Path(), "events.jsonl"), maxEventsBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil || !strings.Contains(err.Error(), "event log exceeds 67108864-byte limit") {
+		t.Fatalf("Open error = %v, want event log size limit", err)
 	}
 }
 
@@ -665,4 +997,45 @@ func independentRecordChecksum(t *testing.T, record Record, domain string) strin
 	input = append(input, record.MetadataChecksum...)
 	digest := sha256.Sum256(append(input, data...))
 	return fmt.Sprintf("%x", digest)
+}
+
+func encodedRecordLineBytes(t *testing.T, log *Log, record Record) int64 {
+	t.Helper()
+	record.Schema = log.meta.Schema
+	record.PreviousChecksum = log.lastChecksum
+	if record.Schema != schema1 {
+		record.MetadataChecksum = log.meta.Checksum
+	}
+	checksum, err := recordChecksum(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Checksum = checksum
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int64(len(data) + 1)
+}
+
+func addUnknownJSONField(t *testing.T, data []byte, path ...string) []byte {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
+	}
+	object := value
+	for _, name := range path {
+		nested, ok := object[name].(map[string]any)
+		if !ok {
+			t.Fatalf("JSON field %q is not an object", name)
+		}
+		object = nested
+	}
+	object["unknown_field"] = true
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
