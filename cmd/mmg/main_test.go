@@ -10,21 +10,21 @@ import (
 	"market-maker/internal/fixed"
 )
 
-func TestConfigFromFlagsDefaultsToAdverseSelection(t *testing.T) {
+func TestConfigFromFlagsDefaultsToLegacy(t *testing.T) {
 	originalVersion, originalInformed := *simulationVersion, *informedFlowBps
 	t.Cleanup(func() { *simulationVersion, *informedFlowBps = originalVersion, originalInformed })
 
-	*simulationVersion = 2
+	*simulationVersion = 1
 	*informedFlowBps = 0
 	cfg, err := configFromFlags()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SimulationVersion != exchange.SimulationVersionAdverseSelection || cfg.InformedFlowBps != 0 {
+	if cfg.SimulationVersion != exchange.SimulationVersionLegacy || cfg.InformedFlowBps != 0 {
 		t.Fatalf("version=%d informed_flow_bps=%d", cfg.SimulationVersion, cfg.InformedFlowBps)
 	}
 	versionFlag := flag.Lookup("simulation-version")
-	if versionFlag == nil || versionFlag.DefValue != "2" || !strings.Contains(versionFlag.Usage, "1 = legacy") {
+	if versionFlag == nil || versionFlag.DefValue != "1" || !strings.Contains(versionFlag.Usage, "1 = legacy") {
 		t.Fatalf("flag=%+v", versionFlag)
 	}
 	configuredFlag := flag.Lookup("informed-flow-bps")

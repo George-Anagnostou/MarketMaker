@@ -23,7 +23,7 @@ var (
 	storageCost       = flag.String("storage", "1", "storage cost per unit per turn")
 	seed              = flag.Uint64("seed", 42, "non-zero deterministic scenario seed")
 	vol               = flag.String("vol", "-0.5,3", `price movement as "min,max" percent`)
-	simulationVersion = flag.Int("simulation-version", 2, "simulation version (1 = legacy, 2 = adverse-selection)")
+	simulationVersion = flag.Int("simulation-version", 1, "simulation version (1 = legacy, 2 = adverse-selection)")
 	informedFlowBps   = flag.Int64("informed-flow-bps", 0, "informed customer flow probability in basis points after a mark move (0..10000)")
 )
 

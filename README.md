@@ -11,10 +11,10 @@ go run ./cmd/server
 # Open http://127.0.0.1:8080
 
 go run ./cmd/mmg -seed 42 -turns 10
-go run ./cmd/mmg -seed 304 -turns 8 -informed-flow-bps 6000
+go run ./cmd/mmg -seed 1 -turns 8 -simulation-version 2 -informed-flow-bps 6000
 ```
 
-The CLI defaults to simulation version 2. Use `-simulation-version 1` to reproduce a legacy seeded CLI path; informed flow requires version 2.
+The CLI defaults to legacy simulation version 1 so existing seeded runs remain reproducible. Use `-simulation-version 2` for independent random streams, P&L attribution, and informed flow.
 
 Or use the project workflows:
 
