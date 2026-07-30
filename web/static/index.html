@@ -231,7 +231,7 @@
         <div id="turn-empty" class="turn-empty">Your next quote will turn market flow into a short, reviewable story.</div>
         <div id="turn-detail" hidden>
           <p id="turn-story" class="story"></p>
-          <section id="turn-attribution" class="attribution" hidden aria-labelledby="turn-attribution-title" role="status" aria-live="polite">
+          <section id="turn-attribution" class="attribution" hidden aria-labelledby="turn-attribution-title">
             <div id="turn-attribution-title" class="attribution-title">Turn P&amp;L attribution</div>
             <div class="attribution-row"><strong>Execution edge</strong><span id="attribution-execution-edge"></span><small>Value captured or conceded versus the opening mark on filled trades.</small></div>
             <div class="attribution-row"><strong>Inventory mark</strong><span id="attribution-inventory-mark"></span><small>Impact of the mark move on the inventory carried through the turn.</small></div>
@@ -249,7 +249,7 @@
     </section>
 
     <section class="card audit-card" aria-labelledby="audit-title">
-      <div class="audit-heading"><div><div class="section-label">Exchange tape</div><h2 id="audit-title">Turn audit</h2></div><span id="audit-status" class="audit-status" role="status" aria-live="polite">No customer flow yet</span></div>
+      <div class="audit-heading"><div><div class="section-label">Exchange tape</div><h2 id="audit-title">Turn audit</h2></div><span id="audit-status" class="audit-status">No customer flow yet</span></div>
       <div id="audit-empty" class="audit-empty">When you post a quote, the exchange places your bid and ask as resting orders. Simulated customer IOC orders then arrive: they trade immediately only if their limit crosses your quote; otherwise, they expire.</div>
       <div id="audit-detail" hidden>
         <p id="audit-explainer" class="audit-explainer"></p>
@@ -261,40 +261,59 @@
       </div>
     </section>
 
-    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><div class="section-label">Session complete</div><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><p id="recap-informed-flow" class="informed-flow" hidden></p><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button class="primary" style="width:auto" onclick="playAgain()">Play again</button><button class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
+    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><div class="section-label">Session complete</div><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><p id="recap-informed-flow" class="informed-flow" hidden></p><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button id="play-again" class="primary" style="width:auto" onclick="playAgain()">Play again</button><button id="review-history" class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
 
     <details>
       <summary>Session controls</summary>
-      <div class="scenario-actions" style="margin-top:12px"><button id="start-selected" class="secondary" onclick="startNewGame()" disabled>Start selected lesson</button><button class="secondary" onclick="quitSession()">End current session</button></div>
+      <div class="scenario-actions" style="margin-top:12px"><button id="start-selected" class="secondary" onclick="startNewGame()" disabled>Start selected lesson</button><button id="quit-session" class="secondary" onclick="quitSession()" disabled>End current session</button></div>
       <p class="quiet">Lessons use server-owned, fixed scenarios so the same session can be replayed and compared fairly.</p>
     </details>
   </main>
 </div>
 
 <script>
-let gameId = null, version = 0, isOver = false, startingEquity = 0, history = [];
+let gameId = null, version = 0, isOver = false, startingEquityFixed = 0n, history = [];
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
 let scenarios = [], selectedScenarioID = null;
-let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null;
+let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, restorationState = null;
 let turnAudits = [], auditGeneration = 0;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const newID = () => globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx'.replace(/x/g, () => Math.floor(Math.random() * 16).toString(16));
+function parseFixed(value, scale) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    value = value.toFixed(scale);
+  }
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(String(value));
+  if (!match || (match[3] || '').length > scale) return null;
+  const fraction = (match[3] || '').padEnd(scale, '0');
+  try {
+    const magnitude = BigInt(match[2] + fraction);
+    return match[1] ? -magnitude : magnitude;
+  } catch (_) {
+    return null;
+  }
+}
 function formatFixed(value, scale, displayScale) {
   let negative = value < 0n, magnitude = negative ? -value : value;
   const divisor = 10n ** BigInt(scale - displayScale);
   magnitude = (magnitude + divisor / 2n) / divisor;
   const base = 10n ** BigInt(displayScale), whole = magnitude / base, fraction = String(magnitude % base).padStart(displayScale, '0');
-  return `${negative ? '-' : ''}${whole.toLocaleString('en-US')}.${fraction}`;
+  return `${negative && magnitude !== 0n ? '-' : ''}${whole.toLocaleString('en-US')}.${fraction}`;
 }
-const money = (value, scale = 8) => typeof value === 'bigint' ? '$' + formatFixed(value, scale, 2) : '$' + number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+function currency(value, scale = 8, showPositive = false) {
+  const fixed = typeof value === 'bigint' ? value : parseFixed(value, scale);
+  if (fixed === null) return '$0.00';
+  const formatted = formatFixed(fixed, scale, 2), negative = formatted.startsWith('-');
+  const magnitude = negative ? formatted.slice(1) : formatted;
+  const sign = magnitude === '0.00' ? '' : negative ? '-' : showPositive ? '+' : '';
+  return `${sign}$${magnitude}`;
+}
+const money = (value, scale = 8) => currency(value, scale);
 const quantity = value => typeof value === 'bigint' ? formatFixed(value, 4, 2) : number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
-function signedMoney(value) {
-  const amount = number(value);
-  const formatted = money(Math.abs(amount));
-  return formatted === money(0) ? formatted : `${amount > 0 ? '+' : amount < 0 ? '-' : ''}${formatted}`;
-}
-function uiState(state) { return {turn:state.turn, cash:number(state.cash), inventory:number(state.position), mark:number(state.mark), isOver:state.is_over, reason:state.reason}; }
+const signedMoney = (value, scale = 8) => currency(value, scale, true);
+function uiState(state) { return {turn:state.turn, cash:parseFixed(state.cash, 8) ?? 0n, inventory:number(state.position), mark:number(state.mark), equity:parseFixed(state.equity, 8) ?? 0n, isOver:state.is_over, reason:state.reason}; }
 function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
 function store(key, value) { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } }
 function removeStored(key) { try { localStorage.removeItem(key); } catch (_) {} }
@@ -304,23 +323,30 @@ function updateQuotePreview() {
   $('spread').textContent = money(Math.max(0, width));
   $('quote-note').textContent = width > 2 ? 'Wide quote: less likely to trade.' : width > 0 ? 'Balanced quote around the mark.' : 'Ask must be above bid.';
 }
-['bid', 'ask'].forEach(id => $(id).addEventListener('input', () => { retryCommand = null; updateQuotePreview(); }));
+['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));
 
 function syncQuoteControls() {
-  const disabled = !gameId || isOver || Boolean(pendingCommand) || startingSession || Boolean(retryCreateRequest);
-  $('submitbtn').disabled = disabled; $('bid').disabled = disabled; $('ask').disabled = disabled;
+  const restoring = Boolean(restorationState), unresolved = Boolean(retryCommand || retryQuitCommand);
+  const disabled = !gameId || isOver || Boolean(pendingCommand) || startingSession || Boolean(retryCreateRequest) || restoring;
+  $('submitbtn').disabled = disabled || Boolean(retryQuitCommand);
+  $('submitbtn').textContent = retryCommand ? 'Retry previous quote' : 'Post quote for this turn';
+  $('bid').disabled = disabled || unresolved; $('ask').disabled = disabled || unresolved;
+  $('quit-session').disabled = disabled || Boolean(retryCommand);
+  $('quit-session').textContent = retryQuitCommand ? 'Retry ending session' : 'End current session';
+  $('play-again').disabled = Boolean(pendingCommand) || startingSession || restoring || unresolved;
+  $('review-history').disabled = Boolean(pendingCommand) || startingSession || restoring;
 }
 
 function setState(state, summary, recap) {
-  const equity = state.cash + state.inventory * state.mark;
-  const pnl = equity - startingEquity;
+  const equity = state.equity ?? 0n;
+  const pnl = equity - startingEquityFixed;
   $('turn').textContent = `Turn ${state.turn}${state.isOver ? ' · complete' : ''}`;
   $('mid').textContent = money(state.mark);
   $('equity').textContent = money(equity);
   $('inventory').textContent = quantity(state.inventory);
   $('cash').textContent = money(state.cash);
-  $('pnl').textContent = money(pnl);
-  $('pnl').className = 'metric-value ' + (pnl >= 0 ? 'positive' : 'negative');
+  $('pnl').textContent = signedMoney(pnl);
+  $('pnl').className = 'metric-value' + (pnl > 0n ? ' positive' : pnl < 0n ? ' negative' : '');
   const direction = state.inventory > 0.0001 ? 'Long' : state.inventory < -0.0001 ? 'Short' : 'Flat';
   const risk = Math.abs(state.inventory);
   $('position-caption').textContent = direction === 'Flat' ? 'Flat. No inventory exposure yet.' : `${direction} ${quantity(risk)} units. A $1 mark move changes equity by about ${money(risk)}.`;
@@ -332,19 +358,19 @@ function setState(state, summary, recap) {
 }
 
 function addHistory(state, summary) {
-  const equity = state.cash + state.inventory * state.mark;
-  history.push({turn:state.turn, mark:state.mark, inventory:state.inventory, equity, pnl:equity-startingEquity, summary:summary || {}});
+  const equity = state.equity ?? 0n;
+  history.push({turn:state.turn, mark:state.mark, inventory:state.inventory, equity, pnl:equity-startingEquityFixed, summary:summary || {}});
   renderHistory();
 }
 function renderHistory() {
   const body = $('historybody'), rows = [];
   for (const item of history.slice().reverse()) {
     const row = document.createElement('tr');
-    const values = [item.turn, money(item.mark, 4), quantity(item.inventory), money(item.equity), money(item.pnl)];
+    const values = [item.turn, money(item.mark, 4), quantity(item.inventory), money(item.equity), signedMoney(item.pnl)];
     values.forEach((value, index) => {
       const cell = document.createElement('td');
       cell.textContent = value;
-      if (index === values.length - 1) cell.className = item.pnl >= 0 ? 'positive' : 'negative';
+      if (index === values.length - 1) cell.className = item.pnl > 0n ? 'positive' : item.pnl < 0n ? 'negative' : '';
       row.appendChild(cell);
     });
     rows.push(row);
@@ -362,8 +388,8 @@ function renderAttribution(summary) {
   $('turn-attribution').hidden = !attribution;
   if (attribution) {
     for (const [id, value] of [['attribution-execution-edge', attribution.execution_edge], ['attribution-inventory-mark', attribution.inventory_mark_pnl], ['attribution-storage', attribution.storage_pnl], ['attribution-total', summary.turn_pnl]]) {
-      const element = $(id), amount = number(value);
-      element.textContent = signedMoney(value); element.className = amount > 0 ? 'positive' : amount < 0 ? 'negative' : '';
+      const element = $(id), amount = parseFixed(value, 8) ?? 0n;
+      element.textContent = signedMoney(value); element.className = amount > 0n ? 'positive' : amount < 0n ? 'negative' : '';
     }
   } else {
     for (const id of ['attribution-execution-edge', 'attribution-inventory-mark', 'attribution-storage', 'attribution-total']) { $(id).textContent = ''; $(id).className = ''; }
@@ -397,12 +423,12 @@ function renderTurn(result) {
   const flowOrders = events.filter(event => event.type === 'flow_order' && event.order);
   const playerOrders = events.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player');
   const mark = events.find(event => event.type === 'mark_updated');
-  const storage = number(summary.storage_cost || 0), turnPnl = number(summary.turn_pnl || 0);
+  const storage = parseFixed(summary.storage_cost || 0, 8) ?? 0n, turnPnl = parseFixed(summary.turn_pnl || 0, 8) ?? 0n;
   $('turn-empty').hidden = true; $('turn-detail').hidden = false;
   $('turn-status').textContent = `Mark ${money(state.mark)} · turn P&L ${signedMoney(turnPnl)}`;
   const flow = fills.length ? `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived and ${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived, but none crossed your quote.`;
   const move = mark ? ` The reference mark finished at ${money(state.mark)}.` : '';
-  $('turn-story').textContent = `${flow}${storage > 0 ? ` Storage cost ${money(storage)}.` : ''}${move}`;
+  $('turn-story').textContent = `${flow}${storage > 0n ? ` Storage cost ${money(storage)}.` : ''}${move}`;
   renderAttribution(summary); renderCoaching(result.coaching);
   const audit = {turn:state.turn, playerOrders, flowOrders, fills}; auditGeneration++; turnAudits.push(audit); renderAudit(audit);
 }
@@ -450,11 +476,11 @@ function clearAudit() {
   auditGeneration++; turnAudits = []; $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet';
 }
 
-async function loadAuditHistory(id, epoch, finalState) {
+async function loadAuditHistory(id, epoch, finalState, signal) {
   const generation = auditGeneration, events = []; let after = 0, hasMore = true;
   try {
     while (hasMore) {
-      const response = await fetch(`/api/v2/games/${id}/events?after=${after}&limit=200`);
+      const response = await fetch(`/api/v2/games/${id}/events?after=${after}&limit=200`, {signal});
       if (!response.ok) return;
       const page = await response.json();
       if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
@@ -472,7 +498,7 @@ async function loadAuditHistory(id, epoch, finalState) {
       if (hasMore && (!page.events.length || nextAfter <= pageAfter)) return;
       after = nextAfter;
     }
-  } catch (_) { return; }
+  } catch (_) { return null; }
   const byCommand = new Map();
   for (const event of events) {
     if (!event.command_id) continue;
@@ -488,23 +514,12 @@ async function loadAuditHistory(id, epoch, finalState) {
   if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
   turnAudits = audits;
   const restoredHistory = restoreHistory(events, finalState);
-  if (restoredHistory) { history = restoredHistory; renderHistory(); }
   if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
+  return restoredHistory;
 }
 
 function restoreHistory(events, finalState) {
-  const parseFixed = (value, scale) => {
-    const text = String(value), match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(text);
-    if (!match || (match[3] || '').length > scale) return null;
-    const fraction = (match[3] || '').padEnd(scale, '0');
-    try {
-      const magnitude = BigInt(match[2] + fraction);
-      return match[1] ? -magnitude : magnitude;
-    } catch (_) {
-      return null;
-    }
-  };
-  const state = {cash:parseFixed(finalState.cash, 8), inventory:parseFixed(finalState.inventory, 4)};
+  const state = {cash:parseFixed(finalState?.cash, 8), inventory:parseFixed(finalState?.position, 4)};
   if (state.cash === null || state.inventory === null) return null;
   const commands = new Map();
   for (const event of events) {
@@ -540,12 +555,12 @@ function restoreHistory(events, finalState) {
   const firstMark = snapshots[0].previousMark;
   if (firstMark === null) return null;
   const startingCash = state.cash, startingInventory = state.inventory;
-  const startingEquity = startingCash + startingInventory * firstMark;
-  const restored = [{turn:0, cash:startingCash, inventory:startingInventory, mark:firstMark, equity:startingEquity, pnl:0n, summary:{}}];
+  const restoredStartingEquityFixed = startingCash + startingInventory * firstMark;
+  const restored = [{turn:0, cash:startingCash, inventory:startingInventory, mark:firstMark, equity:restoredStartingEquityFixed, pnl:0n, summary:{}}];
   for (const [index, snapshot] of snapshots.entries()) restored.push({turn:index + 1, ...snapshot});
   return restored.map(item => {
     const equity = item.equity === undefined ? item.cash + item.inventory * item.mark : item.equity;
-    return {...item, equity, pnl:equity - startingEquity, summary:item.summary || {}};
+    return {...item, equity, pnl:equity - restoredStartingEquityFixed, summary:item.summary || {}};
   });
 }
 
@@ -589,7 +604,7 @@ function renderTutorial(snapshot) {
 function renderScenarios() {
   const list = $('scenario-options'), buttons = [];
   for (const snapshot of scenarios) {
-    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = startingSession || Boolean(retryCreateRequest) || Boolean(gameId && !isOver); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
+    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest) || Boolean(gameId && !isOver); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
     const title = document.createElement('strong'), briefing = document.createElement('span');
     title.textContent = snapshot.title; briefing.textContent = snapshot.briefing; button.append(title, briefing);
     button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(); };
@@ -598,7 +613,7 @@ function renderScenarios() {
   list.replaceChildren(...buttons);
 }
 function setStartButtonsEnabled(enabled) {
-  const disabled = (!enabled && !retryCreateRequest) || startingSession;
+  const disabled = (!enabled && !retryCreateRequest) || Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState);
   $('start-default').disabled = disabled; $('start-selected').disabled = disabled;
 }
 async function loadScenarios() {
@@ -613,31 +628,36 @@ function pendingCreate() {
   try { return JSON.parse(stored('mmg.pending_create')); } catch (_) { removeStored('mmg.pending_create'); return null; }
 }
 async function startNewGame(request) {
-  if (startingSession) return;
-  if (!request && gameId && !isOver && !confirm('Start a new lesson? This replaces the current session in the desk.')) return;
-  if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return; }
+  if (pendingCommand || retryCommand || retryQuitCommand || startingSession || restorationState) return {status:'ignored'};
+  if (!request && gameId && !isOver && !confirm('Start a new lesson? This replaces the current session in the desk.')) return {status:'ignored'};
+  if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return {status:'ignored'}; }
   const create = request || retryCreateRequest || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
   const attempt = ++startAttempt; startingSession = true; retryCreateRequest = create;
-  const savedCreate = store('mmg.pending_create', JSON.stringify(create)); setStartButtonsEnabled(catalogReady); syncQuoteControls();
+  const savedCreate = store('mmg.pending_create', JSON.stringify(create)); renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
   try {
     const response = await fetch('/api/v2/games', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(create)});
     if (!response.ok) {
-      if (attempt !== startAttempt) return;
+      const body = await response.text();
+      if (attempt !== startAttempt) return {status:'stale'};
       if (response.status < 500) { retryCreateRequest = null; removeStored('mmg.pending_create'); }
-      alert(`Could not start this lesson: ${await response.text()}`); return;
+      alert(`Could not start this lesson: ${body}`);
+      return {status:response.status < 500 ? 'rejected' : 'retryable'};
     }
     const data = await response.json(), state = uiState(data.state);
-    if (attempt !== startAttempt) return;
+    if (attempt !== startAttempt) return {status:'stale'};
     sessionEpoch++;
     gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
-    startingEquity = state.cash + state.inventory * state.mark; history = []; clearAudit(); retryCreateRequest = null;
-    removeStored('mmg.pending_create');
-    const savedGame = store('mmg.game_id', gameId) && store('mmg.starting_equity', String(startingEquity));
-    if (!savedGame) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
+    startingEquityFixed = state.equity; history = []; clearAudit();
+    const savedGame = store('mmg.game_id', gameId);
+    const savedBaseline = store('mmg.starting_equity', formatFixed(startingEquityFixed, 8, 8));
+    if (!savedGame || !savedBaseline) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
     applyScenario(data.scenario); resetLatestTurn(); $('gamesummary').hidden = true; $('historybody').replaceChildren();
     setState(state, null, data.recap); addHistory(state);
+    retryCreateRequest = null; removeStored('mmg.pending_create');
+    return {status:'started'};
   } catch (_) {
     if (attempt === startAttempt) alert(savedCreate ? 'Network error. Start the lesson again to safely retry.' : 'Network error. Start the lesson again to safely retry; browser storage is unavailable, so keep this tab open.');
+    return {status:'retryable'};
   } finally {
     if (attempt === startAttempt) { startingSession = false; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
   }
@@ -649,39 +669,61 @@ function startDefault() {
 }
 
 async function submitTurn() {
-  if (!gameId || isOver || pendingCommand) return;
+  if (!gameId || isOver || pendingCommand || retryQuitCommand || startingSession || restorationState) return;
   const bid = number($('bid').value), ask = number($('ask').value);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || bid >= ask) { alert('Set a positive bid below your ask.'); return; }
   const command = retryCommand || {id:newID(), type:'submit_quote', expected_version:version, bid:$('bid').value, ask:$('ask').value}, epoch = sessionEpoch;
-  pendingCommand = command; syncQuoteControls();
+  pendingCommand = command; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
   try {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
-    if (!response.ok) { if (epoch !== sessionEpoch || pendingCommand !== command) return; alert(`Quote rejected: ${await response.text()}`); retryCommand = null; return; }
+    if (!response.ok) {
+      const body = await response.text();
+      if (epoch !== sessionEpoch || pendingCommand !== command) return;
+      if (response.status >= 500) {
+        retryCommand = command;
+        alert(`Quote response was uncertain: ${body}\nThe same quote will be retried.`);
+      } else {
+        retryCommand = null;
+        alert(`Quote rejected: ${body}`);
+      }
+      return;
+    }
     const data = await response.json(), state = uiState(data.state);
     if (epoch !== sessionEpoch || pendingCommand !== command) return;
     version = data.version; retryCommand = null;
     renderTurn(data); setState(state, data.summary, data.recap); addHistory(state, data.summary);
   } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryCommand = command; alert('Network error. Post the same quote again to recover safely.'); } }
-  finally { if (pendingCommand === command) { pendingCommand = null; syncQuoteControls(); } }
+  finally { if (pendingCommand === command) { pendingCommand = null; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); } }
 }
 
 async function quitSession() {
-  if (!gameId || pendingCommand) return;
-  const command = retryQuitCommand || {id:newID(), type:'quit', expected_version:version}, epoch = sessionEpoch; pendingCommand = command; syncQuoteControls();
+  if (!gameId || isOver || pendingCommand || retryCommand || startingSession || restorationState) return;
+  const command = retryQuitCommand || {id:newID(), type:'quit', expected_version:version}, epoch = sessionEpoch; pendingCommand = command; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
   try {
     const response = await fetch(`/api/v2/games/${gameId}/commands`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(command)});
-    if (!response.ok) { if (epoch !== sessionEpoch || pendingCommand !== command) return; alert(`Could not end session: ${await response.text()}`); retryQuitCommand = null; return; }
+    if (!response.ok) {
+      const body = await response.text();
+      if (epoch !== sessionEpoch || pendingCommand !== command) return;
+      if (response.status >= 500) {
+        retryQuitCommand = command;
+        alert(`End-session response was uncertain: ${body}\nThe same end-session command will be retried.`);
+      } else {
+        retryQuitCommand = null;
+        alert(`Could not end session: ${body}`);
+      }
+      return;
+    }
     const data = await response.json(), state = uiState(data.state);
     if (epoch !== sessionEpoch || pendingCommand !== command) return;
     version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap);
   } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryQuitCommand = command; alert('Network error. End the session again to recover safely.'); } }
-  finally { if (pendingCommand === command) { pendingCommand = null; syncQuoteControls(); } }
+  finally { if (pendingCommand === command) { pendingCommand = null; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); } }
 }
 
 function showSummary(state, recap) {
-  const equity = state.cash + state.inventory * state.mark, pnl = equity - startingEquity;
+  const equity = state.equity ?? 0n, pnl = equity - startingEquityFixed;
   $('gamesummary').hidden = false;
-  $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${money(pnl)} since the start.`;
+  $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${signedMoney(pnl)} since the start.`;
   const informedFields = ['informed_orders', 'informed_orders_filled', 'informed_units_traded', 'informed_flow_pnl'];
   const hasInformedRecap = recap && (recap.scorecard?.focus_label === 'Informed-flow P&L' || informedFields.some(field => Object.prototype.hasOwnProperty.call(recap, field)));
   $('recap-informed-flow').hidden = !hasInformedRecap;
@@ -689,22 +731,60 @@ function showSummary(state, recap) {
   const scorecard = recap?.scorecard;
   $('scorecard').hidden = !scorecard;
   if (scorecard) {
-    $('score-pnl').textContent = money(recap.total_pnl); $('score-pnl').className = number(recap.total_pnl) >= 0 ? 'positive' : 'negative';
-    $('score-focus-label').textContent = scorecard.focus_label; $('score-focus-value').textContent = scorecard.focus_value;
+    const totalPnl = parseFixed(recap.total_pnl, 8) ?? 0n;
+    $('score-pnl').textContent = signedMoney(totalPnl); $('score-pnl').className = totalPnl > 0n ? 'positive' : totalPnl < 0n ? 'negative' : '';
+    $('score-focus-label').textContent = scorecard.focus_label; $('score-focus-value').textContent = scorecard.focus_label === 'Informed-flow P&L' ? signedMoney(scorecard.focus_value) : scorecard.focus_value;
     $('score-focus-note').textContent = scorecard.focus_note; $('score-reflection').textContent = scorecard.reflection;
   }
   $('gamesummary').focus();
 }
-function playAgain() { sessionEpoch++; startAttempt++; startingSession = false; retryCreateRequest = null; gameId = null; isOver = false; history = []; retryCommand = retryQuitCommand = pendingCommand = null; removeStored('mmg.game_id'); removeStored('mmg.pending_create'); $('gamesummary').hidden=true; resetLatestTurn(); $('historybody').replaceChildren(); clearAudit(); renderScenarios(); setStartButtonsEnabled(catalogReady); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); }
-function reviewHistory() { $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
+function playAgain() { if (!pendingCommand && !retryCommand && !retryQuitCommand && !startingSession && !restorationState) return startNewGame(); }
+function reviewHistory() { if (!pendingCommand && !startingSession && !restorationState) $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
 async function resumeGame() {
   const id = stored('mmg.game_id'); if (!id) return;
-  const epoch = sessionEpoch;
-  try { const response = await fetch(`/api/v2/games/${id}`); if (!response.ok) { if (response.status === 404) { removeStored('mmg.game_id'); removeStored('mmg.starting_equity'); } return; } const data = await response.json(), state=uiState(data.state); if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return; gameId=data.game_id; version=data.version; isOver=state.isOver; const equity = state.cash + state.inventory * state.mark; startingEquity=Number(stored('mmg.starting_equity')) || (data.recap ? equity - number(data.recap.total_pnl) : equity); clearAudit(); if (data.scenario && scenarios.some(snapshot => snapshot.id === data.scenario.id)) selectedScenarioID=data.scenario.id; applyScenario(data.scenario); renderScenarios(); if (data.latest_turn) renderLatestTurn(data.latest_turn); else resetLatestTurn(); setState(state, data.latest_turn?.summary, data.recap); addHistory(state, data.latest_turn?.summary); loadAuditHistory(id, epoch, state); } catch (_) { /* Keep ID for a later reconnect. */ }
+  const epoch = sessionEpoch, restoration = {id, epoch};
+  restorationState = restoration; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
+  try {
+    const response = await fetch(`/api/v2/games/${id}`);
+    if (!response.ok) { if (response.status === 404) { removeStored('mmg.game_id'); removeStored('mmg.starting_equity'); } return; }
+    const data = await response.json(), state = uiState(data.state);
+    if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return;
+    gameId = data.game_id; version = data.version; isOver = state.isOver;
+    const savedBaseline = parseFixed(stored('mmg.starting_equity'), 8), recapPnl = parseFixed(data.recap?.total_pnl, 8);
+    startingEquityFixed = savedBaseline ?? (recapPnl === null ? state.equity : state.equity - recapPnl);
+    clearAudit();
+    if (data.scenario) selectedScenarioID = data.scenario.id;
+    applyScenario(data.scenario); renderScenarios();
+    if (data.latest_turn) renderLatestTurn(data.latest_turn); else resetLatestTurn();
+    setState(state, data.latest_turn?.summary, data.recap); addHistory(state, data.latest_turn?.summary);
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 5000);
+    let restoredHistory = null;
+    try { restoredHistory = await loadAuditHistory(id, epoch, data.state, controller.signal); }
+    finally { clearTimeout(timeout); }
+    if (restoredHistory && epoch === sessionEpoch && gameId === id) {
+      startingEquityFixed = restoredHistory[0].equity;
+      store('mmg.starting_equity', formatFixed(startingEquityFixed, 8, 8));
+      history = restoredHistory;
+      setState(state, data.latest_turn?.summary, data.recap); renderHistory();
+    }
+  } catch (_) { /* Keep ID for a later reconnect. */ }
+  finally {
+    if (restorationState === restoration) {
+      restorationState = null;
+      if (epoch === sessionEpoch) { renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
+    }
+  }
 }
 document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
-async function initialize() { await loadScenarios(); const request = pendingCreate(); if (request) { selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); startNewGame(request); return; } resumeGame(); }
-updateQuotePreview(); setState({turn:0,cash:0,inventory:0,mark:0,isOver:false}); initialize();
+async function initialize() {
+  const catalog = loadScenarios(), request = pendingCreate();
+  if (!request) return resumeGame();
+  await catalog;
+  selectedScenarioID = request.scenario_id; applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios();
+  const result = await startNewGame(request);
+  if (result?.status === 'rejected') await resumeGame();
+}
+updateQuotePreview(); setState({turn:0,cash:0n,inventory:0,mark:0,equity:0n,isOver:false}); initialize();
 </script>
 </body>
 </html>
