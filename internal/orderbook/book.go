@@ -105,12 +105,24 @@ func (b *Book) Asks() []Level        { return b.asks.snapshot(false) }
 func (b *Book) Clone() *Book {
 	clone := New()
 	for _, order := range b.Orders("") {
-		clone.rest(order)
+		if err := clone.rest(order); err != nil {
+			panic("orderbook: valid book failed to clone: " + err.Error())
+		}
 	}
 	return clone
 }
 
 func (b *Book) Submit(order Order, policy SelfTradePolicy) (Report, error) {
+	clone := b.Clone()
+	report, err := clone.submit(order, policy)
+	if err != nil {
+		return Report{}, err
+	}
+	*b = *clone
+	return report, nil
+}
+
+func (b *Book) submit(order Order, policy SelfTradePolicy) (Report, error) {
 	if err := validate(order); err != nil {
 		return Report{}, err
 	}
@@ -160,7 +172,9 @@ func (b *Book) Submit(order Order, policy SelfTradePolicy) (Report, error) {
 		report.Expired = &expired
 		return report, nil
 	}
-	b.rest(order)
+	if err := b.rest(order); err != nil {
+		return Report{}, err
+	}
 	resting := clone(order)
 	report.Resting = &resting
 	return report, nil
@@ -231,9 +245,17 @@ func (b *Book) Orders(ownerID string) []Order {
 	return orders
 }
 
-func (b *Book) rest(order Order) {
+func (b *Book) rest(order Order) error {
 	s := b.forSide(order.Side)
 	l := s.levels[order.Price]
+	nextQty := order.Remaining
+	if l != nil {
+		var err error
+		nextQty, err = fixed.AddQty(l.qty, order.Remaining)
+		if err != nil {
+			return err
+		}
+	}
 	if l == nil {
 		l = &level{price: order.Price}
 		s.levels[order.Price] = l
@@ -246,8 +268,9 @@ func (b *Book) rest(order Order) {
 		l.head = n
 	}
 	l.tail = n
-	l.qty += order.Remaining
+	l.qty = nextQty
 	b.orders[order.ID] = n
+	return nil
 }
 
 func (b *Book) remove(n *node) {
@@ -304,7 +327,9 @@ func (b *Book) without(orderID uint64) (*Book, error) {
 		if order.ID == orderID {
 			continue
 		}
-		clone.rest(order)
+		if err := clone.rest(order); err != nil {
+			return nil, err
+		}
 	}
 	return clone, nil
 }

@@ -100,6 +100,67 @@ func TestRestingOrdersReserveWorstCasePosition(t *testing.T) {
 	}
 }
 
+func TestOrdersRejectWorstCaseInsolvencyIncludingOpenOrdersAndReplacement(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingCash = mustMoney(t, "100")
+	cfg.MaxPosition = mustQty(t, "2")
+	cfg.MaxOrderQty = mustQty(t, "2")
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps, cfg.MaxOrdersPerTurn = 0, 0, 0
+
+	t.Run("generic includes open orders", func(t *testing.T) {
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "1"), mustQty(t, "1"), GTC); err != nil {
+			t.Fatal(err)
+		}
+		before := e.State()
+		if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "1"), mustQty(t, "1"), GTC); err == nil {
+			t.Fatal("expected aggregate one-sided insolvency rejection")
+		}
+		if e.State() != before || len(e.OpenOrders(PlayerAccount)) != 1 {
+			t.Fatal("rejected order changed venue")
+		}
+	})
+
+	t.Run("post-fill initial margin", func(t *testing.T) {
+		marginCfg := cfg
+		marginCfg.InitialMarginBps = 10_000
+		e, err := New(marginCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "50"), mustQty(t, "1"), GTC); err == nil {
+			t.Fatal("expected post-fill initial-margin rejection")
+		}
+	})
+
+	t.Run("replacement excludes old order", func(t *testing.T) {
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		placed, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "101"), mustQty(t, "2"), GTC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldID := placed.Events[0].Order.ID
+		replaced, err := e.ReplaceLimit(PlayerAccount, oldID, Sell, mustPrice(t, "102"), mustQty(t, "2"), GTC)
+		if err != nil {
+			t.Fatal("replacement counted the old order against risk limits:", err)
+		}
+		oldID = replaced.Events[0].Order.ID
+		beforeState, beforeOrders := e.State(), e.OpenOrders(PlayerAccount)
+		if _, err := e.ReplaceLimit(PlayerAccount, oldID, Sell, mustPrice(t, "1"), mustQty(t, "2"), GTC); err == nil {
+			t.Fatal("expected replacement insolvency rejection")
+		}
+		if e.State() != beforeState || !reflect.DeepEqual(e.OpenOrders(PlayerAccount), beforeOrders) {
+			t.Fatal("rejected replacement changed venue")
+		}
+	})
+}
+
 func TestQuoteMatchesExistingLiquidityAndNeverCrossesBook(t *testing.T) {
 	cfg := config(t)
 	cfg.MaxOrdersPerTurn = 0
@@ -545,8 +606,8 @@ func TestLegacyEquityDeltaOverflowRollsBackTransaction(t *testing.T) {
 func TestLegacyFlowSummaryOverflowRollsBackTransaction(t *testing.T) {
 	maxFlowQty := fixed.Qty(math.MaxInt64 / 4)
 	cfg := config(t)
-	cfg.StartingCash = fixed.Money(math.MaxInt64)
-	cfg.StartingMark = fixed.Price(2)
+	cfg.StartingCash = fixed.Money(maxFlowQty)
+	cfg.StartingMark = fixed.Price(3)
 	cfg.MaxPosition = maxFlowQty
 	cfg.MaxOrderQty = maxFlowQty
 	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
@@ -557,10 +618,10 @@ func TestLegacyFlowSummaryOverflowRollsBackTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range 3 {
+	for i := range 4 {
 		id := string(rune('a' + i))
 		e.accounts[id] = &Account{ID: id, External: true}
-		if _, err := e.PlaceLimit(id, Sell, fixed.Price(2), fixed.Qty(math.MaxInt64/2), GTC); err != nil {
+		if _, err := e.PlaceLimit(id, Sell, fixed.Price(2+i/2), maxFlowQty, GTC); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -927,6 +988,47 @@ func TestV2ArithmeticFailureRollsBackStateAndStreams(t *testing.T) {
 	}
 }
 
+func TestV2RejectsInsolventQuoteWithoutConsumingStateOrRNG(t *testing.T) {
+	cfg := config(t)
+	cfg.SimulationVersion = SimulationVersionAdverseSelection
+	cfg.StartingCash = mustMoney(t, "250")
+	cfg.MaxPosition = mustQty(t, "10")
+	cfg.MaxOrderQty = mustQty(t, "3")
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeState, beforeLedger := e.State(), e.LedgerEntries()
+	beforeFlow, beforeMark, beforeInformed := e.flowRNG, e.markRNG, e.informedRNG
+	beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+	if _, err := e.SubmitQuote(mustPrice(t, "1"), mustPrice(t, "2")); err == nil {
+		t.Fatal("expected deeply underpriced quote rejection")
+	}
+	if e.State() != beforeState || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) || len(e.OpenOrders(PlayerAccount)) != 0 {
+		t.Fatal("rejected quote changed venue state")
+	}
+	if e.flowRNG != beforeFlow || e.markRNG != beforeMark || e.informedRNG != beforeInformed || e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent {
+		t.Fatal("rejected quote consumed RNG or counters")
+	}
+	got, err := e.SubmitQuote(mustPrice(t, "50"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := fresh.SubmitQuote(mustPrice(t, "50"), mustPrice(t, "101"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("rejected quote changed subsequent deterministic result")
+	}
+}
+
 func TestV2FlowLimitOverflowRollsBackTransactionAndStreams(t *testing.T) {
 	cfg := config(t)
 	cfg.SimulationVersion = SimulationVersionAdverseSelection
@@ -1057,6 +1159,7 @@ func TestSettlementOverflowLeavesLiveVenueUntouched(t *testing.T) {
 	if err := e.AddAccount("seller", fixed.Money(math.MaxInt64), 0); err != nil {
 		t.Fatal(err)
 	}
+	e.accounts["seller"].External = true
 	sell, err := e.PlaceLimit("seller", Sell, mustPrice(t, "1"), mustQty(t, "1"), GTC)
 	if err != nil {
 		t.Fatal(err)
@@ -1070,6 +1173,100 @@ func TestSettlementOverflowLeavesLiveVenueUntouched(t *testing.T) {
 	}
 	if _, ok := e.book.Order(sell.Events[0].Order.ID); !ok {
 		t.Fatal("overflowing settlement consumed maker order")
+	}
+}
+
+func TestMarkedEquityOverflowRollsBackTakerAndMakerSettlement(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *Engine) uint64
+		trade func(*Engine) error
+	}{
+		{
+			name: "taker",
+			setup: func(t *testing.T, e *Engine) uint64 {
+				result, err := e.PlaceLimit(FlowAccount, Sell, fixed.Price(1), fixed.Qty(1), GTC)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return result.Events[0].Order.ID
+			},
+			trade: func(e *Engine) error {
+				_, err := e.PlaceLimit(PlayerAccount, Buy, fixed.Price(100), fixed.Qty(1), IOC)
+				return err
+			},
+		},
+		{
+			name: "maker",
+			setup: func(t *testing.T, e *Engine) uint64 {
+				e.mark = fixed.Price(1)
+				result, err := e.PlaceLimit(PlayerAccount, Buy, fixed.Price(1), fixed.Qty(1), GTC)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.mark = fixed.Price(100)
+				return result.Events[0].Order.ID
+			},
+			trade: func(e *Engine) error {
+				_, err := e.PlaceLimit(FlowAccount, Sell, fixed.Price(1), fixed.Qty(1), IOC)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.StartingCash = fixed.Money(math.MaxInt64 - 50)
+			cfg.StartingMark = fixed.Price(100)
+			cfg.MaxPosition = fixed.Qty(10)
+			cfg.MaxOrderQty = fixed.Qty(1)
+			cfg.InitialMarginBps, cfg.MaintenanceMarginBps, cfg.MaxOrdersPerTurn = 0, 0, 0
+			e, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restingID := test.setup(t, e)
+			beforeState, beforeOrders, beforeLedger := e.State(), e.book.Orders(""), e.LedgerEntries()
+			beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+			if err := test.trade(e); err == nil {
+				t.Fatal("expected marked equity overflow")
+			}
+			if e.State() != beforeState || !reflect.DeepEqual(e.book.Orders(""), beforeOrders) || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) {
+				t.Fatal("overflowing settlement changed venue")
+			}
+			if e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent {
+				t.Fatal("overflowing settlement consumed counters")
+			}
+			if _, ok := e.book.Order(restingID); !ok {
+				t.Fatal("overflowing settlement consumed resting order")
+			}
+		})
+	}
+}
+
+func TestEngineRejectsLevelQuantityOverflowAtomically(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingMark = fixed.Price(1)
+	cfg.MaxPosition = fixed.Qty(1)
+	cfg.MaxOrderQty = fixed.Qty(1)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(FlowAccount, Buy, fixed.Price(1), fixed.Qty(math.MaxInt64), GTC); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, beforeOrders, beforeLedger := e.State(), e.book.Orders(""), e.LedgerEntries()
+	beforeOrder, beforeTrade, beforeEvent := e.nextOrder, e.nextTrade, e.nextEvent
+	if _, err := e.PlaceLimit(FlowAccount, Buy, fixed.Price(1), fixed.Qty(1), GTC); err == nil {
+		t.Fatal("expected engine level quantity overflow")
+	}
+	if e.State() != beforeState || !reflect.DeepEqual(e.book.Orders(""), beforeOrders) || !reflect.DeepEqual(e.LedgerEntries(), beforeLedger) {
+		t.Fatal("level overflow changed venue")
+	}
+	if e.nextOrder != beforeOrder || e.nextTrade != beforeTrade || e.nextEvent != beforeEvent {
+		t.Fatal("level overflow consumed counters")
 	}
 }
 

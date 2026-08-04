@@ -40,8 +40,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Println("=== Market Maker Exchange ===")
-	fmt.Printf("Scenario seed: %d | simulation version: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, cfg.SimulationVersion, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
+	printBanner(os.Stdout, cfg)
 	printState(os.Stdout, engine.State())
 	reader := bufio.NewReader(os.Stdin)
 	for !engine.State().IsOver {
@@ -58,7 +57,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "quit rejected:", err)
 				return
 			}
-			printResult(os.Stdout, result)
+			printResult(os.Stdout, result, cfg.SimulationVersion)
 			break
 		}
 		parts := strings.Fields(line)
@@ -77,7 +76,7 @@ func main() {
 			fmt.Println("Rejected:", err)
 			continue
 		}
-		printResult(os.Stdout, result)
+		printResult(os.Stdout, result, cfg.SimulationVersion)
 	}
 }
 
@@ -125,11 +124,24 @@ func parseVol(input string) (int64, int64, error) {
 	return int64(math.Round(min * 100)), int64(math.Round(max * 100)), nil
 }
 
-func printResult(w io.Writer, result exchange.Result) {
+func printBanner(w io.Writer, cfg exchange.Config) {
+	fmt.Fprintln(w, "=== Market Maker Exchange ===")
+	if cfg.SimulationVersion == exchange.SimulationVersionAdverseSelection {
+		fmt.Fprintf(w, "Scenario seed: %d | simulation version: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, cfg.SimulationVersion, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
+		return
+	}
+	fmt.Fprintf(w, "Scenario seed: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
+}
+
+func printResult(w io.Writer, result exchange.Result, simulationVersion exchange.SimulationVersion) {
 	for _, event := range result.Events {
 		switch event.Type {
 		case "trade":
 			if event.Trade == nil {
+				continue
+			}
+			if simulationVersion != exchange.SimulationVersionAdverseSelection {
+				fmt.Fprintf(w, "Trade: %s %s @ %s\n", event.Trade.Quantity, event.Trade.Price, event.Trade.BuyerID+" buys")
 				continue
 			}
 			customer := "a customer"
@@ -150,7 +162,7 @@ func printResult(w io.Writer, result exchange.Result) {
 			fmt.Fprintln(w, "Game ended:", event.Reason)
 		}
 	}
-	if attribution := result.Summary.PnLAttribution; attribution != nil {
+	if attribution := result.Summary.PnLAttribution; simulationVersion == exchange.SimulationVersionAdverseSelection && attribution != nil {
 		fmt.Fprintln(w, "Turn P&L attribution:")
 		fmt.Fprintf(w, "  Execution edge: %s\n", signedMoney(attribution.ExecutionEdge))
 		fmt.Fprintf(w, "  Inventory mark: %s\n", signedMoney(attribution.InventoryMarkPnL))
@@ -159,7 +171,7 @@ func printResult(w io.Writer, result exchange.Result) {
 	} else {
 		fmt.Fprintf(w, "Turn fill cash: $%s | storage: $%s | turn P&L: $%s\n", result.Summary.NetFillCash, result.Summary.StorageCost, result.Summary.TurnPnL)
 	}
-	if result.Summary.InformedOrders > 0 || result.Summary.InformedOrdersFilled > 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.InformedFlowPnL != 0 {
+	if simulationVersion == exchange.SimulationVersionAdverseSelection && (result.Summary.InformedOrders > 0 || result.Summary.InformedOrdersFilled > 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.InformedFlowPnL != 0) {
 		fmt.Fprintf(w, "Informed flow: %d arrived | %d filled | %s units | P&L %s\n", result.Summary.InformedOrders, result.Summary.InformedOrdersFilled, result.Summary.InformedUnitsTraded, signedMoney(result.Summary.InformedFlowPnL))
 	}
 	printState(w, result.State)

@@ -22,6 +22,7 @@ import (
 )
 
 const testGameID = "11111111-1111-4111-8111-111111111111"
+const testOtherGameID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 const testCreateID = "22222222-2222-4222-8222-222222222222"
 const testQuoteID = "33333333-3333-4333-8333-333333333333"
 const testQuitID = "44444444-4444-4444-8444-444444444444"
@@ -37,6 +38,47 @@ func v2ServerForService(svc *exchangeService) *httptest.Server {
 	mux.HandleFunc("/api/v2/games", svc.handleGames)
 	mux.HandleFunc("/api/v2/games/", svc.handleGame)
 	return httptest.NewServer(mux)
+}
+
+func TestCommandMetricsIncludeDurableAppend(t *testing.T) {
+	svc := newExchangeService(t.TempDir())
+	svc.metrics = newMetrics()
+	create := httptest.NewRequest(http.MethodPost, "/api/v2/games", strings.NewReader(`{"game_id":"`+testGameID+`","command_id":"`+testCreateID+`","scenario_id":"first-spread-v1"}`))
+	create.Header.Set("Content-Type", "application/json")
+	svc.handleGames(httptest.NewRecorder(), create)
+	entry := svc.entries[testGameID]
+	if entry == nil {
+		t.Fatal("game was not created")
+	}
+	quote := httptest.NewRequest(http.MethodPost, "/api/v2/games/"+testGameID+"/commands", strings.NewReader(`{"id":"`+testQuoteID+`","type":"submit_quote","expected_version":0,"bid":"99.5000","ask":"100.5000"}`))
+	quote.Header.Set("Content-Type", "application/json")
+	svc.handleExchangeCommand(httptest.NewRecorder(), quote, testGameID, entry)
+	output := string(svc.metrics.prometheus())
+	for _, expected := range []string{
+		`mmg_game_commands_total{command="create_game",outcome="accepted"} 1`,
+		`mmg_game_commands_total{command="submit_quote",outcome="accepted"} 1`,
+		`mmg_event_log_append_duration_seconds_count{outcome="success"} 1`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("metrics output missing %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestRecoveryFailureMetric(t *testing.T) {
+	svc := newExchangeService(t.TempDir())
+	svc.metrics = newMetrics()
+	create := httptest.NewRequest(http.MethodPost, "/api/v2/games", strings.NewReader(`{"game_id":"`+testGameID+`","command_id":"`+testCreateID+`","scenario_id":"first-spread-v1"}`))
+	create.Header.Set("Content-Type", "application/json")
+	svc.handleGames(httptest.NewRecorder(), create)
+	entry := svc.entries[testGameID]
+	entry.syncLog = func(*eventlog.Log) error { return errors.New("sync failed") }
+	if err := entry.recover(); err == nil {
+		t.Fatal("recover succeeded")
+	}
+	if !strings.Contains(string(svc.metrics.prometheus()), "mmg_game_recovery_failures_total 1") {
+		t.Fatalf("recovery failure missing from metrics:\n%s", svc.metrics.prometheus())
+	}
 }
 
 func TestV2ListsServerOwnedScenarios(t *testing.T) {
@@ -98,6 +140,21 @@ func TestV2EndpointSemantics(t *testing.T) {
 	}
 	if _, exists := state["latest_turn"]; exists {
 		t.Fatal("state response contains latest_turn before the first turn")
+	}
+	var initialState exchange.State
+	var startingEquity fixed.Money
+	var eventsThrough uint64
+	if err := json.Unmarshal(state["state"], &initialState); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(state["starting_equity"], &startingEquity); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(state["events_through"], &eventsThrough); err != nil {
+		t.Fatal(err)
+	}
+	if startingEquity != initialState.Equity || eventsThrough != 0 || initialState.Turn != 0 {
+		t.Fatalf("turn-zero snapshot state=%+v starting_equity=%s events_through=%d", initialState, startingEquity, eventsThrough)
 	}
 
 	methodTests := []struct {
@@ -210,6 +267,111 @@ func TestV2EventsRequiresCanonicalLimit(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("repeated limit status=%d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestV2EventsRequiresCanonicalDurableThrough(t *testing.T) {
+	ts := v2Server(t.TempDir())
+	defer ts.Close()
+	createV2Game(t, ts.URL)
+
+	resp, err := http.Get(ts.URL + "/api/v2/games/" + testGameID + "/events?through=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("through=0 status=%d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	for _, value := range []string{"", "00", "01", "+1", "-1", "1.0", "1x", "18446744073709551616"} {
+		resp, err := http.Get(ts.URL + "/api/v2/games/" + testGameID + "/events?through=" + url.QueryEscape(value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("through=%q status=%d, want %d", value, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+	for _, query := range []string{"through=0&through=0", "through=1"} {
+		resp, err := http.Get(ts.URL + "/api/v2/games/" + testGameID + "/events?" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("query=%q status=%d, want %d", query, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestV2EventsThroughBoundsPagination(t *testing.T) {
+	ts := v2Server(t.TempDir())
+	defer ts.Close()
+	createV2Game(t, ts.URL)
+	command := `{"id":"` + testQuoteID + `","type":"submit_quote","expected_version":0,"bid":"99.50","ask":"100.50"}`
+	resp, err := http.Post(ts.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(command))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result exchangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(result.Events) < 2 {
+		t.Fatalf("command emitted %d events, want at least two", len(result.Events))
+	}
+	through := result.Events[0].Sequence
+
+	resp, err = http.Get(fmt.Sprintf("%s/api/v2/games/%s/events?after=0&through=%d&limit=1", ts.URL, testGameID, through))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page struct {
+		Events    []exchange.Event `json:"events"`
+		NextAfter uint64           `json:"next_after"`
+		HasMore   bool             `json:"has_more"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(page.Events) != 1 || page.Events[0].Sequence != through || page.NextAfter != through || page.HasMore {
+		t.Fatalf("bounded page=%+v through=%d", page, through)
+	}
+
+	resp, err = http.Get(fmt.Sprintf("%s/api/v2/games/%s/events?after=%d&through=%d&limit=200", ts.URL, testGameID, through, result.Events[len(result.Events)-1].Sequence))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remainder struct {
+		Events []exchange.Event `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&remainder); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(remainder.Events) != len(result.Events)-1 || remainder.Events[0].Sequence <= through {
+		t.Fatalf("remainder=%+v", remainder.Events)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	wantThrough := result.Events[len(result.Events)-1].Sequence
+	if snapshot.Version != result.Version || snapshot.State != result.State || snapshot.EventsThrough != wantThrough {
+		t.Fatalf("state snapshot=%+v result version=%d through=%d", snapshot, result.Version, wantThrough)
 	}
 }
 
@@ -755,7 +917,7 @@ func TestReplayTreatsOmittedEmptyLedgerAsEquivalent(t *testing.T) {
 	}
 }
 
-func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
+func TestRecoveryRetainsActiveLoggerBeforeNextAppend(t *testing.T) {
 	root := t.TempDir()
 	svc := newExchangeService(root)
 	entry, created, err := svc.createOrLoad(testGameID, testCreateID, "first-spread-v1")
@@ -798,7 +960,8 @@ func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate the old recovery path, which rebuilt state but retained the stale log.
+	// The engine has observed the command while the active Log still considers
+	// the externally appended bytes an uncertain suffix.
 	entry.engine, entry.commands, err = replayRecords(separateLog.Meta().Config, persistedRecords)
 	if err != nil {
 		t.Fatal(err)
@@ -813,8 +976,8 @@ func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("stale append status=%d body=%s", response.Code, response.Body.String())
 	}
-	if entry.log == staleLog || entry.engine.State().Version != 1 || entry.commands[firstCommand.ID].Version != 1 || !reflect.DeepEqual(entry.coaching, firstRecord.Coaching) || entry.latestTurn == nil || !reflect.DeepEqual(entry.latestTurn.Summary, firstRecord.Result.Summary) {
-		t.Fatalf("recovered entry did not replace all persisted state: %+v", entry)
+	if entry.log != staleLog || entry.engine.State().Version != 1 || entry.commands[firstCommand.ID].Version != 1 || !reflect.DeepEqual(entry.coaching, firstRecord.Coaching) || entry.latestTurn == nil || !reflect.DeepEqual(entry.latestTurn.Summary, firstRecord.Result.Summary) {
+		t.Fatalf("recovered entry did not preserve the active log and install all persisted state: %+v", entry)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/v2/games/"+testGameID+"/commands", strings.NewReader(secondCommand))
@@ -828,6 +991,72 @@ func TestRecoveryReplacesStaleLoggerBeforeNextAppend(t *testing.T) {
 	_, records, err = eventlog.Open(root, testGameID)
 	if err != nil || len(records) != 2 || records[1].Version != 2 || records[1].Command.ID != "55555555-5555-4555-8555-555555555555" {
 		t.Fatalf("persisted records=%+v err=%v", records, err)
+	}
+}
+
+func TestRecoveryFencesChangedActiveLog(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, []byte)
+	}{
+		{
+			name: "truncate",
+			mutate: func(t *testing.T, path string, data []byte) {
+				t.Helper()
+				if err := os.Truncate(path, int64(len(data)-1)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "same-size replacement",
+			mutate: func(t *testing.T, path string, data []byte) {
+				t.Helper()
+				replacement := path + ".replacement"
+				if err := os.WriteFile(replacement, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(replacement, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			svc := newExchangeService(root)
+			entry, created, err := svc.createOrLoad(testGameID, testCreateID, "first-spread-v1")
+			if err != nil || !created {
+				t.Fatalf("create: created=%t err=%v", created, err)
+			}
+			post := func(body string) *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodPost, "/api/v2/games/"+testGameID+"/commands", strings.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				svc.handleExchangeCommand(response, request, testGameID, entry)
+				return response
+			}
+			first := `{"id":"` + testQuoteID + `","type":"submit_quote","expected_version":0,"bid":"99.50","ask":"100.50"}`
+			if response := post(first); response.Code != http.StatusOK {
+				t.Fatalf("first command status=%d body=%s", response.Code, response.Body.String())
+			}
+			activeLog := entry.log
+			path := filepath.Join(activeLog.Path(), "events.jsonl")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, path, data)
+
+			second := `{"id":"55555555-5555-4555-8555-555555555555","type":"submit_quote","expected_version":1,"bid":"99.50","ask":"100.50"}`
+			response := post(second)
+			if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"storage_failure"`) {
+				t.Fatalf("changed log status=%d body=%s", response.Code, response.Body.String())
+			}
+			if !entry.storageFailed || entry.log != activeLog {
+				t.Fatalf("changed active log was not fenced: storageFailed=%t sameLog=%t", entry.storageFailed, entry.log == activeLog)
+			}
+		})
 	}
 }
 
@@ -1298,6 +1527,65 @@ func TestV2CreateIsIdempotentOnlyForMatchingRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("conflict status=%d", resp.StatusCode)
 	}
+}
+
+func TestV2CreateCommandIDIsScopedAcrossGamesAndRestart(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	if _, created, err := service.createOrLoad(testGameID, testCreateID, "first-spread-v1"); err != nil || !created {
+		t.Fatalf("first create: created=%t err=%v", created, err)
+	}
+	if _, _, err := service.createOrLoad(testOtherGameID, testCreateID, "first-spread-v1"); !errors.Is(err, errCreateConflict) {
+		t.Fatalf("same-process cross-game create error=%v, want conflict", err)
+	}
+
+	restarted := newExchangeService(root)
+	if len(restarted.entries) != 0 {
+		t.Fatalf("new service unexpectedly loaded entries: %+v", restarted.entries)
+	}
+	if _, _, err := restarted.createOrLoad(testOtherGameID, testCreateID, "inventory-pressure-v1"); !errors.Is(err, errCreateConflict) {
+		t.Fatalf("restart cross-game create error=%v, want conflict", err)
+	}
+	if restarted.entries[testGameID] != nil {
+		t.Fatal("metadata scan cold-loaded the existing game")
+	}
+}
+
+func TestV2CreateMetadataScanIsStrictAndIgnoresStaging(t *testing.T) {
+	t.Run("unreadable published metadata", func(t *testing.T) {
+		root := t.TempDir()
+		published := filepath.Join(root, testGameID)
+		if err := os.Mkdir(published, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(published, "meta.json"), []byte("invalid"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		service := newExchangeService(root)
+		body := `{"game_id":"` + testOtherGameID + `","command_id":"` + testQuitID + `","scenario_id":"first-spread-v1"}`
+		request := httptest.NewRequest(http.MethodPost, "/api/v2/games", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		service.handleGames(response, request)
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"storage_failure"`) {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("abandoned staging", func(t *testing.T) {
+		root := t.TempDir()
+		staging, err := os.MkdirTemp(root, ".eventlog-staging-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(staging, "meta.json"), []byte("invalid"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		service := newExchangeService(root)
+		if _, created, err := service.createOrLoad(testGameID, testCreateID, "first-spread-v1"); err != nil || !created {
+			t.Fatalf("create with staging entry: created=%t err=%v", created, err)
+		}
+	})
 }
 
 func TestCreateRetryUsesPersistedScenarioIdentity(t *testing.T) {

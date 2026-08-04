@@ -706,61 +706,7 @@ func (e *Engine) Quit() (Result, error) {
 }
 
 func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
-	player := e.accounts[PlayerAccount]
-	buyNotional, err := fixed.Notional(bid, qty)
-	if err != nil {
-		return false
-	}
-	if player.Cash < buyNotional {
-		return false
-	}
-	longPosition, err := fixed.AddQty(player.Position, qty)
-	if err != nil {
-		return false
-	}
-	shortPosition, err := fixed.SubQty(player.Position, qty)
-	if err != nil {
-		return false
-	}
-	longPositionAbs, err := fixed.AbsQtyChecked(longPosition)
-	if err != nil || longPositionAbs > e.cfg.MaxPosition {
-		return false
-	}
-	shortPositionAbs, err := fixed.AbsQtyChecked(shortPosition)
-	if err != nil || shortPositionAbs > e.cfg.MaxPosition {
-		return false
-	}
-	equity, err := e.equity(player)
-	if err != nil {
-		return false
-	}
-	positionAbs, err := fixed.AbsQtyChecked(player.Position)
-	if err != nil {
-		return false
-	}
-	positionNotional, err := fixed.Notional(e.mark, positionAbs)
-	if err != nil {
-		return false
-	}
-	sellNotional, err := fixed.Notional(ask, qty)
-	if err != nil {
-		return false
-	}
-	// ReplaceQuotes removes the player's previous quotes atomically, so they
-	// must not count toward the prospective reservation.
-	gross, err := fixed.AddMoney(positionNotional, buyNotional)
-	if err != nil {
-		return false
-	}
-	gross, err = fixed.AddMoney(gross, sellNotional)
-	if err != nil {
-		return false
-	}
-	required, err := fixed.ScaleMoney(gross, e.cfg.InitialMarginBps, 10_000)
-	if err != nil {
-		return false
-	}
-	return equity >= required
+	return e.canPlaceOrders(PlayerAccount, []riskOrder{{side: Buy, price: bid, qty: qty}, {side: Sell, price: ask, qty: qty}}, 0)
 }
 
 func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fixed.Qty) bool {
@@ -768,37 +714,62 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 }
 
 func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Price, qty fixed.Qty, excludedOrderID uint64) bool {
+	return e.canPlaceOrders(accountID, []riskOrder{{side: side, price: price, qty: qty}}, excludedOrderID)
+}
+
+type riskOrder struct {
+	side  Side
+	price fixed.Price
+	qty   fixed.Qty
+}
+
+func (e *Engine) canPlaceOrders(accountID string, proposed []riskOrder, excludedOrderID uint64) bool {
 	account := e.accounts[accountID]
 	if account.External {
 		return true
 	}
-	notional, err := fixed.Notional(price, qty)
+	longWorst, shortWorst := account.Position, account.Position
+	buyNotional, sellNotional := fixed.Money(0), fixed.Money(0)
+	positionAbs, err := fixed.AbsQtyChecked(account.Position)
 	if err != nil {
 		return false
 	}
-	longWorst, shortWorst := account.Position, account.Position
+	gross, err := fixed.Notional(e.mark, positionAbs)
+	if err != nil {
+		return false
+	}
+
+	orders := make([]riskOrder, 0, len(e.book.Orders(accountID))+len(proposed))
 	for _, order := range e.book.Orders(accountID) {
 		if order.ID == excludedOrderID {
 			continue
 		}
-		var err error
-		if order.Side == orderbook.Buy {
-			longWorst, err = fixed.AddQty(longWorst, order.Remaining)
+		orders = append(orders, riskOrder{side: Side(order.Side), price: order.Price, qty: order.Remaining})
+	}
+	orders = append(orders, proposed...)
+	for _, order := range orders {
+		notional, err := fixed.Notional(order.price, order.qty)
+		if err != nil {
+			return false
+		}
+		gross, err = fixed.AddMoney(gross, notional)
+		if err != nil {
+			return false
+		}
+		if order.side == Buy {
+			longWorst, err = fixed.AddQty(longWorst, order.qty)
+			if err == nil {
+				buyNotional, err = fixed.AddMoney(buyNotional, notional)
+			}
 		} else {
-			shortWorst, err = fixed.SubQty(shortWorst, order.Remaining)
+			shortWorst, err = fixed.SubQty(shortWorst, order.qty)
+			if err == nil {
+				sellNotional, err = fixed.AddMoney(sellNotional, notional)
+			}
 		}
 		if err != nil {
 			return false
 		}
-	}
-	var positionErr error
-	if side == Buy {
-		longWorst, positionErr = fixed.AddQty(longWorst, qty)
-	} else {
-		shortWorst, positionErr = fixed.SubQty(shortWorst, qty)
-	}
-	if positionErr != nil {
-		return false
 	}
 	longWorstAbs, err := fixed.AbsQtyChecked(longWorst)
 	if err != nil || longWorstAbs > e.cfg.MaxPosition {
@@ -812,46 +783,39 @@ func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Pric
 	if err != nil {
 		return false
 	}
-	positionAbs, err := fixed.AbsQtyChecked(account.Position)
+	if account.Cash < buyNotional {
+		return false
+	}
+	required, err := fixed.ScaleMoney(gross, e.cfg.InitialMarginBps, 10_000)
+	if err != nil || equity < required {
+		return false
+	}
+	longCash, err := fixed.SubMoney(account.Cash, buyNotional)
 	if err != nil {
+		return false
+	}
+	shortCash, err := fixed.AddMoney(account.Cash, sellNotional)
+	if err != nil {
+		return false
+	}
+	return e.fillStateWithinInitialMargin(longCash, longWorst) &&
+		e.fillStateWithinInitialMargin(shortCash, shortWorst)
+}
+
+func (e *Engine) fillStateWithinInitialMargin(cash fixed.Money, position fixed.Qty) bool {
+	marked, err := fixed.Notional(e.mark, position)
+	if err != nil {
+		return false
+	}
+	equity, err := fixed.AddMoney(cash, marked)
+	if err != nil {
+		return false
+	}
+	positionAbs, err := fixed.AbsQtyChecked(position)
+	if err != nil || positionAbs > e.cfg.MaxPosition {
 		return false
 	}
 	gross, err := fixed.Notional(e.mark, positionAbs)
-	if err != nil {
-		return false
-	}
-	reservedBuy := fixed.Money(0)
-	for _, order := range e.book.Orders(accountID) {
-		if order.ID == excludedOrderID {
-			continue
-		}
-		if order.OwnerID == accountID {
-			n, err := fixed.Notional(order.Price, order.Remaining)
-			if err != nil {
-				return false
-			}
-			gross, err = fixed.AddMoney(gross, n)
-			if err != nil {
-				return false
-			}
-			if order.Side == orderbook.Buy {
-				reservedBuy, err = fixed.AddMoney(reservedBuy, n)
-				if err != nil {
-					return false
-				}
-			}
-		}
-	}
-	if side == Buy {
-		reservedBuy, err = fixed.AddMoney(reservedBuy, notional)
-		if err != nil {
-			return false
-		}
-	}
-	if account.Cash < reservedBuy {
-		return false
-	}
-	gross, err = fixed.AddMoney(gross, notional)
 	if err != nil {
 		return false
 	}
@@ -1384,6 +1348,9 @@ func (e *Engine) submitBookOrder(order *Order) ([]Trade, orderbook.Report, error
 }
 
 func (e *Engine) settleReport(report orderbook.Report) ([]Trade, error) {
+	if err := e.validateSettlement(report); err != nil {
+		return nil, err
+	}
 	trades := make([]Trade, 0, len(report.Fills))
 	for _, fill := range report.Fills {
 		e.nextTrade++
@@ -1403,6 +1370,62 @@ func (e *Engine) settleReport(report orderbook.Report) ([]Trade, error) {
 		trades = append(trades, trade)
 	}
 	return trades, nil
+}
+
+func (e *Engine) validateSettlement(report orderbook.Report) error {
+	type balance struct {
+		cash     fixed.Money
+		position fixed.Qty
+	}
+	balances := make(map[string]balance)
+	for _, fill := range report.Fills {
+		buyerID, sellerID := fill.Taker.OwnerID, fill.Maker.OwnerID
+		if fill.Taker.Side == orderbook.Sell {
+			buyerID, sellerID = sellerID, buyerID
+		}
+		notional, err := fixed.Notional(fill.Price, fill.Quantity)
+		if err != nil {
+			return err
+		}
+		for _, change := range []struct {
+			id  string
+			buy bool
+		}{
+			{id: buyerID, buy: true},
+			{id: sellerID},
+		} {
+			account := e.accounts[change.id]
+			current, ok := balances[change.id]
+			if !ok {
+				current = balance{cash: account.Cash, position: account.Position}
+			}
+			if change.buy {
+				current.cash, err = fixed.SubMoney(current.cash, notional)
+				if err == nil {
+					current.position, err = fixed.AddQty(current.position, fill.Quantity)
+				}
+			} else {
+				current.cash, err = fixed.AddMoney(current.cash, notional)
+				if err == nil {
+					current.position, err = fixed.SubQty(current.position, fill.Quantity)
+				}
+			}
+			if err != nil {
+				return err
+			}
+			if !account.External {
+				marked, err := fixed.Notional(e.mark, current.position)
+				if err != nil {
+					return err
+				}
+				if _, err := fixed.AddMoney(current.cash, marked); err != nil {
+					return err
+				}
+			}
+			balances[change.id] = current
+		}
+	}
+	return nil
 }
 
 func (e *Engine) applyTrade(trade Trade, buyerOrder, sellerOrder orderbook.Order) error {

@@ -2,6 +2,8 @@ package orderbook
 
 import (
 	"market-maker/internal/fixed"
+	"math"
+	"reflect"
 	"testing"
 )
 
@@ -149,5 +151,47 @@ func TestReplaceRejectsStaleSequenceWithoutReorderingBook(t *testing.T) {
 	report, err := b.Submit(order(3, 3, "buyer", Buy, "100", "1", IOC, t), RejectTaker)
 	if err != nil || len(report.Fills) != 1 || report.Fills[0].Maker.ID != 1 {
 		t.Fatalf("report=%+v err=%v", report, err)
+	}
+}
+
+func TestSubmitRejectsLevelQuantityOverflowAtomically(t *testing.T) {
+	b := New()
+	first := Order{ID: 1, Sequence: 1, OwnerID: "first", Side: Buy, Price: fixed.Price(1), Quantity: fixed.Qty(math.MaxInt64), TIF: GTC}
+	if _, err := b.Submit(first, RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	before := b.Bids()
+	if _, err := b.Submit(Order{ID: 2, Sequence: 2, OwnerID: "second", Side: Buy, Price: fixed.Price(1), Quantity: 1, TIF: GTC}, RejectTaker); err == nil {
+		t.Fatal("expected level quantity overflow")
+	}
+	if got := b.Bids(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("rejected submit changed depth: got=%+v want=%+v", got, before)
+	}
+	if _, ok := b.Order(1); !ok {
+		t.Fatal("rejected submit removed existing order")
+	}
+	if _, ok := b.Order(2); ok {
+		t.Fatal("rejected submit rested overflowing order")
+	}
+}
+
+func TestReplaceRejectsLevelQuantityOverflowAtomically(t *testing.T) {
+	b := New()
+	orders := []Order{
+		{ID: 1, Sequence: 1, OwnerID: "level", Side: Buy, Price: fixed.Price(1), Quantity: fixed.Qty(math.MaxInt64), TIF: GTC},
+		{ID: 2, Sequence: 2, OwnerID: "replace", Side: Buy, Price: fixed.Price(2), Quantity: 1, TIF: GTC},
+	}
+	for _, order := range orders {
+		if _, err := b.Submit(order, RejectTaker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeBids, beforeOrders := b.Bids(), b.Orders("")
+	replacement := Order{ID: 3, Sequence: 3, OwnerID: "replace", Side: Buy, Price: fixed.Price(1), Quantity: 1, TIF: GTC}
+	if _, err := b.Replace(2, replacement, RejectTaker); err == nil {
+		t.Fatal("expected replacement level quantity overflow")
+	}
+	if !reflect.DeepEqual(b.Bids(), beforeBids) || !reflect.DeepEqual(b.Orders(""), beforeOrders) {
+		t.Fatal("rejected replacement changed book")
 	}
 }

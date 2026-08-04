@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-cli build-server run test test-race test-cover vet fmt fmt-check check clean
+.PHONY: help build build-cli build-server run test test-js test-race test-cover vet fmt fmt-check check clean
 
 BIN_DIR := bin
 
@@ -23,6 +23,9 @@ run: ## Run the local web server at http://127.0.0.1:8080
 test: ## Run all tests
 	go test ./...
 
+test-js: ## Run dependency-free browser runtime tests
+	node --test web/static/index.test.js
+
 test-race: ## Run all tests with the race detector
 	go test -race ./...
 
@@ -38,7 +41,7 @@ fmt: ## Format Go source files
 fmt-check: ## Verify Go source files are formatted without modifying them
 	@gofmt -d $$(git ls-files '*.go') | diff -u /dev/null -
 
-check: fmt-check vet test-race build ## Verify formatting, vet, race tests, and builds
+check: fmt-check vet test-js test-race build ## Verify formatting, vet, runtime tests, race tests, and builds
 
 clean: ## Remove local build artifacts
 	rm -rf $(BIN_DIR)
