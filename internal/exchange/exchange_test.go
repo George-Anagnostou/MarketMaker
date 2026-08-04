@@ -3,6 +3,7 @@ package exchange
 import (
 	"encoding/json"
 	"market-maker/internal/fixed"
+	"market-maker/internal/orderbook"
 	"math"
 	"reflect"
 	"strings"
@@ -258,6 +259,104 @@ func TestAccountReservationsFollowOrderLifecycle(t *testing.T) {
 	state, _ = e.Account(PlayerAccount)
 	if state.Cash != mustMoney(t, "99900") || state.Position != mustQty(t, "1") || state.ReservedCash != 0 {
 		t.Fatalf("filled account=%+v", state)
+	}
+}
+
+func TestReservationsDeriveFromLiveOrdersAcrossLifecycle(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "101"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.Cancel(PlayerAccount, 1); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.ReplaceLimit(PlayerAccount, 2, Sell, mustPrice(t, "102"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+}
+
+func TestExchangeReadModelsAreDefensiveCopies(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	ordersBefore := e.OpenOrders(PlayerAccount)
+	ledgerBefore := e.LedgerEntries()
+	orders := e.OpenOrders(PlayerAccount)
+	ledger := e.LedgerEntries()
+	orders[0].Remaining = 0
+	ledger[0].Postings[0].Money++
+	if got := e.OpenOrders(PlayerAccount); !reflect.DeepEqual(got, ordersBefore) {
+		t.Fatalf("orders changed through read model: got=%+v want=%+v", got, ordersBefore)
+	}
+	if got := e.LedgerEntries(); !reflect.DeepEqual(got, ledgerBefore) {
+		t.Fatalf("ledger changed through read model: got=%+v want=%+v", got, ledgerBefore)
+	}
+}
+
+func assertReservationsDerivedFromBook(t *testing.T, e *Engine) {
+	t.Helper()
+	type reservation struct {
+		cash      fixed.Money
+		buy, sell fixed.Qty
+	}
+	want := make(map[string]reservation)
+	for _, order := range e.book.Orders("") {
+		account := e.accounts[order.OwnerID]
+		if account.External {
+			continue
+		}
+		current := want[order.OwnerID]
+		if order.Side == orderbook.Buy {
+			notional, err := fixed.Notional(order.Price, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.cash, err = fixed.AddMoney(current.cash, notional)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.buy, err = fixed.AddQty(current.buy, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			var err error
+			current.sell, err = fixed.AddQty(current.sell, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		want[order.OwnerID] = current
+	}
+	for id, account := range e.accounts {
+		if account.External {
+			continue
+		}
+		got, ok := e.Account(id)
+		if !ok {
+			t.Fatalf("account %q missing", id)
+		}
+		if got.ReservedCash != want[id].cash || got.OpenBuyQuantity != want[id].buy || got.OpenSellQuantity != want[id].sell {
+			t.Fatalf("account %q reservations=%+v want=%+v", id, got, want[id])
+		}
 	}
 }
 
