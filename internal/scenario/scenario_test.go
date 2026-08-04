@@ -36,7 +36,7 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 		t.Fatalf("volatility v1 changed: %+v", volatility)
 	}
 	informed, ok := Get("volatility-shock-v2")
-	if !ok || informed.Revision != "1" || informed.Title != "Volatility Shock: Informed Flow" || len(informed.Snapshot().Tutorial) != 5 || informed.Snapshot().Reflection == "" || informed.Snapshot().ScorecardKind != "informed_flow_pnl" {
+	if !ok || informed.Revision != "2" || informed.Title != "Volatility Shock: Informed Flow" || len(informed.Snapshot().Tutorial) != 5 || informed.Snapshot().Reflection == "" || informed.Snapshot().ScorecardKind != "informed_flow_pnl" {
 		t.Fatalf("informed scenario=%+v", informed)
 	}
 	wantInformedConfig := exchange.Config{
@@ -65,9 +65,14 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	for _, step := range informed.Tutorial {
 		tutorialText += " " + step.Body
 	}
-	for _, text := range []string{"direction", "not its magnitude", "overpay", "negative result", "zero means", "positive result"} {
+	for _, text := range []string{"direction", "not its magnitude", "buyer overpaid", "seller accepted less", "negative result", "zero means", "positive result", "diagnostic evidence", "marked total P&L"} {
 		if !strings.Contains(tutorialText, text) {
 			t.Fatalf("informed tutorial does not explain %q: %s", text, tutorialText)
+		}
+	}
+	for _, wrong := range []string{"customer can still overpay", "customer overpaid", "customer knew the direction but overpaid"} {
+		if strings.Contains(tutorialText, wrong) {
+			t.Fatalf("informed tutorial contains side-neutral overpayment language %q: %s", wrong, tutorialText)
 		}
 	}
 }
@@ -144,6 +149,8 @@ func TestInformedFlowCoachingUsesAuthoritativeEvidence(t *testing.T) {
 	}
 	containedBuy := buyFill
 	containedBuy.Summary.InformedFlowPnL = fixed.Money(10_000_000)
+	containedSell := sellFill
+	containedSell.Summary.InformedFlowPnL = fixed.Money(20_000_000)
 	matchedBuy := buyFill
 	matchedBuy.Summary.InformedFlowPnL = 0
 
@@ -154,10 +161,11 @@ func TestInformedFlowCoachingUsesAuthoritativeEvidence(t *testing.T) {
 		wantTitle  string
 		wantInBody []string
 	}{
-		{name: "informed buy", result: buyFill, wantCode: "informed-buy-filled", wantTitle: "You sold before the rise", wantInBody: []string{"1.0000", "-0.10000000", "value conceded"}},
-		{name: "informed sell", result: sellFill, wantCode: "informed-sell-filled", wantTitle: "You bought before the fall", wantInBody: []string{"2.0000", "-0.20000000", "value conceded"}},
+		{name: "informed buy", result: buyFill, wantCode: "informed-buy-filled", wantTitle: "You sold before the rise", wantInBody: []string{"1.0000", "-0.10000000", "increased inventory risk to short 1.0000 units", "value conceded"}},
+		{name: "informed sell", result: sellFill, wantCode: "informed-sell-filled", wantTitle: "You bought before the fall", wantInBody: []string{"2.0000", "-0.20000000", "increased inventory risk to long 2.0000 units", "value conceded"}},
 		{name: "avoided informed order", result: avoided, wantCode: "informed-flow-avoided", wantInBody: []string{"0.0000", "0.00000000"}},
 		{name: "contained informed buy", result: containedBuy, wantCode: "informed-buy-contained", wantTitle: "Your ask contained the informed buy", wantInBody: []string{"0.10000000", "not by how much", "overpaid"}},
+		{name: "contained informed sell", result: containedSell, wantCode: "informed-sell-contained", wantTitle: "Your bid contained the informed sell", wantInBody: []string{"0.20000000", "not by how much", "seller", "accepted less than the closing mark"}},
 		{name: "matched informed buy", result: matchedBuy, wantCode: "informed-buy-contained", wantTitle: "Your ask contained the informed buy", wantInBody: []string{"0.00000000", "no measured informed edge"}},
 		{name: "ordinary flow", result: ordinary, wantCode: "ordinary-flow"},
 	} {
@@ -193,7 +201,7 @@ func TestInformedFlowCoachingUsesNoInformedCounterfactual(t *testing.T) {
 					{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.FlowAccount, SellerID: exchange.PlayerAccount, Quantity: fixed.Qty(10_000), Informed: true}},
 				},
 			},
-			want: "increased inventory risk to short 3.0000 units",
+			want: "Excluding the informed fills while retaining this turn's ordinary fills gives a counterfactual closing position of short 2.0000 units; including every fill gives the actual closing position of short 3.0000 units.",
 		},
 		{
 			name:   "mixed flow informed sell reduces short risk",
@@ -206,7 +214,7 @@ func TestInformedFlowCoachingUsesNoInformedCounterfactual(t *testing.T) {
 					{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.PlayerAccount, SellerID: exchange.FlowAccount, Quantity: fixed.Qty(20_000), Informed: true}},
 				},
 			},
-			want: "reduced the prior short inventory from 5.0000 to 3.0000 units",
+			want: "Excluding the informed fills while retaining this turn's ordinary fills gives a counterfactual closing position of short 5.0000 units; including every fill gives the actual closing position of short 3.0000 units.",
 		},
 		{
 			name:   "mixed flow informed buy flips long to short",
@@ -219,12 +227,12 @@ func TestInformedFlowCoachingUsesNoInformedCounterfactual(t *testing.T) {
 					{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.FlowAccount, SellerID: exchange.PlayerAccount, Quantity: fixed.Qty(20_000), Informed: true}},
 				},
 			},
-			want: "flipped inventory from long 1.0000 units to short 1.0000 units",
+			want: "Excluding the informed fills while retaining this turn's ordinary fills gives a counterfactual closing position of long 1.0000 units; including every fill gives the actual closing position of short 1.0000 units.",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := Coach(Snapshot{ID: "volatility-shock-v2"}, exchange.State{Position: test.before, Mark: fixed.Price(100_000)}, test.result)
-			if !strings.Contains(got.Body, test.want) {
+			if !strings.Contains(got.Body, test.want) || strings.Contains(got.Body, "prior") {
 				t.Fatalf("coaching=%+v", got)
 			}
 		})
@@ -276,7 +284,7 @@ func TestInformedFlowTerminalCoachingRetainsEvidenceWithoutNextTurnAdvice(t *tes
 }
 
 func TestQuitCoachingReviewsPriorTurns(t *testing.T) {
-	result := exchange.Result{State: exchange.State{IsOver: true, Reason: exchange.PlayerQuit}}
+	result := exchange.Result{State: exchange.State{Turn: 1, IsOver: true, Reason: exchange.PlayerQuit}}
 	for _, scenarioID := range []string{"first-spread-v1", "inventory-pressure-v1", "volatility-shock-v1", "volatility-shock-v2"} {
 		t.Run(scenarioID, func(t *testing.T) {
 			got := Coach(Snapshot{ID: scenarioID}, exchange.State{}, result)
@@ -286,6 +294,45 @@ func TestQuitCoachingReviewsPriorTurns(t *testing.T) {
 			for _, incorrect := range []string{"final turn", "No customer fill", "no customer fill"} {
 				if strings.Contains(got.Body, incorrect) {
 					t.Fatalf("quit coaching describes a turn that did not happen: %+v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestImmediateQuitHasNoTurnReviewOrLessonEvaluation(t *testing.T) {
+	for _, scenarioID := range []string{"first-spread-v1", "inventory-pressure-v1", "volatility-shock-v1", "volatility-shock-v2"} {
+		t.Run(scenarioID, func(t *testing.T) {
+			definition, ok := Get(scenarioID)
+			if !ok {
+				t.Fatal("missing scenario")
+			}
+			engine, err := exchange.New(definition.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := engine.State()
+			result, err := engine.Quit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State.Turn != 0 {
+				t.Fatalf("quit completed a turn: %+v", result.State)
+			}
+			coaching := Coach(definition.Snapshot(), before, result)
+			if coaching.Code != "player-quit" || coaching.Body != "You ended the session. No turn was completed." {
+				t.Fatalf("coaching=%+v", coaching)
+			}
+			recap, err := BuildRecap(definition.Snapshot(), definition.Config, nil, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recap.Body != "You ended the session. No turn was completed, so the lesson was not evaluated." || recap.Scorecard != nil {
+				t.Fatalf("recap=%+v", recap)
+			}
+			for _, unevaluable := range []string{"prior turns", "fills", "quote", definition.Reflection} {
+				if unevaluable != "" && (strings.Contains(coaching.Body, unevaluable) || strings.Contains(recap.Body, unevaluable)) {
+					t.Fatalf("immediate quit evaluates %q: coaching=%+v recap=%+v", unevaluable, coaching, recap)
 				}
 			}
 		})
@@ -335,6 +382,65 @@ func TestInformedScenarioSeedExercisesBothDirections(t *testing.T) {
 	}
 	if informedBuys == 0 || informedSells == 0 || informedFills == 0 {
 		t.Fatalf("seed did not exercise lesson: buys=%d sells=%d fills=%d", informedBuys, informedSells, informedFills)
+	}
+}
+
+func runSeedOneActivePolicy(t *testing.T) []exchange.Result {
+	t.Helper()
+	definition, _ := Get("volatility-shock-v2")
+	engine, err := exchange.New(definition.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make([]exchange.Result, 0, definition.Config.NumTurns)
+	for !engine.State().IsOver {
+		mark := engine.State().Mark
+		bid, err := fixed.ScalePrice(mark, 9_850, 10_000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ask, err := fixed.ScalePrice(mark, 10_150, 10_000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := engine.SubmitQuote(bid, ask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+func TestInformedScenarioSeedOneMixedFlowUsesExplicitCounterfactual(t *testing.T) {
+	definition, ok := Get("volatility-shock-v2")
+	if !ok || definition.Config.Seed != 1 {
+		t.Fatalf("scenario seed=%d", definition.Config.Seed)
+	}
+	result := runSeedOneActivePolicy(t)[2]
+	if result.State.Turn != 3 || result.State.Position != fixed.Qty(-9_150) || result.Summary.UnitsTraded != fixed.Qty(113_762) || result.Summary.InformedUnitsTraded != fixed.Qty(86_617) {
+		t.Fatalf("seed-1 turn changed: state=%+v summary=%+v", result.State, result.Summary)
+	}
+	got := Coach(definition.Snapshot(), exchange.State{}, result)
+	want := "The informed fills traded 8.6617 units and produced -12.69458752 informed-flow P&L. Excluding the informed fills while retaining this turn's ordinary fills gives a counterfactual closing position of short 9.5767 units; including every fill gives the actual closing position of short 0.9150 units. The customer knew the direction of the fall, and the negative result records value conceded. A wider spread or lower bid can deny that edge."
+	if got.Body != want || strings.Contains(got.Body, "prior inventory") {
+		t.Fatalf("coaching=%+v", got)
+	}
+}
+
+func TestInformedScenarioSeedOnePositiveSellNamesSellerEconomics(t *testing.T) {
+	definition, ok := Get("volatility-shock-v2")
+	if !ok || definition.Config.Seed != 1 {
+		t.Fatalf("scenario seed=%d", definition.Config.Seed)
+	}
+	result := runSeedOneActivePolicy(t)[5]
+	if result.State.Turn != 6 || result.Summary.InformedFlowPnL != fixed.Money(908_844_129) {
+		t.Fatalf("seed-1 turn changed: state=%+v summary=%+v", result.State, result.Summary)
+	}
+	got := Coach(definition.Snapshot(), exchange.State{}, result)
+	want := "The informed fills traded 11.5029 units and produced 9.08844129 informed-flow P&L. They flipped inventory from short 0.9150 units to long 10.5879 units, replacing one directional exposure with the other. The seller knew the mark would fall but not by how much and accepted less than the closing mark. Compare that protection with the ordinary flow your quote attracted."
+	if got.Body != want || strings.Contains(got.Body, "overpaid") {
+		t.Fatalf("coaching=%+v", got)
 	}
 }
 
@@ -417,7 +523,7 @@ func TestInformedScenarioActivePolicyBeatsAbstentionBenchmark(t *testing.T) {
 	if active.recap.Scorecard == nil {
 		t.Fatal("active benchmark has no scorecard")
 	}
-	for _, context := range []string{"total P&L", "matched volume"} {
+	for _, context := range []string{"Marked total P&L is the lesson outcome", "matched volume", "not a standalone ranking or success criterion"} {
 		if !strings.Contains(active.recap.Scorecard.FocusNote, context) {
 			t.Fatalf("scorecard note does not contextualize informed P&L with %q: %s", context, active.recap.Scorecard.FocusNote)
 		}
@@ -432,7 +538,7 @@ func TestBuildRecapIncludesTerminalTurn(t *testing.T) {
 		Summary: exchange.Summary{UnitsTraded: fixed.Qty(10_000), StorageCost: fixed.Money(100_000_000)},
 	}}
 	final := exchange.Result{
-		State:   exchange.State{Cash: fixed.Money(8_000_000_000), Position: fixed.Qty(20_000), Mark: fixed.Price(150_000), Reason: exchange.PlayerQuit},
+		State:   exchange.State{Turn: 2, Cash: fixed.Money(8_000_000_000), Position: fixed.Qty(20_000), Mark: fixed.Price(150_000), Reason: exchange.PlayerQuit},
 		Summary: exchange.Summary{UnitsTraded: fixed.Qty(20_000), StorageCost: fixed.Money(200_000_000)},
 	}
 	recap, err := BuildRecap(snapshot, cfg, records, final)
@@ -447,7 +553,7 @@ func TestBuildRecapIncludesTerminalTurn(t *testing.T) {
 	}
 }
 
-func TestBuildRecapAggregatesMeasuredInformedFlow(t *testing.T) {
+func TestBuildRecapAggregatesMeasuredInformedFlowAsDiagnostic(t *testing.T) {
 	cfg := exchange.Config{StartingCash: fixed.Money(10_000_000_000), StartingMark: fixed.Price(100_000)}
 	records := []exchange.Result{{
 		State: exchange.State{Cash: fixed.Money(10_000_000_000), Mark: fixed.Price(100_000)},
@@ -468,10 +574,10 @@ func TestBuildRecapAggregatesMeasuredInformedFlow(t *testing.T) {
 	if recap.InformedOrders != 5 || recap.InformedOrdersFilled != 3 || recap.InformedUnitsTraded != fixed.Qty(30_000) || recap.InformedFlowPnL != fixed.Money(-50_000_000) || recap.AdverseSelectionTurns != 1 {
 		t.Fatalf("recap=%+v", recap)
 	}
-	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Informed-flow P&L" || recap.Scorecard.FocusValue != recap.InformedFlowPnL.String() {
+	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Marked total P&L" || recap.Scorecard.FocusValue != recap.TotalPnL.String() {
 		t.Fatalf("scorecard=%+v", recap.Scorecard)
 	}
-	for _, text := range []string{"5 informed orders", "3 filled", "3.0000 units", "More negative", "total P&L", "matched volume"} {
+	for _, text := range []string{"Marked total P&L is the lesson outcome", "Informed-flow P&L of -0.50000000", "5 informed orders", "3 fills", "3.0000 units", "diagnostic evidence", "not a standalone ranking or success criterion", "matched volume"} {
 		if !strings.Contains(recap.Scorecard.FocusNote, text) {
 			t.Fatalf("scorecard note %q does not contain %q", recap.Scorecard.FocusNote, text)
 		}
@@ -673,7 +779,7 @@ func TestBuildRecapIncludesEngineProducedV2TerminalLesson(t *testing.T) {
 	if recap.InformedOrders != result.Summary.InformedOrders || recap.InformedOrdersFilled != result.Summary.InformedOrdersFilled || recap.InformedUnitsTraded != result.Summary.InformedUnitsTraded || recap.InformedFlowPnL != result.Summary.InformedFlowPnL {
 		t.Fatalf("recap=%+v summary=%+v", recap, result.Summary)
 	}
-	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Informed-flow P&L" || recap.Scorecard.FocusValue != result.Summary.InformedFlowPnL.String() {
+	if recap.Scorecard == nil || recap.Scorecard.FocusLabel != "Marked total P&L" || recap.Scorecard.FocusValue != recap.TotalPnL.String() {
 		t.Fatalf("scorecard=%+v", recap.Scorecard)
 	}
 }
@@ -725,7 +831,7 @@ func TestLegacyScorecardFallbacks(t *testing.T) {
 		{id: "first-spread-v1", label: "Matched volume"},
 		{id: "inventory-pressure-v1", label: "Peak inventory"},
 		{id: "volatility-shock-v1", label: "Adverse selection turns"},
-		{id: "volatility-shock-v2", label: "Informed-flow P&L"},
+		{id: "volatility-shock-v2", label: "Marked total P&L"},
 	} {
 		t.Run(test.id, func(t *testing.T) {
 			recap, err := BuildRecap(Snapshot{ID: test.id}, cfg, nil, final)

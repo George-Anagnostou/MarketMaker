@@ -279,6 +279,9 @@ let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttemp
 let turnAudits = [], auditGeneration = 0;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MIN_INT64 = -(1n << 63n), MAX_INT64 = (1n << 63n) - 1n;
+const HYDRATION_TIMEOUT_MS = Number(globalThis.__MM_HYDRATION_TIMEOUT_MS__ || 5000);
 const newID = () => globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx'.replace(/x/g, () => Math.floor(Math.random() * 16).toString(16));
 function parseFixed(value, scale) {
   if (typeof value === 'number') {
@@ -304,27 +307,164 @@ function formatFixed(value, scale, displayScale) {
 }
 function currency(value, scale = 8, showPositive = false) {
   const fixed = typeof value === 'bigint' ? value : parseFixed(value, scale);
-  if (fixed === null) return '$0.00';
+  if (fixed === null) throw new Error('invalid fixed-point value');
   const formatted = formatFixed(fixed, scale, 2), negative = formatted.startsWith('-');
   const magnitude = negative ? formatted.slice(1) : formatted;
   const sign = magnitude === '0.00' ? '' : negative ? '-' : showPositive ? '+' : '';
   return `${sign}$${magnitude}`;
 }
 const money = (value, scale = 8) => currency(value, scale);
-const quantity = value => typeof value === 'bigint' ? formatFixed(value, 4, 2) : number(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+const quantity = value => formatFixed(typeof value === 'bigint' ? value : requireFixed(value, 4, 'quantity'), 4, 2);
 const signedMoney = (value, scale = 8) => currency(value, scale, true);
-function uiState(state) { return {turn:state.turn, cash:parseFixed(state.cash, 8) ?? 0n, inventory:number(state.position), mark:number(state.mark), equity:parseFixed(state.equity, 8) ?? 0n, isOver:state.is_over, reason:state.reason}; }
+function plain(value, label) { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`); return value; }
+function stringField(value, label) { if (typeof value !== 'string') throw new Error(`${label} must be a string`); return value; }
+function booleanField(value, label) { if (typeof value !== 'boolean') throw new Error(`${label} must be a boolean`); return value; }
+function safeInteger(value, label, minimum = 0) { if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${label} must be a safe integer`); return value; }
+function requireFixed(value, scale, label) {
+  if (typeof value !== 'string' || !new RegExp(`^-?(?:0|[1-9]\\d*)\\.\\d{${scale}}$`).test(value)) throw new Error(`${label} must be a fixed decimal`);
+  const parsed = parseFixed(value, scale);
+  if (parsed === null || parsed < MIN_INT64 || parsed > MAX_INT64 || formatFixed(parsed, scale, scale).replace(/,/g, '') !== value) throw new Error(`${label} is out of range`);
+  return parsed;
+}
+function optionalString(value, label) { if (value === undefined) return undefined; return stringField(value, label); }
+function validateCoaching(value, label = 'coaching') {
+  if (value === undefined || value === null) return null;
+  value = plain(value, label); stringField(value.code, `${label}.code`); stringField(value.title, `${label}.title`); stringField(value.body, `${label}.body`); return value;
+}
+function validateScenario(value, label = 'scenario') {
+  value = plain(value, label);
+  for (const field of ['id', 'revision', 'title', 'briefing', 'objective']) stringField(value[field], `${label}.${field}`);
+  safeInteger(value.turns, `${label}.turns`, 1);
+  for (const field of ['reflection', 'scorecard_kind']) optionalString(value[field], `${label}.${field}`);
+  if (value.tutorial !== undefined) {
+    if (!Array.isArray(value.tutorial)) throw new Error(`${label}.tutorial must be an array`);
+    value.tutorial.forEach((step, index) => { step = plain(step, `${label}.tutorial[${index}]`); stringField(step.title, 'tutorial title'); stringField(step.body, 'tutorial body'); });
+  }
+  return value;
+}
+function validateAttribution(value, label) {
+  if (value === undefined || value === null) return null;
+  value = plain(value, label);
+  for (const field of ['execution_edge', 'inventory_mark_pnl', 'storage_pnl']) requireFixed(value[field], 8, `${label}.${field}`);
+  return value;
+}
+function validateSummary(value, label = 'summary') {
+  value = plain(value, label); safeInteger(value.orders_received, `${label}.orders_received`);
+  for (const field of ['units_traded', 'buy_volume', 'sell_volume']) requireFixed(value[field], 4, `${label}.${field}`);
+  for (const field of ['net_fill_cash', 'storage_cost', 'turn_pnl']) requireFixed(value[field], 8, `${label}.${field}`);
+  validateAttribution(value.pnl_attribution, `${label}.pnl_attribution`);
+  for (const field of ['informed_orders', 'informed_orders_filled']) if (value[field] !== undefined) safeInteger(value[field], `${label}.${field}`);
+  if (value.informed_units_traded !== undefined) requireFixed(value.informed_units_traded, 4, `${label}.informed_units_traded`);
+  if (value.informed_flow_pnl !== undefined) requireFixed(value.informed_flow_pnl, 8, `${label}.informed_flow_pnl`);
+  return value;
+}
+function validateRecap(value, label = 'recap') {
+  if (value === undefined || value === null) return null;
+  value = plain(value, label);
+  for (const field of ['headline', 'body', 'end_reason']) stringField(value[field], `${label}.${field}`);
+  for (const field of ['final_equity', 'total_pnl', 'storage_paid']) requireFixed(value[field], 8, `${label}.${field}`);
+  for (const field of ['max_abs_inventory', 'units_traded']) requireFixed(value[field], 4, `${label}.${field}`);
+  for (const field of ['adverse_selection_turns', 'informed_orders', 'informed_orders_filled']) if (value[field] !== undefined) safeInteger(value[field], `${label}.${field}`);
+  if (value.informed_units_traded !== undefined) requireFixed(value.informed_units_traded, 4, `${label}.informed_units_traded`);
+  if (value.informed_flow_pnl !== undefined) requireFixed(value.informed_flow_pnl, 8, `${label}.informed_flow_pnl`);
+  if (value.scorecard !== undefined && value.scorecard !== null) {
+    const scorecard = plain(value.scorecard, `${label}.scorecard`);
+    for (const field of ['focus_label', 'focus_value', 'focus_note', 'reflection']) stringField(scorecard[field], `${label}.scorecard.${field}`);
+    if (['Informed-flow P&L', 'Marked total P&L'].includes(scorecard.focus_label)) requireFixed(scorecard.focus_value, 8, `${label}.scorecard.focus_value`);
+  }
+  return value;
+}
+function validateOrder(value, label) {
+  value = plain(value, label);
+  safeInteger(value.id, `${label}.id`); safeInteger(value.sequence, `${label}.sequence`);
+  stringField(value.account_id, `${label}.account_id`); stringField(value.side, `${label}.side`); stringField(value.time_in_force, `${label}.time_in_force`);
+  if (!['buy', 'sell'].includes(value.side)) throw new Error(`${label}.side is invalid`);
+  for (const field of ['price', 'quantity', 'remaining']) requireFixed(value[field], 4, `${label}.${field}`);
+  if (value.informed !== undefined) booleanField(value.informed, `${label}.informed`);
+  return value;
+}
+function validateTrade(value, label) {
+  value = plain(value, label);
+  for (const field of ['id', 'maker_order_id', 'taker_order_id']) safeInteger(value[field], `${label}.${field}`);
+  requireFixed(value.price, 4, `${label}.price`); requireFixed(value.quantity, 4, `${label}.quantity`);
+  stringField(value.buyer_id, `${label}.buyer_id`); stringField(value.seller_id, `${label}.seller_id`);
+  if (value.informed !== undefined) booleanField(value.informed, `${label}.informed`);
+  return value;
+}
+function validateEvent(value, label = 'event') {
+  value = plain(value, label); safeInteger(value.sequence, `${label}.sequence`, 1); stringField(value.type, `${label}.type`);
+  if (value.command_id !== undefined && !UUID_PATTERN.test(stringField(value.command_id, `${label}.command_id`))) throw new Error(`${label}.command_id is invalid`);
+  if (value.order !== undefined) validateOrder(value.order, `${label}.order`);
+  if (value.previous_order !== undefined) validateOrder(value.previous_order, `${label}.previous_order`);
+  if (value.trade !== undefined) validateTrade(value.trade, `${label}.trade`);
+  if (value.account !== undefined) {
+    const account = plain(value.account, `${label}.account`); stringField(account.id, `${label}.account.id`);
+    for (const field of ['cash', 'reserved_cash', 'available_cash', 'equity']) requireFixed(account[field], 8, `${label}.account.${field}`);
+    for (const field of ['position', 'open_buy_quantity', 'open_sell_quantity']) requireFixed(account[field], 4, `${label}.account.${field}`);
+  }
+  if (value.amount !== undefined) requireFixed(value.amount, 8, `${label}.amount`);
+  if (value.mark !== undefined) requireFixed(value.mark, 4, `${label}.mark`);
+  if (value.previous_mark !== undefined) requireFixed(value.previous_mark, 4, `${label}.previous_mark`);
+  optionalString(value.reason, `${label}.reason`); optionalString(value.message, `${label}.message`);
+  if (['order_accepted', 'order_resting', 'order_canceled', 'order_filled', 'flow_order'].includes(value.type) && !value.order) throw new Error(`${label}.order is required`);
+  if (value.type === 'trade' && !value.trade) throw new Error(`${label}.trade is required`);
+  if (value.type === 'storage_charged' && value.amount === undefined) throw new Error(`${label}.amount is required`);
+  if (value.type === 'mark_updated' && value.mark === undefined) throw new Error(`${label}.mark is required`);
+  if (value.type === 'game_ended' && value.reason === undefined) throw new Error(`${label}.reason is required`);
+  return value;
+}
+function uiState(state) {
+  state = plain(state, 'state');
+  const parsed = {version:safeInteger(state.version, 'state.version'), turn:safeInteger(state.turn, 'state.turn'), cash:requireFixed(state.cash, 8, 'state.cash'), inventory:requireFixed(state.position, 4, 'state.position'), mark:requireFixed(state.mark, 4, 'state.mark'), equity:requireFixed(state.equity, 8, 'state.equity'), isOver:booleanField(state.is_over, 'state.is_over'), reason:stringField(state.reason, 'state.reason'), bestBid:requireFixed(state.best_bid, 4, 'state.best_bid'), bestAsk:requireFixed(state.best_ask, 4, 'state.best_ask')};
+  if (parsed.equity !== parsed.cash + parsed.inventory * parsed.mark) throw new Error('state equity does not match cash plus marked position');
+  return parsed;
+}
+function validateStateEnvelope(data, id) {
+  data = plain(data, 'game response');
+  if (stringField(data.game_id, 'game_id') !== id || !UUID_PATTERN.test(data.game_id)) throw new Error('game_id does not match');
+  const envelopeVersion = safeInteger(data.version, 'version'), state = uiState(data.state);
+  if (state.version !== envelopeVersion) throw new Error('state version does not match envelope');
+  const startingEquity = requireFixed(data.starting_equity, 8, 'starting_equity');
+  const eventsThrough = safeInteger(data.events_through, 'events_through');
+  const scenario = validateScenario(data.scenario);
+  let latestTurn = null;
+  if (data.latest_turn !== undefined && data.latest_turn !== null) {
+    latestTurn = plain(data.latest_turn, 'latest_turn'); safeInteger(latestTurn.turn, 'latest_turn.turn', 1); validateSummary(latestTurn.summary, 'latest_turn.summary'); validateCoaching(latestTurn.coaching, 'latest_turn.coaching');
+    if (latestTurn.turn > state.turn) throw new Error('latest_turn is ahead of state');
+  }
+  return {data, state, startingEquity, eventsThrough, scenario, latestTurn, coaching:validateCoaching(data.coaching), recap:validateRecap(data.recap)};
+}
+function validateCommandEnvelope(data, id, command) {
+  data = plain(data, 'command response');
+  if (stringField(data.game_id, 'game_id') !== id) throw new Error('command game_id does not match');
+  const responseVersion = safeInteger(data.version, 'version'), state = uiState(data.state);
+  if (state.version !== responseVersion || responseVersion !== command.expected_version + 1) throw new Error('command version does not match');
+  const responseCommand = plain(data.command, 'command');
+  if (stringField(responseCommand.id, 'command.id') !== command.id || stringField(responseCommand.type, 'command.type') !== command.type) throw new Error('command acknowledgement does not match');
+  booleanField(responseCommand.replayed, 'command.replayed'); validateSummary(data.summary); validateScenario(data.scenario); validateCoaching(data.coaching); validateRecap(data.recap);
+  if (!Array.isArray(data.events)) throw new Error('events must be an array');
+  let sequence = 0;
+  data.events.forEach((event, index) => { validateEvent(event, `events[${index}]`); if (event.sequence <= sequence || event.command_id !== command.id) throw new Error('command events are not ordered or attributed'); sequence = event.sequence; });
+  return {data, state};
+}
+function validateCreateAcknowledgement(data, request) {
+  data = plain(data, 'create response');
+  if (!UUID_PATTERN.test(request.game_id) || !UUID_PATTERN.test(request.command_id) || stringField(data.game_id, 'game_id') !== request.game_id) throw new Error('create game_id does not match');
+  const command = plain(data.command, 'command');
+  if (stringField(command.id, 'command.id') !== request.command_id || stringField(command.type, 'command.type') !== 'create_game') throw new Error('create command acknowledgement does not match');
+  booleanField(command.replayed, 'command.replayed'); return data;
+}
+async function responseJSON(response) { const text = await response.text(); try { return JSON.parse(text); } catch (_) { throw new Error('response was not valid JSON'); } }
+function apiErrorCode(text) { try { const body = JSON.parse(text); return typeof body?.error?.code === 'string' ? body.error.code : ''; } catch (_) { return ''; } }
 function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
 function store(key, value) { try { localStorage.setItem(key, value); return true; } catch (_) { return false; } }
 function removeStored(key) { try { localStorage.removeItem(key); } catch (_) {} }
 
 function updateQuotePreview() {
   const bid = number($('bid').value), ask = number($('ask').value), width = ask - bid;
-  $('spread').textContent = money(Math.max(0, width));
+  $('spread').textContent = number(Math.max(0, width)).toLocaleString('en-US', {style:'currency', currency:'USD', minimumFractionDigits:2, maximumFractionDigits:2});
   $('quote-note').textContent = width > 2 ? 'Wide quote: less likely to trade.' : width > 0 ? 'Balanced quote around the mark.' : 'Ask must be above bid.';
 }
-['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));
-
 function syncQuoteControls() {
   const restoring = Boolean(restorationState), unresolved = Boolean(retryCommand || retryQuitCommand);
   const disabled = !gameId || isOver || Boolean(pendingCommand) || startingSession || Boolean(retryCreateRequest) || restoring;
@@ -338,18 +478,18 @@ function syncQuoteControls() {
 }
 
 function setState(state, summary, recap) {
-  const equity = state.equity ?? 0n;
+  const equity = state.equity;
   const pnl = equity - startingEquityFixed;
   $('turn').textContent = `Turn ${state.turn}${state.isOver ? ' · complete' : ''}`;
-  $('mid').textContent = money(state.mark);
+  $('mid').textContent = money(state.mark, 4);
   $('equity').textContent = money(equity);
   $('inventory').textContent = quantity(state.inventory);
   $('cash').textContent = money(state.cash);
   $('pnl').textContent = signedMoney(pnl);
   $('pnl').className = 'metric-value' + (pnl > 0n ? ' positive' : pnl < 0n ? ' negative' : '');
-  const direction = state.inventory > 0.0001 ? 'Long' : state.inventory < -0.0001 ? 'Short' : 'Flat';
-  const risk = Math.abs(state.inventory);
-  $('position-caption').textContent = direction === 'Flat' ? 'Flat. No inventory exposure yet.' : `${direction} ${quantity(risk)} units. A $1 mark move changes equity by about ${money(risk)}.`;
+  const direction = state.inventory > 0n ? 'Long' : state.inventory < 0n ? 'Short' : 'Flat';
+  const risk = state.inventory < 0n ? -state.inventory : state.inventory;
+  $('position-caption').textContent = direction === 'Flat' ? 'Flat. No inventory exposure yet.' : `${direction} ${quantity(risk)} units. A $1 mark move changes equity by about ${money(risk, 4)}.`;
   $('risk-note').textContent = direction === 'Flat' ? 'Tighter quotes can trade more often; inventory makes the next price move matter.' : `${direction} inventory is live. Quote with the next mark move in mind.`;
   $('session-label').textContent = state.isOver ? 'Session complete' : gameId ? 'Live scenario' : 'Ready to quote';
   isOver = state.isOver;
@@ -358,7 +498,7 @@ function setState(state, summary, recap) {
 }
 
 function addHistory(state, summary) {
-  const equity = state.equity ?? 0n;
+  const equity = state.equity;
   history.push({turn:state.turn, mark:state.mark, inventory:state.inventory, equity, pnl:equity-startingEquityFixed, summary:summary || {}});
   renderHistory();
 }
@@ -388,7 +528,7 @@ function renderAttribution(summary) {
   $('turn-attribution').hidden = !attribution;
   if (attribution) {
     for (const [id, value] of [['attribution-execution-edge', attribution.execution_edge], ['attribution-inventory-mark', attribution.inventory_mark_pnl], ['attribution-storage', attribution.storage_pnl], ['attribution-total', summary.turn_pnl]]) {
-      const element = $(id), amount = parseFixed(value, 8) ?? 0n;
+      const element = $(id), amount = requireFixed(value, 8, id);
       element.textContent = signedMoney(value); element.className = amount > 0n ? 'positive' : amount < 0n ? 'negative' : '';
     }
   } else {
@@ -396,7 +536,7 @@ function renderAttribution(summary) {
   }
   const arrivals = number(summary?.informed_orders || 0), informed = $('informed-flow');
   informed.hidden = arrivals <= 0;
-  informed.textContent = arrivals > 0 ? `Informed flow: ${arrivals} order${arrivals === 1 ? '' : 's'} arrived; ${number(summary.informed_orders_filled || 0)} filled for ${quantity(summary.informed_units_traded || 0)} units; informed-flow P&L ${signedMoney(summary.informed_flow_pnl || 0)}. Negative means value conceded; positive means your quote contained the directional edge.` : '';
+  informed.textContent = arrivals > 0 ? `Informed flow: ${arrivals} order${arrivals === 1 ? '' : 's'} arrived; ${number(summary.informed_orders_filled || 0)} filled for ${quantity(summary.informed_units_traded || '0.0000')} units; informed-flow P&L ${signedMoney(summary.informed_flow_pnl || '0.00000000')}. Negative means value conceded; positive means your quote contained the directional edge.` : '';
 }
 
 function customerOrderLabel(side, informed) {
@@ -417,17 +557,28 @@ function renderLatestTurn(latestTurn) {
   renderAttribution(summary); renderCoaching(latestTurn.coaching);
 }
 
+function renderTopCoaching(coaching, state) {
+  if (!coaching) return;
+  if ($('turn-detail').hidden) {
+    $('turn-empty').hidden = true; $('turn-detail').hidden = false;
+    $('turn-status').textContent = state.isOver ? 'Session complete' : `Turn ${state.turn}`;
+    $('turn-story').textContent = state.isOver ? 'The session ended before another turn was completed.' : 'Canonical coaching was restored for this session.';
+    renderAttribution(null);
+  }
+  renderCoaching(coaching);
+}
+
 function renderTurn(result) {
   const state = uiState(result.state), summary = result.summary || {}, events = result.events || [];
   const fills = events.filter(event => event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player'));
   const flowOrders = events.filter(event => event.type === 'flow_order' && event.order);
   const playerOrders = events.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player');
   const mark = events.find(event => event.type === 'mark_updated');
-  const storage = parseFixed(summary.storage_cost || 0, 8) ?? 0n, turnPnl = parseFixed(summary.turn_pnl || 0, 8) ?? 0n;
+  const storage = requireFixed(summary.storage_cost, 8, 'summary.storage_cost'), turnPnl = requireFixed(summary.turn_pnl, 8, 'summary.turn_pnl');
   $('turn-empty').hidden = true; $('turn-detail').hidden = false;
-  $('turn-status').textContent = `Mark ${money(state.mark)} · turn P&L ${signedMoney(turnPnl)}`;
+  $('turn-status').textContent = `Mark ${money(state.mark, 4)} · turn P&L ${signedMoney(turnPnl)}`;
   const flow = fills.length ? `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived and ${fills.length} execution${fills.length === 1 ? '' : 's'} met your quote.` : `${flowOrders.length} customer order${flowOrders.length === 1 ? '' : 's'} arrived, but none crossed your quote.`;
-  const move = mark ? ` The reference mark finished at ${money(state.mark)}.` : '';
+  const move = mark ? ` The reference mark finished at ${money(state.mark, 4)}.` : '';
   $('turn-story').textContent = `${flow}${storage > 0n ? ` Storage cost ${money(storage)}.` : ''}${move}`;
   renderAttribution(summary); renderCoaching(result.coaching);
   const audit = {turn:state.turn, playerOrders, flowOrders, fills}; auditGeneration++; turnAudits.push(audit); renderAudit(audit);
@@ -437,7 +588,7 @@ function renderAudit(audit) {
   $('audit-empty').hidden = true; $('audit-detail').hidden = false;
   const bid = audit.playerOrders.find(order => order.order.side === 'buy')?.order, ask = audit.playerOrders.find(order => order.order.side === 'sell')?.order;
   $('audit-status').textContent = `Turn ${audit.turn} · ${audit.playerOrders.length} resting quote${audit.playerOrders.length === 1 ? '' : 's'} · ${audit.flowOrders.length} customer order${audit.flowOrders.length === 1 ? '' : 's'} · ${audit.fills.length} trade${audit.fills.length === 1 ? '' : 's'}`;
-  $('audit-explainer').textContent = bid && ask ? `You rested a bid at ${money(bid.price)} and an ask at ${money(ask.price)}. Every customer order is immediate-or-cancel: it trades only when its limit crosses your price; any unmatched quantity expires.` : 'Every customer order is immediate-or-cancel: it trades only when its limit crosses your resting quote; any unmatched quantity expires.';
+  $('audit-explainer').textContent = bid && ask ? `You rested a bid at ${money(bid.price, 4)} and an ask at ${money(ask.price, 4)}. Every customer order is immediate-or-cancel: it trades only when its limit crosses your price; any unmatched quantity expires.` : 'Every customer order is immediate-or-cancel: it trades only when its limit crosses your resting quote; any unmatched quantity expires.';
   const appendCell = (row, text, className) => {
     const cell = document.createElement('td'); cell.textContent = text;
     if (className) cell.className = className;
@@ -445,11 +596,11 @@ function renderAudit(audit) {
   };
   const orders = $('ordersbody'); orders.replaceChildren();
   for (const event of audit.flowOrders) {
-    const order = event.order, filled = audit.fills.filter(fill => fill.trade.taker_order_id === order.id).reduce((total, fill) => total + number(fill.trade.quantity), 0);
-    const complete = filled >= number(order.quantity), outcome = filled === 0 ? 'Expired unfilled' : complete ? `Filled ${quantity(filled)}` : `Filled ${quantity(filled)}; remainder expired`;
+    const order = event.order, filled = audit.fills.filter(fill => fill.trade.taker_order_id === order.id).reduce((total, fill) => total + requireFixed(fill.trade.quantity, 4, 'trade.quantity'), 0n);
+    const ordered = requireFixed(order.quantity, 4, 'order.quantity'), complete = filled >= ordered, outcome = filled === 0n ? 'Expired unfilled' : complete ? `Filled ${quantity(filled)}` : `Filled ${quantity(filled)}; remainder expired`;
     const row = document.createElement('tr');
     appendCell(row, `${customerOrderLabel(order.side, order.informed)} ${quantity(order.quantity)}`);
-    appendCell(row, money(order.price)); appendCell(row, outcome, filled ? 'filled' : 'unfilled');
+    appendCell(row, money(order.price, 4)); appendCell(row, outcome, filled !== 0n ? 'filled' : 'unfilled');
     orders.appendChild(row);
   }
   const trades = $('tradesbody'); trades.replaceChildren();
@@ -459,14 +610,14 @@ function renderAudit(audit) {
   for (const event of audit.fills) {
     const trade = event.trade, bought = trade.buyer_id === 'player', side = bought ? 'Bought' : 'Sold';
     const row = document.createElement('tr');
-    appendCell(row, `${side} ${quantity(trade.quantity)}`); appendCell(row, money(trade.price)); appendCell(row, `You ${bought ? 'bought' : 'sold'} when ${trade.informed ? 'an informed customer' : 'a customer'} ${bought ? 'sell' : 'buy'} limit crossed your ${bought ? 'bid' : 'ask'}.`);
+    appendCell(row, `${side} ${quantity(trade.quantity)}`); appendCell(row, money(trade.price, 4)); appendCell(row, `You ${bought ? 'bought' : 'sold'} when ${trade.informed ? 'an informed customer' : 'a customer'} ${bought ? 'sell' : 'buy'} limit crossed your ${bought ? 'bid' : 'ask'}.`);
     trades.appendChild(row);
   }
   const tape = $('tapebody'); tape.replaceChildren();
   tape.parentElement.hidden = turnAudits.length < 2;
   for (const item of turnAudits.slice(0, -1).reverse()) {
     const entry = document.createElement('div'); entry.className = 'tape-entry';
-    const matches = item.fills.length ? item.fills.map(fill => `${customerOrderLabel(fill.trade.buyer_id === 'player' ? 'sell' : 'buy', fill.trade.informed)}: you ${fill.trade.buyer_id === 'player' ? 'bought' : 'sold'} ${quantity(fill.trade.quantity)} @ ${money(fill.trade.price)}`).join('; ') : 'no trades matched';
+    const matches = item.fills.length ? item.fills.map(fill => `${customerOrderLabel(fill.trade.buyer_id === 'player' ? 'sell' : 'buy', fill.trade.informed)}: you ${fill.trade.buyer_id === 'player' ? 'bought' : 'sold'} ${quantity(fill.trade.quantity)} @ ${money(fill.trade.price, 4)}`).join('; ') : 'no trades matched';
     entry.textContent = `Turn ${item.turn}: ${item.flowOrders.length} customer order${item.flowOrders.length === 1 ? '' : 's'} arrived; ${matches}.`;
     tape.appendChild(entry);
   }
@@ -476,108 +627,96 @@ function clearAudit() {
   auditGeneration++; turnAudits = []; $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet';
 }
 
-async function loadAuditHistory(id, epoch, finalState, signal) {
-  const generation = auditGeneration, events = []; let after = 0, hasMore = true;
-  try {
-    while (hasMore) {
-      const response = await fetch(`/api/v2/games/${id}/events?after=${after}&limit=200`, {signal});
-      if (!response.ok) return;
-      const page = await response.json();
-      if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
-      if (!Array.isArray(page.events)) return;
-      const pageAfter = after;
-      const nextAfter = Number(page.next_after);
-      if (!Number.isSafeInteger(nextAfter) || nextAfter < after) return;
-      for (const event of page.events) {
-        const sequence = Number(event?.sequence);
-        if (!Number.isSafeInteger(sequence) || sequence <= after) return;
-        after = sequence;
-      }
-      events.push(...page.events);
-      hasMore = Boolean(page.has_more);
-      if (hasMore && (!page.events.length || nextAfter <= pageAfter)) return;
-      after = nextAfter;
-    }
-  } catch (_) { return null; }
+async function loadAuditHistory(id, through, signal) {
+  const events = []; let after = 0;
+  while (after < through) {
+    const response = await fetch(`/api/v2/games/${id}/events?after=${after}&through=${through}&limit=200`, {signal});
+    if (!response.ok) throw new Error(`event page failed with status ${response.status}`);
+    const page = plain(await responseJSON(response), 'event page');
+    if (!Array.isArray(page.events)) throw new Error('event page events must be an array');
+    const nextAfter = safeInteger(page.next_after, 'event page next_after'), hasMore = booleanField(page.has_more, 'event page has_more');
+    let sequence = after;
+    page.events.forEach((event, index) => {
+      validateEvent(event, `event page events[${index}]`);
+      if (!event.command_id || event.sequence <= sequence || event.sequence > through) throw new Error('event page sequence is invalid');
+      sequence = event.sequence;
+    });
+    if (nextAfter !== sequence || (hasMore && (!page.events.length || nextAfter >= through)) || (!hasMore && nextAfter !== through)) throw new Error('event page cursor is inconsistent');
+    events.push(...page.events); after = nextAfter;
+  }
+  return events;
+}
+
+function buildAudits(events) {
   const byCommand = new Map();
   for (const event of events) {
-    if (!event.command_id) continue;
     if (!byCommand.has(event.command_id)) byCommand.set(event.command_id, []);
     byCommand.get(event.command_id).push(event);
   }
-  const audits = [];
+  const audits = []; let turn = 0;
   for (const commandEvents of byCommand.values()) {
+    if (commandEvents.some(event => event.type === 'mark_updated')) turn++;
     const flowOrders = commandEvents.filter(event => event.type === 'flow_order' && event.order);
     if (!flowOrders.length) continue;
-    audits.push({turn:audits.length + 1, playerOrders:commandEvents.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player'), flowOrders, fills:commandEvents.filter(event => event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player'))});
+    audits.push({turn, playerOrders:commandEvents.filter(event => event.type === 'order_accepted' && event.order && event.order.account_id === 'player'), flowOrders, fills:commandEvents.filter(event => event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player'))});
   }
-  if (epoch !== sessionEpoch || gameId !== id || generation !== auditGeneration) return;
-  turnAudits = audits;
-  const restoredHistory = restoreHistory(events, finalState);
-  if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
-  return restoredHistory;
+  return audits;
 }
 
-function restoreHistory(events, finalState) {
-  const state = {cash:parseFixed(finalState?.cash, 8), inventory:parseFixed(finalState?.position, 4)};
-  if (state.cash === null || state.inventory === null) return null;
+function restoreHistory(events, finalState, authoritativeBaseline) {
+  const state = {cash:finalState.cash, inventory:finalState.inventory};
   const commands = new Map();
   for (const event of events) {
-    if (!event.command_id) continue;
     if (!commands.has(event.command_id)) commands.set(event.command_id, []);
     commands.get(event.command_id).push(event);
   }
   const snapshots = [];
   for (const commandEvents of Array.from(commands.values()).reverse()) {
-    const markEvent = commandEvents.find(event => event.type === 'mark_updated');
+    const markEvents = commandEvents.filter(event => event.type === 'mark_updated');
+    if (markEvents.length > 1) throw new Error('command contains multiple mark updates');
+    const markEvent = markEvents[0];
     if (markEvent) {
-      const mark = parseFixed(markEvent.mark, 4);
-      if (mark === null) return null;
-      snapshots.push({cash:state.cash, inventory:state.inventory, mark, previousMark:parseFixed(markEvent.previous_mark, 4) ?? previousMark(markEvent.message)});
+      const mark = requireFixed(markEvent.mark, 4, 'mark event mark');
+      const prior = markEvent.previous_mark === undefined ? previousMark(markEvent.message) : requireFixed(markEvent.previous_mark, 4, 'mark event previous_mark');
+      if (prior === null) throw new Error('mark event has no valid previous mark');
+      snapshots.push({cash:state.cash, inventory:state.inventory, mark, previousMark:prior});
     }
     for (const event of commandEvents.slice().reverse()) {
       if (event.type === 'storage_charged') {
-        const amount = parseFixed(event.amount, 8);
-        if (amount === null) return null;
-        state.cash += amount;
+        state.cash += requireFixed(event.amount, 8, 'storage amount');
       }
       if (event.type === 'trade' && event.trade && (event.trade.buyer_id === 'player' || event.trade.seller_id === 'player')) {
-        const price = parseFixed(event.trade.price, 4), units = parseFixed(event.trade.quantity, 4);
-        if (price === null || units === null) return null;
+        const price = requireFixed(event.trade.price, 4, 'trade price'), units = requireFixed(event.trade.quantity, 4, 'trade quantity');
         const notional = price * units;
         if (event.trade.buyer_id === 'player') { state.cash += notional; state.inventory -= units; }
         else { state.cash -= notional; state.inventory += units; }
       }
     }
   }
-  if (!snapshots.length) return null;
+  if (snapshots.length !== finalState.turn) throw new Error('event turns do not match authoritative state');
+  if (!snapshots.length) {
+    if (finalState.equity !== authoritativeBaseline) throw new Error('turn-zero equity does not match authoritative baseline');
+    return [{turn:0, cash:finalState.cash, inventory:finalState.inventory, mark:finalState.mark, equity:finalState.equity, pnl:0n, summary:{}}];
+  }
   snapshots.reverse();
   const firstMark = snapshots[0].previousMark;
-  if (firstMark === null) return null;
   const startingCash = state.cash, startingInventory = state.inventory;
   const restoredStartingEquityFixed = startingCash + startingInventory * firstMark;
-  const restored = [{turn:0, cash:startingCash, inventory:startingInventory, mark:firstMark, equity:restoredStartingEquityFixed, pnl:0n, summary:{}}];
+  if (restoredStartingEquityFixed !== authoritativeBaseline) throw new Error('reconstructed baseline does not match starting_equity');
+  const restored = [{turn:0, cash:startingCash, inventory:startingInventory, mark:firstMark, equity:authoritativeBaseline, pnl:0n, summary:{}}];
   for (const [index, snapshot] of snapshots.entries()) restored.push({turn:index + 1, ...snapshot});
-  return restored.map(item => {
+  const result = restored.map(item => {
     const equity = item.equity === undefined ? item.cash + item.inventory * item.mark : item.equity;
-    return {...item, equity, pnl:equity - restoredStartingEquityFixed, summary:item.summary || {}};
+    return {...item, equity, pnl:equity - authoritativeBaseline, summary:item.summary || {}};
   });
+  const last = result[result.length - 1];
+  if (last.turn !== finalState.turn || last.cash !== finalState.cash || last.inventory !== finalState.inventory || last.mark !== finalState.mark || last.equity !== finalState.equity) throw new Error('reconstructed final state does not match authoritative state');
+  return result;
 }
 
 function previousMark(message) {
-  const match = /^previous=(.+)$/.exec(message || '');
-  if (!match) return null;
-  const text = match[1], parts = text.split('.');
-  if (parts.length > 2) return null;
-  const fraction = parts[1] || '';
-  if (!/^-?\d+$/.test(parts[0]) || !/^\d*$/.test(fraction) || fraction.length > 4) return null;
-  try {
-    const sign = parts[0].startsWith('-') ? -1n : 1n;
-    const whole = parts[0].replace(/^-/, '');
-    return sign * BigInt(whole + fraction.padEnd(4, '0'));
-  } catch (_) {
-    return null;
-  }
+  const match = /^previous=(.+)$/.exec(message || ''); if (!match) return null;
+  try { return requireFixed(match[1], 4, 'mark event message previous'); } catch (_) { return null; }
 }
 
 function applyScenario(snapshot) {
@@ -619,7 +758,7 @@ function setStartButtonsEnabled(enabled) {
 async function loadScenarios() {
   try {
     const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
-    const data = await response.json(); scenarios = data.scenarios || [];
+    const data = plain(await responseJSON(response), 'scenario response'); if (!Array.isArray(data.scenarios)) throw new Error('scenarios must be an array'); scenarios = data.scenarios.map((item, index) => validateScenario(item, `scenarios[${index}]`));
     if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
     applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); catalogReady = scenarios.length > 0; setStartButtonsEnabled(catalogReady);
   } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; catalogReady = false; setStartButtonsEnabled(false); }
@@ -634,6 +773,7 @@ async function startNewGame(request) {
   const create = request || retryCreateRequest || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
   const attempt = ++startAttempt; startingSession = true; retryCreateRequest = create;
   const savedCreate = store('mmg.pending_create', JSON.stringify(create)); renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
+  let acknowledged = false;
   try {
     const response = await fetch('/api/v2/games', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(create)});
     if (!response.ok) {
@@ -643,20 +783,16 @@ async function startNewGame(request) {
       alert(`Could not start this lesson: ${body}`);
       return {status:response.status < 500 ? 'rejected' : 'retryable'};
     }
-    const data = await response.json(), state = uiState(data.state);
-    if (attempt !== startAttempt) return {status:'stale'};
-    sessionEpoch++;
-    gameId = data.game_id; version = data.version; isOver = false; pendingCommand = retryCommand = retryQuitCommand = null;
-    startingEquityFixed = state.equity; history = []; clearAudit();
-    const savedGame = store('mmg.game_id', gameId);
-    const savedBaseline = store('mmg.starting_equity', formatFixed(startingEquityFixed, 8, 8));
-    if (!savedGame || !savedBaseline) alert('Session started, but browser storage is unavailable. Keep this tab open to continue this lesson.');
-    applyScenario(data.scenario); resetLatestTurn(); $('gamesummary').hidden = true; $('historybody').replaceChildren();
-    setState(state, null, data.recap); addHistory(state);
+    validateCreateAcknowledgement(await responseJSON(response), create); acknowledged = true;
     retryCreateRequest = null; removeStored('mmg.pending_create');
-    return {status:'started'};
+    const savedGame = store('mmg.game_id', create.game_id);
+    if (!savedGame) alert('Session was acknowledged, but browser storage is unavailable. Keep this tab open to continue this lesson.');
+    if (attempt !== startAttempt) return {status:'stale'};
+    const hydration = await hydrateGame(create.game_id);
+    if (hydration.status !== 'hydrated' && hydration.status !== 'stale') alert('The session was created, but its canonical state could not be loaded. The game ID was kept for retry.');
+    return {status:hydration.status === 'hydrated' ? 'started' : hydration.status};
   } catch (_) {
-    if (attempt === startAttempt) alert(savedCreate ? 'Network error. Start the lesson again to safely retry.' : 'Network error. Start the lesson again to safely retry; browser storage is unavailable, so keep this tab open.');
+    if (attempt === startAttempt && !acknowledged) alert(savedCreate ? 'The create response was uncertain. Start the lesson again to safely retry the same request.' : 'The create response was uncertain. Keep this tab open to retry the same request.');
     return {status:'retryable'};
   } finally {
     if (attempt === startAttempt) { startingSession = false; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
@@ -679,6 +815,12 @@ async function submitTurn() {
     if (!response.ok) {
       const body = await response.text();
       if (epoch !== sessionEpoch || pendingCommand !== command) return;
+      if (response.status === 409 && apiErrorCode(body) === 'version_conflict') {
+        retryCommand = null; pendingCommand = null;
+        const hydration = await hydrateGame(gameId);
+        if (hydration.status === 'failed') alert('The quote conflicted with canonical state, which could not be reloaded. Retry after reconnecting.');
+        return;
+      }
       if (response.status >= 500) {
         retryCommand = command;
         alert(`Quote response was uncertain: ${body}\nThe same quote will be retried.`);
@@ -688,12 +830,16 @@ async function submitTurn() {
       }
       return;
     }
-    const data = await response.json(), state = uiState(data.state);
+    const result = validateCommandEnvelope(await responseJSON(response), gameId, command), data = result.data, state = result.state;
     if (epoch !== sessionEpoch || pendingCommand !== command) return;
     version = data.version; retryCommand = null;
     renderTurn(data); setState(state, data.summary, data.recap); addHistory(state, data.summary);
   } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryCommand = command; alert('Network error. Post the same quote again to recover safely.'); } }
-  finally { if (pendingCommand === command) { pendingCommand = null; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); } }
+  finally {
+    if (epoch !== sessionEpoch && retryCommand === command) retryCommand = null;
+    if (pendingCommand === command) pendingCommand = null;
+    if (!restorationState) { renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
+  }
 }
 
 async function quitSession() {
@@ -704,6 +850,12 @@ async function quitSession() {
     if (!response.ok) {
       const body = await response.text();
       if (epoch !== sessionEpoch || pendingCommand !== command) return;
+      if (response.status === 409 && apiErrorCode(body) === 'version_conflict') {
+        retryQuitCommand = null; pendingCommand = null;
+        const hydration = await hydrateGame(gameId);
+        if (hydration.status === 'failed') alert('The end-session command conflicted with canonical state, which could not be reloaded. Retry after reconnecting.');
+        return;
+      }
       if (response.status >= 500) {
         retryQuitCommand = command;
         alert(`End-session response was uncertain: ${body}\nThe same end-session command will be retried.`);
@@ -713,25 +865,29 @@ async function quitSession() {
       }
       return;
     }
-    const data = await response.json(), state = uiState(data.state);
+    const result = validateCommandEnvelope(await responseJSON(response), gameId, command), data = result.data, state = result.state;
     if (epoch !== sessionEpoch || pendingCommand !== command) return;
-    version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap);
+    version = data.version; retryQuitCommand = null; setState(state, data.summary, data.recap); renderTopCoaching(data.coaching, state);
   } catch (_) { if (epoch === sessionEpoch && pendingCommand === command) { retryQuitCommand = command; alert('Network error. End the session again to recover safely.'); } }
-  finally { if (pendingCommand === command) { pendingCommand = null; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); } }
+  finally {
+    if (epoch !== sessionEpoch && retryQuitCommand === command) retryQuitCommand = null;
+    if (pendingCommand === command) pendingCommand = null;
+    if (!restorationState) { renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
+  }
 }
 
 function showSummary(state, recap) {
-  const equity = state.equity ?? 0n, pnl = equity - startingEquityFixed;
+  const equity = state.equity, pnl = equity - startingEquityFixed;
   $('gamesummary').hidden = false;
   $('summarycontent').textContent = recap ? `${recap.body} Final marked equity ${money(recap.final_equity)}.` : `${state.reason || 'Session ended'}. Final marked equity ${money(equity)}, for ${signedMoney(pnl)} since the start.`;
   const informedFields = ['informed_orders', 'informed_orders_filled', 'informed_units_traded', 'informed_flow_pnl'];
   const hasInformedRecap = recap && (recap.scorecard?.focus_label === 'Informed-flow P&L' || informedFields.some(field => Object.prototype.hasOwnProperty.call(recap, field)));
   $('recap-informed-flow').hidden = !hasInformedRecap;
-  $('recap-informed-flow').textContent = hasInformedRecap ? `Informed flow: ${number(recap.informed_orders || 0)} orders arrived; ${number(recap.informed_orders_filled || 0)} filled for ${quantity(recap.informed_units_traded || 0)} units; informed-flow P&L ${signedMoney(recap.informed_flow_pnl || 0)}. Negative means value conceded; positive means quotes contained the directional edge.` : '';
+  $('recap-informed-flow').textContent = hasInformedRecap ? `Informed flow: ${number(recap.informed_orders || 0)} orders arrived; ${number(recap.informed_orders_filled || 0)} filled for ${quantity(recap.informed_units_traded || '0.0000')} units; informed-flow P&L ${signedMoney(recap.informed_flow_pnl || '0.00000000')}. Negative means value conceded; positive means quotes contained the directional edge.` : '';
   const scorecard = recap?.scorecard;
   $('scorecard').hidden = !scorecard;
   if (scorecard) {
-    const totalPnl = parseFixed(recap.total_pnl, 8) ?? 0n;
+    const totalPnl = requireFixed(recap.total_pnl, 8, 'recap.total_pnl');
     $('score-pnl').textContent = signedMoney(totalPnl); $('score-pnl').className = totalPnl > 0n ? 'positive' : totalPnl < 0n ? 'negative' : '';
     $('score-focus-label').textContent = scorecard.focus_label; $('score-focus-value').textContent = scorecard.focus_label === 'Informed-flow P&L' ? signedMoney(scorecard.focus_value) : scorecard.focus_value;
     $('score-focus-note').textContent = scorecard.focus_note; $('score-reflection').textContent = scorecard.reflection;
@@ -740,42 +896,44 @@ function showSummary(state, recap) {
 }
 function playAgain() { if (!pendingCommand && !retryCommand && !retryQuitCommand && !startingSession && !restorationState) return startNewGame(); }
 function reviewHistory() { if (!pendingCommand && !startingSession && !restorationState) $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
-async function resumeGame() {
-  const id = stored('mmg.game_id'); if (!id) return;
-  const epoch = sessionEpoch, restoration = {id, epoch};
+function commitHydration(id, staged) {
+  gameId = id; version = staged.state.version; isOver = staged.state.isOver; startingEquityFixed = staged.startingEquity;
+  history = staged.history; turnAudits = staged.audits; auditGeneration++;
+  pendingCommand = retryCommand = retryQuitCommand = null;
+  const saved = store('mmg.game_id', id); removeStored('mmg.starting_equity');
+  selectedScenarioID = staged.scenario.id; applyScenario(staged.scenario); renderScenarios(); renderHistory();
+  if (staged.latestTurn) renderLatestTurn(staged.latestTurn); else resetLatestTurn();
+  if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
+  else { $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet'; }
+  $('gamesummary').hidden = true; setState(staged.state, staged.latestTurn?.summary, staged.recap); renderTopCoaching(staged.coaching, staged.state);
+  if (!saved) alert('Canonical state loaded, but browser storage is unavailable. Keep this tab open to continue.');
+}
+
+async function hydrateGame(id) {
+  if (!UUID_PATTERN.test(id)) return {status:'failed', error:new Error('stored game ID is invalid')};
+  const epoch = ++sessionEpoch, restoration = {id, epoch};
   restorationState = restoration; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
+  const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), HYDRATION_TIMEOUT_MS);
   try {
-    const response = await fetch(`/api/v2/games/${id}`);
-    if (!response.ok) { if (response.status === 404) { removeStored('mmg.game_id'); removeStored('mmg.starting_equity'); } return; }
-    const data = await response.json(), state = uiState(data.state);
-    if (epoch !== sessionEpoch || stored('mmg.game_id') !== id) return;
-    gameId = data.game_id; version = data.version; isOver = state.isOver;
-    const savedBaseline = parseFixed(stored('mmg.starting_equity'), 8), recapPnl = parseFixed(data.recap?.total_pnl, 8);
-    startingEquityFixed = savedBaseline ?? (recapPnl === null ? state.equity : state.equity - recapPnl);
-    clearAudit();
-    if (data.scenario) selectedScenarioID = data.scenario.id;
-    applyScenario(data.scenario); renderScenarios();
-    if (data.latest_turn) renderLatestTurn(data.latest_turn); else resetLatestTurn();
-    setState(state, data.latest_turn?.summary, data.recap); addHistory(state, data.latest_turn?.summary);
-    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 5000);
-    let restoredHistory = null;
-    try { restoredHistory = await loadAuditHistory(id, epoch, data.state, controller.signal); }
-    finally { clearTimeout(timeout); }
-    if (restoredHistory && epoch === sessionEpoch && gameId === id) {
-      startingEquityFixed = restoredHistory[0].equity;
-      store('mmg.starting_equity', formatFixed(startingEquityFixed, 8, 8));
-      history = restoredHistory;
-      setState(state, data.latest_turn?.summary, data.recap); renderHistory();
-    }
-  } catch (_) { /* Keep ID for a later reconnect. */ }
+    const response = await fetch(`/api/v2/games/${id}`, {signal:controller.signal});
+    if (!response.ok) throw new Error(`state request failed with status ${response.status}`);
+    const staged = validateStateEnvelope(await responseJSON(response), id);
+    if (epoch !== sessionEpoch || restorationState !== restoration) return {status:'stale'};
+    const events = await loadAuditHistory(id, staged.eventsThrough, controller.signal);
+    staged.audits = buildAudits(events); staged.history = restoreHistory(events, staged.state, staged.startingEquity);
+    if (epoch !== sessionEpoch || restorationState !== restoration) return {status:'stale'};
+    commitHydration(id, staged); return {status:'hydrated'};
+  } catch (error) { return {status:'failed', error}; }
   finally {
+    clearTimeout(timeout);
     if (restorationState === restoration) {
       restorationState = null;
-      if (epoch === sessionEpoch) { renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls(); }
+      renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
     }
   }
 }
-document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } });
+async function resumeGame() { const id = stored('mmg.game_id'); return id ? hydrateGame(id) : {status:'none'}; }
+function installKeyboardHandler() { document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } }); }
 async function initialize() {
   const catalog = loadScenarios(), request = pendingCreate();
   if (!request) return resumeGame();
@@ -784,7 +942,19 @@ async function initialize() {
   const result = await startNewGame(request);
   if (result?.status === 'rejected') await resumeGame();
 }
-updateQuotePreview(); setState({turn:0,cash:0n,inventory:0,mark:0,equity:0n,isOver:false}); initialize();
+function seedTestModel(id, rawState, baseline) {
+  const state = uiState(rawState); gameId = id; version = state.version; isOver = state.isOver; startingEquityFixed = requireFixed(baseline, 8, 'baseline');
+  history = []; turnAudits = []; pendingCommand = retryCommand = retryQuitCommand = null; restorationState = null; setState(state); return state;
+}
+globalThis.__MM_TEST__ = {
+  hydrateGame, startNewGame, submitTurn, quitSession, seedTestModel,
+  setCatalog(items, selected) { scenarios = items.map((item, index) => validateScenario(item, `test scenarios[${index}]`)); selectedScenarioID = selected || scenarios[0]?.id || null; catalogReady = scenarios.length > 0; if (selectedScenarioID) applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(catalogReady); },
+  model() { return {gameId, version, isOver, startingEquityFixed:String(startingEquityFixed), pendingCommand, retryCommand, retryQuitCommand, restoration:Boolean(restorationState), historyLength:history.length}; }
+};
+if (!globalThis.__MM_TEST_MODE__) {
+  ['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));
+  installKeyboardHandler(); updateQuotePreview(); setState({turn:0,cash:0n,inventory:0n,mark:0n,equity:0n,isOver:false,reason:'',bestBid:0n,bestAsk:0n}); initialize();
+}
 </script>
 </body>
 </html>

@@ -89,13 +89,58 @@ func TestConfigFromFlagsValidatesAdverseSelectionInformedFlow(t *testing.T) {
 	}
 }
 
-func TestPrintResultUsesPlayerPerspectiveForInformedTrades(t *testing.T) {
+func TestPrintBannerPreservesLegacyDefaultAndExplainsVersionTwo(t *testing.T) {
+	tests := []struct {
+		name    string
+		version exchange.SimulationVersion
+		want    string
+	}{
+		{
+			name:    "legacy",
+			version: exchange.SimulationVersionLegacy,
+			want: "=== Market Maker Exchange ===\n" +
+				"Scenario seed: 42 | margin: 50.00% initial / 25.00% maintenance\n",
+		},
+		{
+			name:    "version two",
+			version: exchange.SimulationVersionAdverseSelection,
+			want: "=== Market Maker Exchange ===\n" +
+				"Scenario seed: 42 | simulation version: 2 | margin: 50.00% initial / 25.00% maintenance\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			printBanner(&output, exchange.Config{Seed: 42, SimulationVersion: test.version, InitialMarginBps: 5_000, MaintenanceMarginBps: 2_500})
+			if got := output.String(); got != test.want {
+				t.Fatalf("banner mismatch\nwant:\n%s\ngot:\n%s", test.want, got)
+			}
+		})
+	}
+}
+
+func TestPrintResultPreservesLegacyTradeLine(t *testing.T) {
+	result := exchange.Result{Events: []exchange.Event{
+		{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.PlayerAccount, SellerID: exchange.FlowAccount, Quantity: fixed.Qty(12_500), Price: fixed.Price(1_000_000)}},
+	}}
+	var output bytes.Buffer
+	printResult(&output, result, exchange.SimulationVersionLegacy)
+
+	want := "Trade: 1.2500 100.0000 @ player buys\n" +
+		"Turn fill cash: $0.00000000 | storage: $0.00000000 | turn P&L: $0.00000000\n" +
+		"Turn 0 | Cash $0.00000000 | Position 0.0000 | Mark $0.0000 | Equity $0.00000000 | Book 0.0000 / 0.0000\n"
+	if got := output.String(); got != want {
+		t.Fatalf("legacy result mismatch\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestPrintResultUsesVersionTwoTradeWording(t *testing.T) {
 	result := exchange.Result{Events: []exchange.Event{
 		{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.PlayerAccount, SellerID: exchange.FlowAccount, Quantity: fixed.Qty(12_500), Price: fixed.Price(1_000_000), Informed: true}},
 		{Type: "trade", Trade: &exchange.Trade{BuyerID: exchange.FlowAccount, SellerID: exchange.PlayerAccount, Quantity: fixed.Qty(20_000), Price: fixed.Price(1_010_000), Informed: true}},
 	}}
 	var output bytes.Buffer
-	printResult(&output, result)
+	printResult(&output, result, exchange.SimulationVersionAdverseSelection)
 
 	for _, expected := range []string{
 		"Trade: you bought 1.2500 @ $100.0000 from an informed customer",
@@ -117,7 +162,7 @@ func TestPrintResultShowsAuthoritativeAttributionAndInformedMetrics(t *testing.T
 		InformedFlowPnL:      fixed.Money(-75_000_000),
 	}}
 	var output bytes.Buffer
-	printResult(&output, result)
+	printResult(&output, result, exchange.SimulationVersionAdverseSelection)
 
 	for _, expected := range []string{
 		"Turn P&L attribution:",
@@ -133,16 +178,27 @@ func TestPrintResultShowsAuthoritativeAttributionAndInformedMetrics(t *testing.T
 	}
 }
 
-func TestPrintResultKeepsLegacySummaryFallback(t *testing.T) {
-	result := exchange.Result{Summary: exchange.Summary{NetFillCash: fixed.Money(100_000_000), StorageCost: fixed.Money(25_000_000), TurnPnL: fixed.Money(75_000_000)}}
+func TestPrintResultGatesVersionTwoExplanationsFromLegacy(t *testing.T) {
+	result := exchange.Result{Summary: exchange.Summary{
+		NetFillCash:          fixed.Money(100_000_000),
+		StorageCost:          fixed.Money(25_000_000),
+		TurnPnL:              fixed.Money(75_000_000),
+		PnLAttribution:       &exchange.PnLAttribution{ExecutionEdge: fixed.Money(100_000_000)},
+		InformedOrders:       1,
+		InformedOrdersFilled: 1,
+		InformedUnitsTraded:  fixed.Qty(10_000),
+		InformedFlowPnL:      fixed.Money(50_000_000),
+	}}
 	var output bytes.Buffer
-	printResult(&output, result)
+	printResult(&output, result, exchange.SimulationVersionLegacy)
 
 	want := "Turn fill cash: $1.00000000 | storage: $0.25000000 | turn P&L: $0.75000000"
 	if !strings.Contains(output.String(), want) {
 		t.Fatalf("missing %q in:\n%s", want, output.String())
 	}
-	if strings.Contains(output.String(), "Turn P&L attribution:") {
-		t.Fatalf("legacy result rendered attribution:\n%s", output.String())
+	for _, versionTwoText := range []string{"Turn P&L attribution:", "Informed flow:"} {
+		if strings.Contains(output.String(), versionTwoText) {
+			t.Fatalf("legacy result rendered %q:\n%s", versionTwoText, output.String())
+		}
 	}
 }

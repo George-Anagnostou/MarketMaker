@@ -11,13 +11,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
@@ -35,19 +35,23 @@ type exchangeService struct {
 	entries        map[string]*exchangeEntry
 	lookupScenario func(string) (scenario.Definition, bool)
 	syncLog        func(*eventlog.Log) error
+	metrics        *metrics
 }
 
 type exchangeEntry struct {
-	mu            sync.Mutex
-	engine        *exchange.Engine
-	log           *eventlog.Log
-	commands      map[string]eventlog.Record
-	latestTurn    *latestTurn
-	scenario      *scenario.Snapshot
-	coaching      *scenario.Coaching
-	recap         *scenario.Recap
-	storageFailed bool
-	syncLog       func(*eventlog.Log) error
+	mu             sync.Mutex
+	engine         *exchange.Engine
+	log            *eventlog.Log
+	commands       map[string]eventlog.Record
+	startingEquity fixed.Money
+	eventsThrough  uint64
+	latestTurn     *latestTurn
+	scenario       *scenario.Snapshot
+	coaching       *scenario.Coaching
+	recap          *scenario.Recap
+	storageFailed  bool
+	syncLog        func(*eventlog.Log) error
+	metrics        *metrics
 }
 
 func newExchangeService(root string) *exchangeService {
@@ -116,13 +120,15 @@ type exchangeResponse struct {
 }
 
 type exchangeStateResponse struct {
-	GameID     string             `json:"game_id"`
-	Version    uint64             `json:"version"`
-	State      exchange.State     `json:"state"`
-	LatestTurn *latestTurn        `json:"latest_turn,omitempty"`
-	Scenario   *scenario.Snapshot `json:"scenario,omitempty"`
-	Coaching   *scenario.Coaching `json:"coaching,omitempty"`
-	Recap      *scenario.Recap    `json:"recap,omitempty"`
+	GameID         string             `json:"game_id"`
+	Version        uint64             `json:"version"`
+	StartingEquity fixed.Money        `json:"starting_equity"`
+	EventsThrough  uint64             `json:"events_through"`
+	State          exchange.State     `json:"state"`
+	LatestTurn     *latestTurn        `json:"latest_turn,omitempty"`
+	Scenario       *scenario.Snapshot `json:"scenario,omitempty"`
+	Coaching       *scenario.Coaching `json:"coaching,omitempty"`
+	Recap          *scenario.Recap    `json:"recap,omitempty"`
 }
 
 type latestTurn struct {
@@ -149,6 +155,8 @@ type apiError struct {
 }
 
 func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
+	outcome := "rejected"
+	defer func() { s.metrics.observeCommand("create_game", outcome) }()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
@@ -170,16 +178,18 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, errCreateConflict) {
-		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id already exists with a different create command or scenario")
+		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id or create command id is already associated with a different create request")
 		return
 	}
 	if err != nil {
+		outcome = "storage_failure"
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not create game")
 		return
 	}
 	entry.mu.Lock()
 	if entry.storageFailed {
 		entry.mu.Unlock()
+		outcome = "storage_failure"
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
 		return
 	}
@@ -189,6 +199,7 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		initial, err := exchange.New(entry.log.Meta().Config)
 		if err != nil {
 			entry.mu.Unlock()
+			outcome = "storage_failure"
 			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not restore create result")
 			return
 		}
@@ -202,6 +213,11 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/api/v2/games/"+req.GameID)
 	}
 	writeJSON(w, status, exchangeCreateResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: snapshot, Coaching: coaching, Recap: recap})
+	if created {
+		outcome = "accepted"
+	} else {
+		outcome = "replayed"
+	}
 }
 
 func (s *exchangeService) handleScenarios(w http.ResponseWriter, r *http.Request) {
@@ -268,12 +284,15 @@ func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, 
 		return
 	}
 	state := entry.engine.State()
+	startingEquity, eventsThrough := entry.startingEquity, entry.eventsThrough
 	latest, snapshot, coaching, recap := entry.latestTurn, entry.scenario, entry.coaching, entry.recap
 	entry.mu.Unlock()
-	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap})
+	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, StartingEquity: startingEquity, EventsThrough: eventsThrough, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap})
 }
 
 func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
+	commandType, outcome := "unknown", "rejected"
+	defer func() { s.metrics.observeCommand(commandType, outcome) }()
 	data, err := readJSONRequest(w, r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -286,6 +305,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	commandType = kind.Type
 	if kind.Type != exchange.CommandSubmitQuote && kind.Type != exchange.CommandQuit {
 		writeAPIError(w, http.StatusForbidden, "venue_command_unavailable", "account commands require authenticated venue access")
 		return
@@ -308,6 +328,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	entry.mu.Lock()
 	if entry.storageFailed {
 		entry.mu.Unlock()
+		outcome = "storage_failure"
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
 		return
 	}
@@ -320,6 +341,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		response := exchangeResult(id, prior.Result, command, true, entry.scenario, prior.Coaching, prior.Recap)
 		entry.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
+		outcome = "replayed"
 		return
 	}
 	if command.ID == entry.log.Meta().CreateCommandID {
@@ -353,12 +375,19 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 				entry.storageFailed = true
 			}
 			entry.mu.Unlock()
+			outcome = "recap_failure"
 			writeAPIError(w, http.StatusInternalServerError, "recap_failure", "could not build session recap")
 			return
 		}
 		record.Recap = recap
 	}
+	appendStarted := time.Now()
 	record, err = entry.log.Append(record)
+	appendOutcome := "success"
+	if err != nil {
+		appendOutcome = "failure"
+	}
+	s.metrics.observeEventLogAppend(appendOutcome, time.Since(appendStarted))
 	if err != nil {
 		// A write or sync error leaves commit status uncertain. Rebuild so a
 		// retry can be answered idempotently, but never acknowledge the command
@@ -367,10 +396,12 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 			entry.storageFailed = true
 		}
 		entry.mu.Unlock()
+		outcome = "storage_failure"
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command was not committed")
 		return
 	}
 	entry.commands[command.ID] = record
+	entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 	if command.Type == exchange.CommandSubmitQuote {
 		entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 	}
@@ -378,6 +409,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	response := exchangeResult(id, record.Result, command, false, entry.scenario, entry.coaching, entry.recap)
 	entry.mu.Unlock()
 	writeJSON(w, http.StatusOK, response)
+	outcome = "accepted"
 }
 
 func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Request, entry *exchangeEntry) {
@@ -400,16 +432,28 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	} else if present {
 		limit = parsed
 	}
+	through, hasThrough, err := canonicalUintQuery(query, "through")
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "through must be a canonical unsigned integer")
+		return
+	}
 	entry.mu.Lock()
 	if entry.storageFailed {
 		entry.mu.Unlock()
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
 		return
 	}
+	if !hasThrough {
+		through = entry.eventsThrough
+	} else if through > entry.eventsThrough {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "through cannot exceed the current durable event sequence")
+		return
+	}
 	events := make([]exchange.Event, 0)
 	for _, record := range entry.commands {
 		for _, event := range record.Result.Events {
-			if event.Sequence > after {
+			if event.Sequence > after && event.Sequence <= through {
 				events = append(events, event)
 			}
 		}
@@ -468,6 +512,9 @@ var (
 func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (*exchangeEntry, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkCreateCommandScope(id, createCommandID, scenarioID); err != nil {
+		return nil, false, err
+	}
 	if entry := s.entries[id]; entry != nil {
 		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
 			return nil, false, errCreateConflict
@@ -503,9 +550,35 @@ func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: &snapshot, syncLog: s.syncLog}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, syncLog: s.syncLog, metrics: s.metrics}
 	s.entries[id] = entry
 	return entry, true, nil
+}
+
+func (s *exchangeService) checkCreateCommandScope(id, createCommandID, scenarioID string) error {
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, item := range entries {
+		if !item.IsDir() || !validUUID(item.Name()) {
+			continue
+		}
+		meta, err := eventlog.ReadMeta(s.root, item.Name())
+		if err != nil {
+			return fmt.Errorf("read game metadata %s: %w", item.Name(), err)
+		}
+		if meta.CreateCommandID != createCommandID {
+			continue
+		}
+		if meta.GameID != id || meta.Scenario == nil || meta.Scenario.ID != scenarioID {
+			return errCreateConflict
+		}
+	}
+	return nil
 }
 
 func matchesCreate(meta eventlog.Meta, createCommandID, scenarioID string) bool {
@@ -517,28 +590,58 @@ func (s *exchangeService) load(id string) (*exchangeEntry, error) {
 	defer s.mu.Unlock()
 	return s.loadLocked(id)
 }
+
+func (s *exchangeService) storageHealthy() bool {
+	s.mu.Lock()
+	entries := make([]*exchangeEntry, 0, len(s.entries))
+	for _, entry := range s.entries {
+		entries = append(entries, entry)
+	}
+	s.mu.Unlock()
+	for _, entry := range entries {
+		entry.mu.Lock()
+		failed := entry.storageFailed
+		entry.mu.Unlock()
+		if failed {
+			return false
+		}
+	}
+	return true
+}
 func (s *exchangeService) loadLocked(id string) (*exchangeEntry, error) {
 	if entry := s.entries[id]; entry != nil {
 		return entry, nil
 	}
 	log, records, err := eventlog.Open(s.root, id)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.metrics.observeRecoveryFailure()
+		}
 		return nil, err
 	}
 	if err := s.syncLog(log); err != nil {
+		s.metrics.observeRecoveryFailure()
 		return nil, err
 	}
 	entry, err := rebuildExchangeEntry(log, records)
 	if err != nil {
+		s.metrics.observeRecoveryFailure()
 		return nil, err
 	}
 	entry.syncLog = s.syncLog
+	entry.metrics = s.metrics
 	s.entries[id] = entry
 	return entry, nil
 }
 
-func (entry *exchangeEntry) recover() error {
-	log, records, err := eventlog.Open(filepath.Dir(entry.log.Path()), filepath.Base(entry.log.Path()))
+func (entry *exchangeEntry) recover() (err error) {
+	defer func() {
+		if err != nil {
+			entry.metrics.observeRecoveryFailure()
+		}
+	}()
+	log := entry.log
+	records, err := log.Recover()
 	if err != nil {
 		return err
 	}
@@ -552,6 +655,8 @@ func (entry *exchangeEntry) recover() error {
 	entry.engine = rebuilt.engine
 	entry.log = rebuilt.log
 	entry.commands = rebuilt.commands
+	entry.startingEquity = rebuilt.startingEquity
+	entry.eventsThrough = rebuilt.eventsThrough
 	entry.latestTurn = rebuilt.latestTurn
 	entry.scenario = rebuilt.scenario
 	entry.coaching = rebuilt.coaching
@@ -561,12 +666,18 @@ func (entry *exchangeEntry) recover() error {
 }
 
 func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchangeEntry, error) {
-	engine, commands, err := replayRecords(log.Meta().Config, records)
+	meta := log.Meta()
+	engine, commands, err := replayRecords(meta.Config, records)
 	if err != nil {
 		return nil, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: commands, scenario: log.Meta().Scenario}
+	startingEquity, err := checkedStartingEquity(meta.Config)
+	if err != nil {
+		return nil, err
+	}
+	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario}
 	for _, record := range records {
+		entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 		if record.Command.Type == exchange.CommandSubmitQuote {
 			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 		}
@@ -578,6 +689,23 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 		}
 	}
 	return entry, nil
+}
+
+func checkedStartingEquity(cfg exchange.Config) (fixed.Money, error) {
+	startingNotional, err := fixed.Notional(cfg.StartingMark, cfg.StartingPosition)
+	if err != nil {
+		return 0, err
+	}
+	return fixed.AddMoney(cfg.StartingCash, startingNotional)
+}
+
+func resultEventsThrough(result exchange.Result, through uint64) uint64 {
+	for _, event := range result.Events {
+		if event.Sequence > through {
+			through = event.Sequence
+		}
+	}
+	return through
 }
 
 func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.Engine, map[string]eventlog.Record, error) {

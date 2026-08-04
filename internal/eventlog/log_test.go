@@ -245,6 +245,59 @@ func TestOpenRejectsPublishedMetadataWithoutEvents(t *testing.T) {
 	}
 }
 
+func TestReadMetaDoesNotReadOrMutateEvents(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(log.Path(), "events.jsonl")
+	events := []byte(`not an event stream`)
+	if err := os.WriteFile(eventsPath, events, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := ReadMeta(root, "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.GameID != "game-1" || meta.CreateCommandID != "create-1" || !bytes.Equal(after, events) {
+		t.Fatalf("metadata=%+v events=%q", meta, after)
+	}
+}
+
+func TestReadMetaRejectsInvalidChecksum(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(log.Path(), "meta.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta Meta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	meta.OwnerID = "changed"
+	data, err = json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadMeta(root, "game-1"); err == nil || !strings.Contains(err.Error(), "checksum") {
+		t.Fatalf("ReadMeta error = %v, want checksum rejection", err)
+	}
+}
+
 func TestIgnoreIncompleteTrailingRecord(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
@@ -619,6 +672,203 @@ func TestAppendDoesNotRecreateMissingEventsFile(t *testing.T) {
 	}
 }
 
+func TestAppendRejectsActiveFileSizeAndIdentityChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, []byte)
+	}{
+		{
+			name: "truncate",
+			mutate: func(t *testing.T, path string, data []byte) {
+				t.Helper()
+				if err := os.Truncate(path, int64(len(data)-1)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "same-size replacement",
+			mutate: func(t *testing.T, path string, data []byte) {
+				t.Helper()
+				replaceFile(t, path, data)
+			},
+		},
+		{
+			name: "extension",
+			mutate: func(t *testing.T, path string, _ []byte) {
+				t.Helper()
+				appendFile(t, path, []byte("unacknowledged"))
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "events.jsonl")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			acknowledgedSize := log.eventsSize
+			test.mutate(t, path, data)
+
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err == nil {
+				t.Fatal("Append accepted changed active event log")
+			}
+			if log.eventsSize != acknowledgedSize || log.nextVersion != 2 || log.lastChecksum == "" {
+				t.Fatalf("Append advanced active state after rejection: size=%d version=%d checksum=%q", log.eventsSize, log.nextVersion, log.lastChecksum)
+			}
+		})
+	}
+}
+
+func TestSyncRejectsActiveFileReplacement(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(log.Path(), "events.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceFile(t, path, data)
+	if err := log.Sync(); err == nil || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("Sync error = %v, want identity rejection", err)
+	}
+}
+
+func TestRecoverRetainsValidUncertainRecord(t *testing.T) {
+	root := t.TempDir()
+	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := encodedRecordLine(t, log, Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}})
+	path := filepath.Join(log.Path(), "events.jsonl")
+	appendFile(t, path, line)
+
+	records, err := log.Recover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Command.ID != "c-1" || log.eventsSize != int64(len(line)) || log.nextVersion != 2 {
+		t.Fatalf("recovered records=%+v size=%d version=%d", records, log.eventsSize, log.nextVersion)
+	}
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatalf("Append after Recover: %v", err)
+	}
+}
+
+func TestRecoverTruncatesMalformedSuffix(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		suffix []byte
+	}{
+		{name: "newline terminated", suffix: []byte("{\"bad\":true}\n")},
+		{name: "unterminated", suffix: []byte("{\"schema\":")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "events.jsonl")
+			acknowledged, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendFile(t, path, test.suffix)
+
+			records, err := log.Recover()
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 || !bytes.Equal(data, acknowledged) || log.eventsSize != int64(len(acknowledged)) {
+				t.Fatalf("records=%+v data size=%d acknowledged=%d active=%d", records, len(data), len(acknowledged), log.eventsSize)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatalf("Append after Recover: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoverRefusesRollbackAndReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, []byte)
+	}{
+		{
+			name: "rollback",
+			mutate: func(t *testing.T, path string, data []byte) {
+				t.Helper()
+				if err := os.Truncate(path, int64(len(data)-1)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{name: "replacement", mutate: replaceFile},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(log.Path(), "events.jsonl")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, path, data)
+			if records, err := log.Recover(); err == nil || records != nil {
+				t.Fatalf("Recover records=%+v error=%v, want refusal", records, err)
+			}
+			if log.eventsSize != int64(len(data)) || log.nextVersion != 2 {
+				t.Fatalf("Recover changed active state: size=%d version=%d", log.eventsSize, log.nextVersion)
+			}
+		})
+	}
+}
+
+func TestCreateDurablyCreatesAbsentStorageRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "new", "eventlogs")
+	if _, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Dir(root), root} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("directory %s permissions = %o, want no group/other access", path, info.Mode().Perm())
+		}
+	}
+}
+
 func TestRejectsDuplicateCommandID(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
@@ -755,6 +1005,9 @@ func TestAppendEnforcesEventWriteLimit(t *testing.T) {
 			if err := os.Truncate(path, initialSize); err != nil {
 				t.Fatal(err)
 			}
+			// This fixture establishes an already acknowledged sparse boundary;
+			// active Logs now correctly reject unacknowledged external growth.
+			log.eventsSize = initialSize
 			_, err = log.Append(record)
 			if test.wantError {
 				if err == nil || !strings.Contains(err.Error(), "event log exceeds") {
@@ -1001,6 +1254,11 @@ func independentRecordChecksum(t *testing.T, record Record, domain string) strin
 
 func encodedRecordLineBytes(t *testing.T, log *Log, record Record) int64 {
 	t.Helper()
+	return int64(len(encodedRecordLine(t, log, record)))
+}
+
+func encodedRecordLine(t *testing.T, log *Log, record Record) []byte {
+	t.Helper()
 	record.Schema = log.meta.Schema
 	record.PreviousChecksum = log.lastChecksum
 	if record.Schema != schema1 {
@@ -1015,7 +1273,32 @@ func encodedRecordLineBytes(t *testing.T, log *Log, record Record) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return int64(len(data) + 1)
+	return append(data, '\n')
+}
+
+func appendFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil || n != len(data) || syncErr != nil || closeErr != nil {
+		t.Fatalf("append file: wrote %d/%d bytes, write error=%v sync error=%v close error=%v", n, len(data), writeErr, syncErr, closeErr)
+	}
+}
+
+func replaceFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func addUnknownJSONField(t *testing.T, data []byte, path ...string) []byte {

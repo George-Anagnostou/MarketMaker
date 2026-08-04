@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"time"
 
 	"market-maker/internal/exchange"
@@ -54,9 +56,12 @@ type Record struct {
 type Log struct {
 	dir          string
 	meta         Meta
+	mu           sync.Mutex
 	lastChecksum string
 	nextVersion  uint64
 	commandIDs   map[string]struct{}
+	eventsInfo   os.FileInfo
+	eventsSize   int64
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
@@ -67,7 +72,7 @@ func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := mkdirAllDurable(root, 0o700); err != nil {
 		return nil, err
 	}
 	if createCommandID == "" {
@@ -111,8 +116,11 @@ func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config
 		return nil, err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return nil, err
+		return nil, closeFile(f, err)
+	}
+	eventsInfo, err := f.Stat()
+	if err != nil {
+		return nil, closeFile(f, err)
 	}
 	if err := f.Close(); err != nil {
 		return nil, err
@@ -130,38 +138,42 @@ func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config
 	if err := syncDir(root); err != nil {
 		return nil, err
 	}
-	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: map[string]struct{}{createCommandID: {}}}, nil
+	publishedInfo, err := os.Stat(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(eventsInfo, publishedInfo) || publishedInfo.Size() != 0 {
+		return nil, errors.New("published event log identity or size changed")
+	}
+	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: map[string]struct{}{createCommandID: {}}, eventsInfo: publishedInfo}, nil
 }
 
 func Open(root, gameID string) (*Log, []Record, error) {
+	meta, err := ReadMeta(root, gameID)
+	if err != nil {
+		return nil, nil, err
+	}
 	dir := filepath.Join(root, gameID)
-	data, err := readFileBounded(filepath.Join(dir, "meta.json"), "game metadata", maxMetadataBytes)
+	eventsPath := filepath.Join(dir, "events.jsonl")
+	f, err := os.OpenFile(eventsPath, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}
-	var meta Meta
-	if err := decodeStrictJSON(data, &meta); err != nil {
-		return nil, nil, fmt.Errorf("decode game metadata: %w", err)
-	}
-	if !supportedSchema(meta.Schema) || meta.GameID != gameID {
-		return nil, nil, errors.New("unsupported or mismatched game metadata")
-	}
-	switch meta.Schema {
-	case schema1:
-	case schema2, SchemaVersion:
-		checksum, err := metadataChecksum(meta)
-		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
-			return nil, nil, errors.New("invalid game metadata checksum")
-		}
-	}
-	if err := meta.Config.Validate(); err != nil {
-		return nil, nil, fmt.Errorf("invalid stored config: %w", err)
-	}
-	records, err := loadRecords(filepath.Join(dir, "events.jsonl"), meta.Schema, meta.Checksum)
+	records, eventsInfo, eventsSize, err := loadRecords(f, meta.Schema, meta.Checksum)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, closeFile(f, err)
 	}
-	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records)+1)}
+	pathInfo, err := os.Stat(eventsPath)
+	if err != nil {
+		return nil, nil, closeFile(f, err)
+	}
+	if !os.SameFile(eventsInfo, pathInfo) || pathInfo.Size() != eventsSize {
+		return nil, nil, closeFile(f, errors.New("event log identity or size changed while opening"))
+	}
+	if err := f.Close(); err != nil {
+		return nil, nil, fmt.Errorf("close event log: %w", err)
+	}
+	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records)+1), eventsInfo: eventsInfo, eventsSize: eventsSize}
 	log.commandIDs[meta.CreateCommandID] = struct{}{}
 	if len(records) > 0 {
 		log.lastChecksum = records[len(records)-1].Checksum
@@ -170,6 +182,36 @@ func Open(root, gameID string) (*Log, []Record, error) {
 		log.commandIDs[record.Command.ID] = struct{}{}
 	}
 	return log, records, nil
+}
+
+// ReadMeta validates a published game's metadata without opening, reading, or
+// mutating its event stream.
+func ReadMeta(root, gameID string) (Meta, error) {
+	dir := filepath.Join(root, gameID)
+	data, err := readFileBounded(filepath.Join(dir, "meta.json"), "game metadata", maxMetadataBytes)
+	if err != nil {
+		return Meta{}, err
+	}
+	var meta Meta
+	if err := decodeStrictJSON(data, &meta); err != nil {
+		return Meta{}, fmt.Errorf("decode game metadata: %w", err)
+	}
+	if !supportedSchema(meta.Schema) || meta.GameID != gameID {
+		return Meta{}, errors.New("unsupported or mismatched game metadata")
+	}
+	switch meta.Schema {
+	case schema1:
+	case schema2, SchemaVersion:
+		checksum, err := metadataChecksum(meta)
+		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
+			return Meta{}, errors.New("invalid game metadata checksum")
+		}
+	}
+	if err := meta.Config.Validate(); err != nil {
+		return Meta{}, fmt.Errorf("invalid stored config: %w", err)
+	}
+	meta.Scenario = cloneSnapshot(meta.Scenario)
+	return meta, nil
 }
 
 func (l *Log) Meta() Meta {
@@ -188,6 +230,9 @@ func cloneSnapshot(snapshot *scenario.Snapshot) *scenario.Snapshot {
 }
 
 func (l *Log) Append(record Record) (Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if (record.Schema != SchemaVersion && record.Schema != l.meta.Schema) || record.Command.ID == "" || record.Version != l.nextVersion {
 		return Record{}, errors.New("invalid event record")
 	}
@@ -230,22 +275,27 @@ func (l *Log) Append(record Record) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return Record{}, err
+	operationErr := l.verifyActiveFile(f, l.eventsSize, false)
+	if operationErr == nil && (lineBytes > maxEventsBytes || l.eventsSize > maxEventsBytes-lineBytes) {
+		operationErr = fmt.Errorf("event log exceeds %d-byte limit", maxEventsBytes)
 	}
-	if lineBytes > maxEventsBytes || info.Size() > maxEventsBytes-lineBytes {
-		return Record{}, fmt.Errorf("event log exceeds %d-byte limit", maxEventsBytes)
+	if operationErr == nil {
+		operationErr = writeChecked(f, append(data, '\n'))
 	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return Record{}, err
+	if operationErr == nil {
+		operationErr = f.Sync()
 	}
-	if err := f.Sync(); err != nil {
-		return Record{}, err
+	newSize := l.eventsSize + lineBytes
+	if operationErr == nil {
+		operationErr = l.verifyActiveFile(f, newSize, false)
+	}
+	closeErr := f.Close()
+	if operationErr != nil || closeErr != nil {
+		return Record{}, errors.Join(operationErr, wrapCloseError("event log", closeErr))
 	}
 	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
 	l.commandIDs[record.Command.ID] = struct{}{}
+	l.eventsSize = newSize
 	return record, nil
 }
 
@@ -254,8 +304,23 @@ func (l *Log) Path() string { return l.dir }
 // Sync establishes a fresh durability barrier for all files and directory
 // entries needed to discover and replay this game after a crash.
 func (l *Log) Sync() error {
-	if err := syncFile(filepath.Join(l.dir, "events.jsonl")); err != nil {
-		return fmt.Errorf("sync events file: %w", err)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	f, err := os.Open(filepath.Join(l.dir, "events.jsonl"))
+	if err != nil {
+		return fmt.Errorf("open events file: %w", err)
+	}
+	operationErr := l.verifyActiveFile(f, l.eventsSize, false)
+	if operationErr == nil {
+		operationErr = f.Sync()
+	}
+	if operationErr == nil {
+		operationErr = l.verifyActiveFile(f, l.eventsSize, false)
+	}
+	closeErr := f.Close()
+	if operationErr != nil || closeErr != nil {
+		return fmt.Errorf("sync events file: %w", errors.Join(operationErr, wrapCloseError("event log", closeErr)))
 	}
 	if err := syncDir(l.dir); err != nil {
 		return fmt.Errorf("sync game directory: %w", err)
@@ -266,53 +331,114 @@ func (l *Log) Sync() error {
 	return nil
 }
 
-func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Record, error) {
-	data, err := readFileBounded(path, "event log", maxEventsBytes)
+// Recover validates the active log through its original file identity. It
+// retains complete valid records from an uncertain append and removes any
+// malformed or partial suffix without accepting rollback or replacement.
+// The returned slice contains every retained record, not only recovered ones.
+func (l *Log) Recover() ([]Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	path := filepath.Join(l.dir, "events.jsonl")
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	operationErr := l.verifyActiveFile(f, l.eventsSize, true)
+	var records []Record
+	var finalInfo os.FileInfo
+	var finalSize int64
+	if operationErr == nil {
+		info, statErr := f.Stat()
+		if statErr != nil {
+			operationErr = statErr
+		} else {
+			data, readErr := readFileAtSize(f, info.Size(), "event log", maxEventsBytes)
+			if readErr != nil {
+				operationErr = readErr
+			} else {
+				records, finalSize, operationErr = l.recoverData(f, data)
+			}
+		}
+	}
+	if operationErr == nil {
+		operationErr = f.Sync()
+	}
+	if operationErr == nil {
+		operationErr = l.verifyActiveFile(f, finalSize, false)
+	}
+	if operationErr == nil {
+		finalInfo, operationErr = f.Stat()
+	}
+	closeErr := f.Close()
+	if operationErr != nil || closeErr != nil {
+		return nil, errors.Join(operationErr, wrapCloseError("event log", closeErr))
+	}
+
+	l.lastChecksum = ""
+	l.nextVersion = uint64(len(records) + 1)
+	l.commandIDs = make(map[string]struct{}, len(records)+1)
+	l.commandIDs[l.meta.CreateCommandID] = struct{}{}
+	if len(records) > 0 {
+		l.lastChecksum = records[len(records)-1].Checksum
+	}
+	for _, record := range records {
+		l.commandIDs[record.Command.ID] = struct{}{}
+	}
+	l.eventsInfo = finalInfo
+	l.eventsSize = finalSize
+	return records, nil
+}
+
+func loadRecords(f *os.File, schema int, expectedMetadataChecksum string) ([]Record, os.FileInfo, int64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	data, err := readFileAtSize(f, info.Size(), "event log", maxEventsBytes)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		size := int64(bytes.LastIndexByte(data, '\n') + 1)
+		if err := f.Truncate(size); err != nil {
+			return nil, nil, 0, err
+		}
+		if err := f.Sync(); err != nil {
+			return nil, nil, 0, err
+		}
+		data = data[:size]
+	}
+	records, err := parseRecords(data, schema, expectedMetadataChecksum)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	finalInfo, err := f.Stat()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if !os.SameFile(info, finalInfo) || finalInfo.Size() != int64(len(data)) {
+		return nil, nil, 0, errors.New("event log identity or size changed while reading")
+	}
+	return records, finalInfo, finalInfo.Size(), nil
+}
+
+func parseRecords(data []byte, schema int, expectedMetadataChecksum string) ([]Record, error) {
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
 	previousChecksum := ""
 	commandIDs := make(map[string]struct{})
 	for i, line := range lines {
-		rawLine := line
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
-		// A complete append is newline-terminated before it is synced. Do not
-		// treat an unterminated final line as committed: it may be a torn write.
-		if i == len(lines)-1 && !bytes.HasSuffix(data, []byte("\n")) {
-			if err := truncateAndSync(path, int64(len(data)-len(rawLine))); err != nil {
-				return nil, err
-			}
-			break
-		}
 		var record Record
 		if err := decodeStrictJSON(line, &record); err != nil {
-			// A power loss may leave only the final append partial. It was never
-			// fsynced as a complete record, so replay ignores that trailing data.
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
 		}
-		if record.Schema != schema || record.Version != uint64(len(records)+1) || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
-			return nil, fmt.Errorf("invalid event record %d", i+1)
-		}
-		switch schema {
-		case schema1:
-		case schema2, SchemaVersion:
-			if record.MetadataChecksum != expectedMetadataChecksum {
-				return nil, fmt.Errorf("event record %d is bound to different metadata", i+1)
-			}
-		default:
-			return nil, fmt.Errorf("unsupported event record schema %d", schema)
-		}
-		if _, exists := commandIDs[record.Command.ID]; exists {
-			return nil, fmt.Errorf("duplicate event command id at record %d", i+1)
-		}
-		checksum, err := recordChecksum(record)
-		if err != nil || record.Checksum == "" || record.Checksum != checksum {
-			return nil, fmt.Errorf("invalid event record checksum %d", i+1)
+		if err := validateRecord(record, schema, expectedMetadataChecksum, uint64(len(records)+1), previousChecksum, commandIDs); err != nil {
+			return nil, fmt.Errorf("event record %d: %w", i+1, err)
 		}
 		records = append(records, record)
 		previousChecksum = record.Checksum
@@ -321,25 +447,175 @@ func loadRecords(path string, schema int, expectedMetadataChecksum string) ([]Re
 	return records, nil
 }
 
+func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
+	if int64(len(data)) < l.eventsSize {
+		return nil, 0, errors.New("event log was truncated below acknowledged size")
+	}
+	prefix := data[:int(l.eventsSize)]
+	if len(prefix) > 0 && prefix[len(prefix)-1] != '\n' {
+		return nil, 0, errors.New("acknowledged event log boundary is not newline-terminated")
+	}
+	records, err := parseRecords(prefix, l.meta.Schema, l.meta.Checksum)
+	if err != nil {
+		return nil, 0, fmt.Errorf("validate acknowledged event log prefix: %w", err)
+	}
+	if !l.matchesAcknowledgedRecords(records) {
+		return nil, 0, errors.New("acknowledged event log prefix does not match active state")
+	}
+
+	commandIDs := make(map[string]struct{}, len(l.commandIDs))
+	for id := range l.commandIDs {
+		commandIDs[id] = struct{}{}
+	}
+	previousChecksum := l.lastChecksum
+	nextVersion := l.nextVersion
+	validSize := l.eventsSize
+	suffix := data[int(l.eventsSize):]
+	for offset := 0; offset < len(suffix); {
+		newline := bytes.IndexByte(suffix[offset:], '\n')
+		if newline < 0 {
+			break
+		}
+		lineEnd := offset + newline
+		line := bytes.TrimSpace(suffix[offset:lineEnd])
+		if len(line) == 0 {
+			break
+		}
+		var record Record
+		if err := decodeStrictJSON(line, &record); err != nil {
+			break
+		}
+		if err := validateRecord(record, l.meta.Schema, l.meta.Checksum, nextVersion, previousChecksum, commandIDs); err != nil {
+			break
+		}
+		records = append(records, record)
+		commandIDs[record.Command.ID] = struct{}{}
+		previousChecksum = record.Checksum
+		nextVersion++
+		offset = lineEnd + 1
+		validSize = l.eventsSize + int64(offset)
+	}
+	if validSize != int64(len(data)) {
+		if err := f.Truncate(validSize); err != nil {
+			return nil, 0, fmt.Errorf("truncate uncertain event log suffix: %w", err)
+		}
+	}
+	return records, validSize, nil
+}
+
+func (l *Log) matchesAcknowledgedRecords(records []Record) bool {
+	if l.nextVersion != uint64(len(records)+1) {
+		return false
+	}
+	lastChecksum := ""
+	if len(records) > 0 {
+		lastChecksum = records[len(records)-1].Checksum
+	}
+	if l.lastChecksum != lastChecksum {
+		return false
+	}
+	commandIDs := make(map[string]struct{}, len(records)+1)
+	commandIDs[l.meta.CreateCommandID] = struct{}{}
+	for _, record := range records {
+		commandIDs[record.Command.ID] = struct{}{}
+	}
+	if len(commandIDs) != len(l.commandIDs) {
+		return false
+	}
+	for id := range commandIDs {
+		if _, ok := l.commandIDs[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validateRecord(record Record, schema int, expectedMetadataChecksum string, version uint64, previousChecksum string, commandIDs map[string]struct{}) error {
+	if record.Schema != schema || record.Version != version || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
+		return errors.New("invalid event record")
+	}
+	switch schema {
+	case schema1:
+	case schema2, SchemaVersion:
+		if record.MetadataChecksum != expectedMetadataChecksum {
+			return errors.New("record is bound to different metadata")
+		}
+	default:
+		return fmt.Errorf("unsupported event record schema %d", schema)
+	}
+	if _, exists := commandIDs[record.Command.ID]; exists {
+		return errors.New("duplicate event command id")
+	}
+	checksum, err := recordChecksum(record)
+	if err != nil || record.Checksum == "" || record.Checksum != checksum {
+		return errors.New("invalid event record checksum")
+	}
+	return nil
+}
+
+func (l *Log) verifyActiveFile(f *os.File, size int64, allowExtension bool) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if l.eventsInfo == nil || !os.SameFile(l.eventsInfo, info) {
+		return errors.New("event log file identity changed")
+	}
+	if (allowExtension && info.Size() < size) || (!allowExtension && info.Size() != size) {
+		return fmt.Errorf("event log size changed: got %d, acknowledged %d", info.Size(), size)
+	}
+	pathInfo, err := os.Stat(filepath.Join(l.dir, "events.jsonl"))
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, pathInfo) {
+		return errors.New("event log path identity changed")
+	}
+	if pathInfo.Size() != info.Size() {
+		return errors.New("event log size changed during verification")
+	}
+	return nil
+}
+
+func readFileAtSize(f *os.File, size int64, description string, maxBytes int64) ([]byte, error) {
+	if size > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes)
+	}
+	data := make([]byte, size)
+	if size == 0 {
+		return data, nil
+	}
+	n, err := f.ReadAt(data, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if int64(n) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
 func readFileBounded(path, description string, maxBytes int64) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, closeFile(f, err)
 	}
 	if info.Size() > maxBytes {
-		return nil, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes)
+		return nil, closeFile(f, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes))
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, closeFile(f, err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes)
+		return nil, closeFile(f, fmt.Errorf("%s exceeds %d-byte limit", description, maxBytes))
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", description, err)
 	}
 	return data, nil
 }
@@ -420,31 +696,17 @@ func consumeJSONValue(decoder *json.Decoder) error {
 	return err
 }
 
-func truncateAndSync(path string, size int64) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := f.Truncate(size); err != nil {
-		return err
-	}
-	return f.Sync()
-}
-
 func writeAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
+	if err := writeChecked(f, data); err != nil {
+		return closeFile(f, err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+		return closeFile(f, err)
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -510,15 +772,62 @@ func syncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	return errors.Join(syncErr, wrapCloseError("directory", closeErr))
 }
 
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
+func mkdirAllDurable(path string, perm os.FileMode) error {
+	path = filepath.Clean(path)
+	missing := make([]string, 0)
+	for current := path; ; current = filepath.Dir(current) {
+		if _, err := os.Lstat(current); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return os.ErrNotExist
+		}
+	}
+	if err := os.MkdirAll(path, perm); err != nil {
 		return err
 	}
-	defer f.Close()
-	return f.Sync()
+	// Sync deepest parents first so every new child entry is durable before
+	// the entry that makes its parent reachable.
+	for _, created := range missing {
+		if err := syncDirBestEffort(filepath.Dir(created)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncDirBestEffort(path string) error {
+	err := syncDir(path)
+	if err != nil && (runtime.GOOS == "windows" || errors.Is(err, os.ErrInvalid)) {
+		return nil
+	}
+	return err
+}
+
+func writeChecked(f *os.File, data []byte) error {
+	n, err := f.Write(data)
+	if n != len(data) {
+		err = errors.Join(err, io.ErrShortWrite)
+	}
+	return err
+}
+
+func closeFile(f *os.File, operationErr error) error {
+	return errors.Join(operationErr, wrapCloseError(f.Name(), f.Close()))
+}
+
+func wrapCloseError(description string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close %s: %w", description, err)
 }
