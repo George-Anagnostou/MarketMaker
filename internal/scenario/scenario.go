@@ -58,6 +58,10 @@ type Recap struct {
 	AdverseSelectionTurns int                `json:"adverse_selection_turns,omitempty"`
 	Scorecard             *Scorecard         `json:"scorecard,omitempty"`
 	EndReason             exchange.EndReason `json:"end_reason"`
+	InformedOrders        int                `json:"informed_orders,omitempty"`
+	InformedOrdersFilled  int                `json:"informed_orders_filled,omitempty"`
+	InformedUnitsTraded   fixed.Qty          `json:"informed_units_traded,omitempty"`
+	InformedFlowPnL       fixed.Money        `json:"informed_flow_pnl,omitempty"`
 }
 
 type Scorecard struct {
@@ -112,6 +116,21 @@ var catalog = []Definition{
 		ScorecardKind: "adverse_selection_turns",
 		Config:        config(8, 303, -300, 425, 4, 12),
 	},
+	{
+		ID: "volatility-shock-v2", Revision: "1", Title: "Volatility Shock: Informed Flow",
+		Briefing:  "Some customers know the next mark move's direction, but not its magnitude. An informed buy can take your ask before a rise and an informed sell can hit your bid before a fall, yet either customer can still overpay when your quote exceeds the move.",
+		Objective: "Protect the desk from informed flow while distinguishing execution edge, inventory mark P&L, storage, and total P&L.",
+		Tutorial: []TutorialStep{
+			{Title: "Recognize informed direction", Body: "An informed customer knows whether the next mark will rise or fall, not how large that move will be. A buy from your ask comes before a rise and a sell into your bid comes before a fall, but a sufficiently protective quote can make even a directionally informed customer overpay."},
+			{Title: "Quote to deny the edge", Body: "A wider spread can keep an informed customer's limit from reaching you. Skew can protect one side specifically: raise the ask to resist informed buys before rises, or lower the bid to resist informed sells before falls."},
+			{Title: "Measure the informed fill", Body: "Informed-flow P&L marks only your fills with informed customers at the new mark. A negative result is value conceded, zero means the fill price matched the new mark, and a positive result means the customer knew the direction but overpaid relative to the move's magnitude."},
+			{Title: "Keep the P&Ls separate", Body: "Execution edge measures fill price versus the opening mark. Inventory mark P&L measures the mark move on the position you carry, storage is the cost of carrying it, and total P&L combines those distinct components."},
+			{Title: "Use avoided flow as evidence", Body: "An informed order that does not fill your quote is a useful outcome, not a missed obligation. Compare wide and skewed quotes to learn which protection denies informed customers an edge without eliminating all ordinary flow."},
+		},
+		Reflection:    "Identify an informed buy or sell, explain why knowing direction did not guarantee knowing magnitude, and compare execution edge, inventory mark P&L, storage, informed-flow P&L, and total P&L before choosing a wider or skewed quote.",
+		ScorecardKind: "informed_flow_pnl",
+		Config:        informedConfig(8, 1, -300, 425, 4, 12, 6_000),
+	},
 }
 
 func config(turns int, seed uint64, minMove, maxMove int64, maxOrders int, maxQty int64) exchange.Config {
@@ -121,6 +140,13 @@ func config(turns int, seed uint64, minMove, maxMove int64, maxOrders int, maxQt
 		MaxPosition: fixed.Qty(10_000_000), MaxOrdersPerTurn: maxOrders, MaxOrderQty: fixed.Qty(maxQty * 10_000),
 		MaxFlowSlippageBps: 200, MinMoveBps: minMove, MaxMoveBps: maxMove, Seed: seed,
 	}
+}
+
+func informedConfig(turns int, seed uint64, minMove, maxMove int64, maxOrders int, maxQty, informedFlowBps int64) exchange.Config {
+	cfg := config(turns, seed, minMove, maxMove, maxOrders, maxQty)
+	cfg.SimulationVersion = exchange.SimulationVersionAdverseSelection
+	cfg.InformedFlowBps = informedFlowBps
+	return cfg
 }
 
 func List() []Snapshot {
@@ -135,6 +161,7 @@ func List() []Snapshot {
 func Get(id string) (Definition, bool) {
 	for _, definition := range catalog {
 		if definition.ID == id {
+			definition.Tutorial = cloneTutorial(definition.Tutorial)
 			return definition, true
 		}
 	}
@@ -142,8 +169,11 @@ func Get(id string) (Definition, bool) {
 }
 
 func (d Definition) Snapshot() Snapshot {
-	tutorial := append([]TutorialStep(nil), d.Tutorial...)
-	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: tutorial, Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns}
+	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: cloneTutorial(d.Tutorial), Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns}
+}
+
+func cloneTutorial(tutorial []TutorialStep) []TutorialStep {
+	return append([]TutorialStep(nil), tutorial...)
 }
 
 func ValidateCatalog() error {
@@ -175,11 +205,17 @@ func ValidateCatalog() error {
 }
 
 func Coach(snapshot Snapshot, before exchange.State, result exchange.Result) *Coaching {
+	if result.State.IsOver && result.State.Reason == exchange.PlayerQuit {
+		return &Coaching{Code: "player-quit", Title: "Session ended", Body: "You ended the session. Review the prior turns to assess your fills, inventory, quote protection, and P&L."}
+	}
 	if snapshot.ID == "inventory-pressure-v1" {
 		return coachInventoryPressure(before, result)
 	}
 	if snapshot.ID == "volatility-shock-v1" {
 		return coachVolatilityShock(before, result)
+	}
+	if snapshot.ID == "volatility-shock-v2" {
+		return coachInformedFlow(result)
 	}
 	return coachGeneral(before, result)
 }
@@ -189,7 +225,7 @@ func coachGeneral(before exchange.State, result exchange.Result) *Coaching {
 	if after.IsOver {
 		return &Coaching{Code: "terminal", Title: "Session complete", Body: "The scenario is over. Review the turns where inventory and the reference mark changed the outcome."}
 	}
-	if abs(after.Position) > abs(before.Position) && abs(after.Position) > 0 {
+	if hasGreaterMagnitude(after.Position, before.Position) && after.Position != 0 {
 		return &Coaching{Code: "inventory-built", Title: "Inventory increased", Body: fmt.Sprintf("You now carry %s units. The next reference-price move matters more than it did before.", after.Position)}
 	}
 	if (before.Position > 0 && after.Mark < before.Mark) || (before.Position < 0 && after.Mark > before.Mark) {
@@ -219,7 +255,7 @@ func coachInventoryPressure(before exchange.State, result exchange.Result) *Coac
 		return &Coaching{Code: "long-skew", Title: "Skew down to reduce a long", Body: fmt.Sprintf("You are long %s units. On the next quote, shift both prices down: the lower ask invites offsetting buys from customers, while the lower bid discourages more buying from you.", after.Position)}
 	}
 	if after.Position < 0 {
-		return &Coaching{Code: "short-skew", Title: "Skew up to reduce a short", Body: fmt.Sprintf("You are short %s units. On the next quote, shift both prices up: the higher bid invites offsetting sells from customers, while the higher ask discourages more selling from you.", abs(after.Position))}
+		return &Coaching{Code: "short-skew", Title: "Skew up to reduce a short", Body: fmt.Sprintf("You are short %s units. On the next quote, shift both prices up: the higher bid invites offsetting sells from customers, while the higher ask discourages more selling from you.", magnitudeString(after.Position))}
 	}
 	if result.Summary.UnitsTraded == 0 {
 		return &Coaching{Code: "pressure-no-fill", Title: "No fill is information", Body: "Your quote did not cross any customer limit. If you are comfortable being flat, tighten by one cent to test for more flow; otherwise keep your protection."}
@@ -250,6 +286,142 @@ func coachVolatilityShock(before exchange.State, result exchange.Result) *Coachi
 	return &Coaching{Code: "shock-flat", Title: "Flat after the shock", Body: "You traded without carrying inventory into the next move. Keep distinguishing spread capture from mark risk before you tighten again."}
 }
 
+func coachInformedFlow(result exchange.Result) *Coaching {
+	informedBuyFill, informedSellFill := false, false
+	informedArrival := result.Summary.InformedOrders > 0
+	informedPlayerFill := result.Summary.InformedOrdersFilled > 0 || result.Summary.InformedUnitsTraded > 0
+	informedPositionDelta := fixed.Qty(0)
+	deltaValid := true
+	for _, event := range result.Events {
+		if event.Order != nil && event.Order.Informed {
+			informedArrival = true
+		}
+		if event.Trade == nil || !event.Trade.Informed {
+			continue
+		}
+		if event.Trade.SellerID == exchange.PlayerAccount {
+			informedArrival = true
+			informedPlayerFill = true
+			informedBuyFill = true
+			if next, err := fixed.SubQty(informedPositionDelta, event.Trade.Quantity); err == nil {
+				informedPositionDelta = next
+			} else {
+				deltaValid = false
+			}
+		}
+		if event.Trade.BuyerID == exchange.PlayerAccount {
+			informedArrival = true
+			informedPlayerFill = true
+			informedSellFill = true
+			if next, err := fixed.AddQty(informedPositionDelta, event.Trade.Quantity); err == nil {
+				informedPositionDelta = next
+			} else {
+				deltaValid = false
+			}
+		}
+	}
+	if informedArrival && !informedPlayerFill {
+		body := fmt.Sprintf("%d informed orders arrived, but none filled your quote. No informed units traded and informed-flow P&L was %s.", result.Summary.InformedOrders, result.Summary.InformedFlowPnL)
+		if result.State.IsOver {
+			body += " That avoided flow is the final informed evidence for this lesson."
+		} else {
+			body += " Keep testing whether width or skew provided the protection."
+		}
+		return &Coaching{Code: "informed-flow-avoided", Title: "Your quote denied the informed flow", Body: body}
+	}
+	if informedPlayerFill {
+		positionWithoutInformed := result.State.Position
+		if deltaValid {
+			if counterfactual, err := fixed.SubQty(result.State.Position, informedPositionDelta); err == nil {
+				positionWithoutInformed = counterfactual
+			}
+		}
+		body := fmt.Sprintf("The informed fills traded %s units and produced %s informed-flow P&L. %s", result.Summary.InformedUnitsTraded, result.Summary.InformedFlowPnL, informedInventoryEffect(positionWithoutInformed, result.State.Position))
+		terminal := result.State.IsOver
+		switch {
+		case informedBuyFill && !informedSellFill && result.Summary.InformedFlowPnL < 0:
+			if terminal {
+				return &Coaching{Code: "informed-buy-filled", Title: "You sold before the rise", Body: body + " The final informed buy knew the direction of the rise, and its negative result records value conceded at the new mark."}
+			}
+			return &Coaching{Code: "informed-buy-filled", Title: "You sold before the rise", Body: body + " The customer knew the direction of the rise, and the negative result records value conceded. A wider spread or higher ask can deny that edge."}
+		case informedBuyFill && !informedSellFill && result.Summary.InformedFlowPnL > 0:
+			if terminal {
+				return &Coaching{Code: "informed-buy-contained", Title: "Your ask contained the informed buy", Body: body + " The final customer knew the mark would rise but not by how much and overpaid relative to the new mark."}
+			}
+			return &Coaching{Code: "informed-buy-contained", Title: "Your ask contained the informed buy", Body: body + " The customer knew the mark would rise but not by how much and overpaid relative to the new mark. Compare that protection with the ordinary flow your quote attracted."}
+		case informedBuyFill && !informedSellFill:
+			if terminal {
+				return &Coaching{Code: "informed-buy-contained", Title: "Your ask contained the informed buy", Body: body + " The final customer's direction was right, but the execution price matched the new mark, leaving no measured informed edge."}
+			}
+			return &Coaching{Code: "informed-buy-contained", Title: "Your ask contained the informed buy", Body: body + " The customer's direction was right, but the execution price matched the new mark, leaving no measured informed edge. Compare that protection with the ordinary flow your quote attracted."}
+		case informedSellFill && !informedBuyFill && result.Summary.InformedFlowPnL < 0:
+			if terminal {
+				return &Coaching{Code: "informed-sell-filled", Title: "You bought before the fall", Body: body + " The final informed sell knew the direction of the fall, and its negative result records value conceded at the new mark."}
+			}
+			return &Coaching{Code: "informed-sell-filled", Title: "You bought before the fall", Body: body + " The customer knew the direction of the fall, and the negative result records value conceded. A wider spread or lower bid can deny that edge."}
+		case informedSellFill && !informedBuyFill && result.Summary.InformedFlowPnL > 0:
+			if terminal {
+				return &Coaching{Code: "informed-sell-contained", Title: "Your bid contained the informed sell", Body: body + " The final customer knew the mark would fall but not by how much and overpaid relative to the new mark."}
+			}
+			return &Coaching{Code: "informed-sell-contained", Title: "Your bid contained the informed sell", Body: body + " The customer knew the mark would fall but not by how much and overpaid relative to the new mark. Compare that protection with the ordinary flow your quote attracted."}
+		case informedSellFill && !informedBuyFill:
+			if terminal {
+				return &Coaching{Code: "informed-sell-contained", Title: "Your bid contained the informed sell", Body: body + " The final customer's direction was right, but the execution price matched the new mark, leaving no measured informed edge."}
+			}
+			return &Coaching{Code: "informed-sell-contained", Title: "Your bid contained the informed sell", Body: body + " The customer's direction was right, but the execution price matched the new mark, leaving no measured informed edge. Compare that protection with the ordinary flow your quote attracted."}
+		default:
+			if terminal {
+				return &Coaching{Code: "informed-flow-result", Title: "Review the informed fills", Body: body + " These mixed informed fills are the final measured informed evidence for the lesson."}
+			}
+			return &Coaching{Code: "informed-flow-result", Title: "Review the informed fills", Body: body + " Use the informed events to separate this measured result from ordinary flow, then judge protection alongside total P&L and matched volume."}
+		}
+	}
+	if result.Summary.UnitsTraded > 0 {
+		body := "Ordinary customer flow traded with your quote. Manage the resulting inventory without labeling an unlucky mark move as adverse selection when there is no measured informed evidence."
+		if result.State.IsOver {
+			body = "Ordinary customer flow traded with your quote on the final turn. No measured informed evidence accompanied that flow."
+		}
+		return &Coaching{Code: "ordinary-flow", Title: "Ordinary flow reached your quote", Body: body}
+	}
+	if result.State.IsOver {
+		return &Coaching{Code: "terminal", Title: "Session complete", Body: "The lesson ended with no customer fill on the final turn. The scorecard separates informed evidence, inventory, execution edge, storage, and total P&L."}
+	}
+	if result.State.Position > 0 {
+		return &Coaching{Code: "protect-long-inventory", Title: "Protect the long inventory", Body: "You are carrying a long position. A lower skew can invite offsetting flow while reducing exposure to another fall."}
+	}
+	if result.State.Position < 0 {
+		return &Coaching{Code: "protect-short-inventory", Title: "Protect the short inventory", Body: "You are carrying a short position. A higher skew can invite offsetting flow while reducing exposure to another rise."}
+	}
+	return &Coaching{Code: "no-fill", Title: "No quote was crossed", Body: "No customer filled your quote this turn. Decide whether the protection is worth keeping before inviting more flow."}
+}
+
+func informedInventoryEffect(before, after fixed.Qty) string {
+	if (before > 0 && after < 0) || (before < 0 && after > 0) {
+		return fmt.Sprintf("They flipped inventory from %s to %s, replacing one directional exposure with the other.", inventoryDescription(before), inventoryDescription(after))
+	}
+	if after == before {
+		return "They did not change net inventory risk."
+	}
+	if after == 0 {
+		return fmt.Sprintf("They flattened the prior %s inventory and reduced directional risk.", inventorySide(before))
+	}
+	if before != 0 && !hasGreaterMagnitude(after, before) {
+		return fmt.Sprintf("They reduced the prior %s inventory from %s to %s units rather than creating more directional risk.", inventorySide(before), magnitudeString(before), magnitudeString(after))
+	}
+	return fmt.Sprintf("They increased inventory risk to %s.", inventoryDescription(after))
+}
+
+func inventoryDescription(position fixed.Qty) string {
+	return fmt.Sprintf("%s %s units", inventorySide(position), magnitudeString(position))
+}
+
+func inventorySide(position fixed.Qty) string {
+	if position < 0 {
+		return "short"
+	}
+	return "long"
+}
+
 func isAdverseSelection(before exchange.State, result exchange.Result) bool {
 	after := result.State
 	return result.Summary.UnitsTraded > 0 && addedRisk(before.Position, after.Position) && ((after.Position > 0 && after.Mark < before.Mark) || (after.Position < 0 && after.Mark > before.Mark))
@@ -262,10 +434,46 @@ func addedRisk(before, after fixed.Qty) bool {
 	if before == 0 || (before > 0 && after < 0) || (before < 0 && after > 0) {
 		return true
 	}
-	return abs(after) > abs(before)
+	return hasGreaterMagnitude(after, before)
+}
+
+func hasGreaterMagnitude(after, before fixed.Qty) bool {
+	afterMagnitude, afterErr := fixed.AbsQtyChecked(after)
+	beforeMagnitude, beforeErr := fixed.AbsQtyChecked(before)
+	if afterErr != nil {
+		return beforeErr == nil
+	}
+	if beforeErr != nil {
+		return false
+	}
+	return afterMagnitude > beforeMagnitude
+}
+
+func magnitudeString(value fixed.Qty) string {
+	magnitude, err := fixed.AbsQtyChecked(value)
+	if err == nil {
+		return magnitude.String()
+	}
+	// Qty.String handles MinInt64 without negating it; remove its sign for prose.
+	return value.String()[1:]
 }
 
 func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Result, final exchange.Result) (*Recap, error) {
+	seenVersions := make(map[uint64]struct{}, len(records)+1)
+	for _, result := range records {
+		if result.State.Version == 0 {
+			continue
+		}
+		if _, exists := seenVersions[result.State.Version]; exists {
+			return nil, errors.New("records contain a duplicate version")
+		}
+		seenVersions[result.State.Version] = struct{}{}
+	}
+	if final.State.Version != 0 {
+		if _, exists := seenVersions[final.State.Version]; exists {
+			return nil, errors.New("final result duplicates a recorded version")
+		}
+	}
 	startingInventoryValue, err := fixed.Notional(cfg.StartingMark, cfg.StartingPosition)
 	if err != nil {
 		return nil, err
@@ -275,17 +483,38 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 		return nil, err
 	}
 	maxInventory, units, storage := fixed.Qty(0), fixed.Qty(0), fixed.Money(0)
+	informedOrders, informedOrdersFilled := 0, 0
+	informedUnits, informedFlowPnL := fixed.Qty(0), fixed.Money(0)
 	adverseSelectionTurns := 0
 	position := cfg.StartingPosition
 	previousMark := cfg.StartingMark
-	includePosition := func(next fixed.Qty) {
-		position = next
-		if abs(position) > maxInventory {
-			maxInventory = abs(position)
+	includePosition := func(next fixed.Qty) error {
+		magnitude, err := fixed.AbsQtyChecked(next)
+		if err != nil {
+			return err
 		}
+		position = next
+		if magnitude > maxInventory {
+			maxInventory = magnitude
+		}
+		return nil
 	}
-	includePosition(position)
+	if err := includePosition(position); err != nil {
+		return nil, err
+	}
 	include := func(result exchange.Result) error {
+		if result.Summary.UnitsTraded < 0 || result.Summary.StorageCost < 0 {
+			return errors.New("units traded and storage cost must be non-negative")
+		}
+		if result.Summary.InformedOrders < 0 || result.Summary.InformedOrdersFilled < 0 || result.Summary.InformedUnitsTraded < 0 {
+			return errors.New("informed metrics must be non-negative")
+		}
+		if result.Summary.InformedOrdersFilled > result.Summary.InformedOrders {
+			return errors.New("informed filled orders exceed informed arrivals")
+		}
+		if result.Summary.InformedUnitsTraded > result.Summary.UnitsTraded {
+			return errors.New("informed units exceed total units traded")
+		}
 		priorPosition := position
 		for _, event := range result.Events {
 			if event.Trade == nil {
@@ -296,20 +525,27 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 				if err != nil {
 					return err
 				}
-				includePosition(next)
+				if err := includePosition(next); err != nil {
+					return err
+				}
 			}
 			if event.Trade.SellerID == exchange.PlayerAccount {
 				next, err := fixed.SubQty(position, event.Trade.Quantity)
 				if err != nil {
 					return err
 				}
-				includePosition(next)
+				if err := includePosition(next); err != nil {
+					return err
+				}
 			}
 		}
-		if abs(result.State.Position) > maxInventory {
-			maxInventory = abs(result.State.Position)
+		stateMagnitude, err := fixed.AbsQtyChecked(result.State.Position)
+		if err != nil {
+			return err
 		}
-		var err error
+		if stateMagnitude > maxInventory {
+			maxInventory = stateMagnitude
+		}
 		units, err = fixed.AddQty(units, result.Summary.UnitsTraded)
 		if err != nil {
 			return err
@@ -318,8 +554,32 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 		if err != nil {
 			return err
 		}
-		if result.Summary.UnitsTraded > 0 && addedRisk(priorPosition, result.State.Position) && ((result.State.Position > 0 && result.State.Mark < previousMark) || (result.State.Position < 0 && result.State.Mark > previousMark)) {
-			adverseSelectionTurns++
+		informedOrders, err = addInt(informedOrders, result.Summary.InformedOrders)
+		if err != nil {
+			return err
+		}
+		informedOrdersFilled, err = addInt(informedOrdersFilled, result.Summary.InformedOrdersFilled)
+		if err != nil {
+			return err
+		}
+		informedUnits, err = fixed.AddQty(informedUnits, result.Summary.InformedUnitsTraded)
+		if err != nil {
+			return err
+		}
+		informedFlowPnL, err = fixed.AddMoney(informedFlowPnL, result.Summary.InformedFlowPnL)
+		if err != nil {
+			return err
+		}
+		if snapshot.ID == "volatility-shock-v2" && result.Summary.InformedOrdersFilled > 0 && result.Summary.InformedFlowPnL < 0 {
+			adverseSelectionTurns, err = addInt(adverseSelectionTurns, 1)
+			if err != nil {
+				return err
+			}
+		} else if snapshot.ID != "volatility-shock-v2" && result.Summary.UnitsTraded > 0 && addedRisk(priorPosition, result.State.Position) && ((result.State.Position > 0 && result.State.Mark < previousMark) || (result.State.Position < 0 && result.State.Mark > previousMark)) {
+			adverseSelectionTurns, err = addInt(adverseSelectionTurns, 1)
+			if err != nil {
+				return err
+			}
 		}
 		position = result.State.Position
 		previousMark = result.State.Mark
@@ -341,15 +601,26 @@ func BuildRecap(snapshot Snapshot, cfg exchange.Config, records []exchange.Resul
 	if err != nil {
 		return nil, err
 	}
-	pnl, err := fixed.AddMoney(finalEquity, -startEquity)
+	pnl, err := fixed.SubMoney(finalEquity, startEquity)
 	if err != nil {
 		return nil, err
 	}
 	body := fmt.Sprintf("%s You finished with %s P&L, traded %s units, and carried as much as %s units of inventory.", snapshot.Objective, pnl, units, maxInventory)
-	return &Recap{Headline: "Review the desk", Body: body, FinalEquity: finalEquity, TotalPnL: pnl, MaxAbsInventory: maxInventory, UnitsTraded: units, StoragePaid: storage, AdverseSelectionTurns: adverseSelectionTurns, Scorecard: buildScorecard(snapshot, units, maxInventory, adverseSelectionTurns), EndReason: final.State.Reason}, nil
+	recap := &Recap{Headline: "Review the desk", Body: body, FinalEquity: finalEquity, TotalPnL: pnl, MaxAbsInventory: maxInventory, UnitsTraded: units, StoragePaid: storage, AdverseSelectionTurns: adverseSelectionTurns, EndReason: final.State.Reason, InformedOrders: informedOrders, InformedOrdersFilled: informedOrdersFilled, InformedUnitsTraded: informedUnits, InformedFlowPnL: informedFlowPnL}
+	recap.Scorecard = buildScorecard(snapshot, recap)
+	return recap, nil
 }
 
-func buildScorecard(snapshot Snapshot, units, maxInventory fixed.Qty, adverseSelectionTurns int) *Scorecard {
+func addInt(a, b int) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if (b > 0 && a > maxInt-b) || (b < 0 && a < minInt-b) {
+		return 0, errors.New("integer overflows range")
+	}
+	return a + b, nil
+}
+
+func buildScorecard(snapshot Snapshot, recap *Recap) *Scorecard {
 	scorecard := &Scorecard{Reflection: snapshot.Reflection}
 	if scorecard.Reflection == "" {
 		scorecard.Reflection = legacyReflection(snapshot.ID)
@@ -361,16 +632,20 @@ func buildScorecard(snapshot Snapshot, units, maxInventory fixed.Qty, adverseSel
 	switch kind {
 	case "matched_volume":
 		scorecard.FocusLabel = "Matched volume"
-		scorecard.FocusValue = units.String()
+		scorecard.FocusValue = recap.UnitsTraded.String()
 		scorecard.FocusNote = "Units matched by customer flow. More volume is useful only when the inventory it creates remains manageable."
 	case "peak_inventory":
 		scorecard.FocusLabel = "Peak inventory"
-		scorecard.FocusValue = maxInventory.String()
+		scorecard.FocusValue = recap.MaxAbsInventory.String()
 		scorecard.FocusNote = "Largest position carried during the lesson. Review whether your skew reduced it after the larger clips arrived."
 	case "adverse_selection_turns":
 		scorecard.FocusLabel = "Adverse selection turns"
-		scorecard.FocusValue = fmt.Sprintf("%d", adverseSelectionTurns)
+		scorecard.FocusValue = fmt.Sprintf("%d", recap.AdverseSelectionTurns)
 		scorecard.FocusNote = "Turns where customer flow left inventory exposed to a mark move against it. Protection matters more than chasing the next fill."
+	case "informed_flow_pnl":
+		scorecard.FocusLabel = "Informed-flow P&L"
+		scorecard.FocusValue = recap.InformedFlowPnL.String()
+		scorecard.FocusNote = fmt.Sprintf("%d informed orders arrived; %d filled your quote for %s units. More negative informed-flow P&L means more value conceded; read it alongside total P&L and matched volume, because refusing every trade is not profitable market making.", recap.InformedOrders, recap.InformedOrdersFilled, recap.InformedUnitsTraded)
 	default:
 		return nil
 	}
@@ -385,6 +660,8 @@ func legacyScorecardKind(scenarioID string) string {
 		return "peak_inventory"
 	case "volatility-shock-v1":
 		return "adverse_selection_turns"
+	case "volatility-shock-v2":
+		return "informed_flow_pnl"
 	default:
 		return ""
 	}
@@ -398,14 +675,9 @@ func legacyReflection(scenarioID string) string {
 		return "Identify your largest inventory, the quote skew you used to reduce it, and whether that protected the desk without giving away too much spread."
 	case "volatility-shock-v1":
 		return "Identify the adverse fill-and-mark sequence, then explain how you widened or skewed the next quote to protect the desk."
+	case "volatility-shock-v2":
+		return "Identify the informed fills, measure the value conceded, and explain how quote width or skew could have denied that edge."
 	default:
 		return "Review the risk carried and the quote adjustment used to manage it."
 	}
-}
-
-func abs(value fixed.Qty) fixed.Qty {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

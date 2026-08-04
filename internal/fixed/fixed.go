@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"strconv"
 	"strings"
 )
@@ -87,7 +88,35 @@ func AddQty(a, b Qty) (Qty, error) {
 	return a + b, nil
 }
 
-func SubQty(a, b Qty) (Qty, error) { return AddQty(a, -b) }
+// NegMoney returns the additive inverse of v when it is representable.
+func NegMoney(v Money) (Money, error) {
+	if v == Money(math.MinInt64) {
+		return 0, errors.New("money negation overflows range")
+	}
+	return -v, nil
+}
+
+// NegQty returns the additive inverse of v when it is representable.
+func NegQty(v Qty) (Qty, error) {
+	if v == Qty(math.MinInt64) {
+		return 0, errors.New("quantity negation overflows range")
+	}
+	return -v, nil
+}
+
+func SubMoney(a, b Money) (Money, error) {
+	if (b > 0 && a < Money(math.MinInt64)+b) || (b < 0 && a > Money(math.MaxInt64)+b) {
+		return 0, errors.New("money overflows range")
+	}
+	return a - b, nil
+}
+
+func SubQty(a, b Qty) (Qty, error) {
+	if (b > 0 && a < Qty(math.MinInt64)+b) || (b < 0 && a > Qty(math.MaxInt64)+b) {
+		return 0, errors.New("quantity overflows range")
+	}
+	return a - b, nil
+}
 
 // ScaleMoney returns amount * numerator / denominator without overflowing the
 // intermediate product. It truncates toward zero, matching integer settlement.
@@ -95,17 +124,11 @@ func ScaleMoney(amount Money, numerator, denominator int64) (Money, error) {
 	if denominator <= 0 || numerator < 0 {
 		return 0, errors.New("invalid money scale")
 	}
-	if numerator == 0 {
-		return 0, nil
-	}
-	quotient, remainder := int64(amount)/denominator, int64(amount)%denominator
-	if quotient != 0 && (quotient > math.MaxInt64/numerator || quotient < math.MinInt64/numerator) {
+	result, ok := scaleInt64(int64(amount), numerator, denominator)
+	if !ok {
 		return 0, errors.New("money scale overflows range")
 	}
-	if remainder != 0 && (remainder > math.MaxInt64/numerator || remainder < math.MinInt64/numerator) {
-		return 0, errors.New("money scale overflows range")
-	}
-	return Money(quotient*numerator + remainder*numerator/denominator), nil
+	return Money(result), nil
 }
 
 // ScalePrice returns price * numerator / denominator without an overflowing
@@ -114,24 +137,58 @@ func ScalePrice(price Price, numerator, denominator int64) (Price, error) {
 	if denominator <= 0 || numerator < 0 {
 		return 0, errors.New("invalid price scale")
 	}
-	if numerator == 0 {
-		return 0, nil
-	}
-	quotient, remainder := int64(price)/denominator, int64(price)%denominator
-	if quotient != 0 && (quotient > math.MaxInt64/numerator || quotient < math.MinInt64/numerator) {
+	result, ok := scaleInt64(int64(price), numerator, denominator)
+	if !ok {
 		return 0, errors.New("price scale overflows range")
 	}
-	if remainder != 0 && (remainder > math.MaxInt64/numerator || remainder < math.MinInt64/numerator) {
-		return 0, errors.New("price scale overflows range")
-	}
-	return Price(quotient*numerator + remainder*numerator/denominator), nil
+	return Price(result), nil
 }
 
-func AbsQty(v Qty) Qty {
-	if v < 0 {
-		return -v
+func scaleInt64(value, numerator, denominator int64) (int64, bool) {
+	negative := value < 0
+	magnitude := uint64(value)
+	if negative {
+		magnitude = uint64(-(value + 1)) + 1
 	}
-	return v
+
+	hi, lo := bits.Mul64(magnitude, uint64(numerator))
+	unsignedDenominator := uint64(denominator)
+	if hi >= unsignedDenominator {
+		return 0, false
+	}
+	quotient, _ := bits.Div64(hi, lo, unsignedDenominator)
+	limit := uint64(math.MaxInt64)
+	if negative {
+		limit++
+	}
+	if quotient > limit {
+		return 0, false
+	}
+	if negative {
+		if quotient == uint64(math.MaxInt64)+1 {
+			return math.MinInt64, true
+		}
+		return -int64(quotient), true
+	}
+	return int64(quotient), true
+}
+
+// AbsQtyChecked returns the magnitude of v when it is representable as a Qty.
+func AbsQtyChecked(v Qty) (Qty, error) {
+	if v < 0 {
+		return NegQty(v)
+	}
+	return v, nil
+}
+
+// AbsQty returns the magnitude of v. Call AbsQtyChecked when the input can be
+// untrusted; the magnitude of MinInt64 cannot be represented as a Qty.
+func AbsQty(v Qty) Qty {
+	abs, err := AbsQtyChecked(v)
+	if err != nil {
+		panic(err)
+	}
+	return abs
 }
 
 func parse(s string, scale int64) (int64, error) {
@@ -148,8 +205,8 @@ func parse(s string, scale int64) (int64, error) {
 	if len(parts) > 2 || parts[0] == "" {
 		return 0, fmt.Errorf("invalid decimal %q", s)
 	}
-	whole, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || whole < 0 || whole > math.MaxInt64/scale {
+	whole, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
 		return 0, fmt.Errorf("decimal out of range %q", s)
 	}
 	fraction := ""
@@ -166,18 +223,26 @@ func parse(s string, scale int64) (int64, error) {
 	for len(fraction) < digits {
 		fraction += "0"
 	}
-	frac, err := strconv.ParseInt(fraction, 10, 64)
+	frac, err := strconv.ParseUint(fraction, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid decimal %q", s)
 	}
-	if whole == math.MaxInt64/scale && frac > math.MaxInt64%scale {
+	limit := uint64(math.MaxInt64)
+	if negative {
+		limit++
+	}
+	unsignedScale := uint64(scale)
+	if whole > limit/unsignedScale || (whole == limit/unsignedScale && frac > limit%unsignedScale) {
 		return 0, fmt.Errorf("decimal out of range %q", s)
 	}
-	value := whole*scale + frac
+	magnitude := whole*unsignedScale + frac
 	if negative {
-		value = -value
+		if magnitude == uint64(math.MaxInt64)+1 {
+			return math.MinInt64, nil
+		}
+		return -int64(magnitude), nil
 	}
-	return value, nil
+	return int64(magnitude), nil
 }
 
 func format(value, scale int64) string {

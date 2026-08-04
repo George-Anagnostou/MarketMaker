@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strconv"
@@ -22,6 +23,8 @@ var (
 	storageCost       = flag.String("storage", "1", "storage cost per unit per turn")
 	seed              = flag.Uint64("seed", 42, "non-zero deterministic scenario seed")
 	vol               = flag.String("vol", "-0.5,3", `price movement as "min,max" percent`)
+	simulationVersion = flag.Int("simulation-version", 1, "simulation version (1 = legacy, 2 = adverse-selection)")
+	informedFlowBps   = flag.Int64("informed-flow-bps", 0, "informed customer flow probability in basis points after a mark move (0..10000)")
 )
 
 func main() {
@@ -38,8 +41,8 @@ func main() {
 	}
 
 	fmt.Println("=== Market Maker Exchange ===")
-	fmt.Printf("Scenario seed: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
-	printState(engine.State())
+	fmt.Printf("Scenario seed: %d | simulation version: %d | margin: %.2f%% initial / %.2f%% maintenance\n", cfg.Seed, cfg.SimulationVersion, float64(cfg.InitialMarginBps)/100, float64(cfg.MaintenanceMarginBps)/100)
+	printState(os.Stdout, engine.State())
 	reader := bufio.NewReader(os.Stdin)
 	for !engine.State().IsOver {
 		fmt.Print("Quote bid ask, or q to quit: ")
@@ -55,7 +58,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "quit rejected:", err)
 				return
 			}
-			printResult(result)
+			printResult(os.Stdout, result)
 			break
 		}
 		parts := strings.Fields(line)
@@ -74,7 +77,7 @@ func main() {
 			fmt.Println("Rejected:", err)
 			continue
 		}
-		printResult(result)
+		printResult(os.Stdout, result)
 	}
 }
 
@@ -102,7 +105,7 @@ func configFromFlags() (exchange.Config, error) {
 	if *seed == 0 {
 		return exchange.Config{}, fmt.Errorf("seed must be non-zero; use an explicit seed for replay")
 	}
-	cfg := exchange.Config{Instrument: "SIM", StartingCash: cash, StartingPosition: position, StartingMark: mark, StoragePerUnit: storage, NumTurns: *numTurns, InitialMarginBps: 5000, MaintenanceMarginBps: 2500, MaxPosition: fixed.Qty(10_000_000), MaxOrdersPerTurn: 5, MaxOrderQty: fixed.Qty(100_000), MaxFlowSlippageBps: 200, MinMoveBps: minMove, MaxMoveBps: maxMove, Seed: *seed}
+	cfg := exchange.Config{Instrument: "SIM", StartingCash: cash, StartingPosition: position, StartingMark: mark, StoragePerUnit: storage, NumTurns: *numTurns, InitialMarginBps: 5000, MaintenanceMarginBps: 2500, MaxPosition: fixed.Qty(10_000_000), MaxOrdersPerTurn: 5, MaxOrderQty: fixed.Qty(100_000), MaxFlowSlippageBps: 200, MinMoveBps: minMove, MaxMoveBps: maxMove, Seed: *seed, SimulationVersion: exchange.SimulationVersion(*simulationVersion), InformedFlowBps: *informedFlowBps}
 	return cfg, cfg.Validate()
 }
 
@@ -122,23 +125,57 @@ func parseVol(input string) (int64, int64, error) {
 	return int64(math.Round(min * 100)), int64(math.Round(max * 100)), nil
 }
 
-func printResult(result exchange.Result) {
+func printResult(w io.Writer, result exchange.Result) {
 	for _, event := range result.Events {
 		switch event.Type {
 		case "trade":
-			fmt.Printf("Trade: %s %s @ %s\n", event.Trade.Quantity, event.Trade.Price, event.Trade.BuyerID+" buys")
+			if event.Trade == nil {
+				continue
+			}
+			customer := "a customer"
+			if event.Trade.Informed {
+				customer = "an informed customer"
+			}
+			switch {
+			case event.Trade.BuyerID == exchange.PlayerAccount:
+				fmt.Fprintf(w, "Trade: you bought %s @ $%s from %s\n", event.Trade.Quantity, event.Trade.Price, customer)
+			case event.Trade.SellerID == exchange.PlayerAccount:
+				fmt.Fprintf(w, "Trade: you sold %s @ $%s to %s\n", event.Trade.Quantity, event.Trade.Price, customer)
+			}
 		case "storage_charged":
-			fmt.Printf("Storage charged: $%s\n", event.Amount)
+			fmt.Fprintf(w, "Storage charged: $%s\n", event.Amount)
 		case "mark_updated":
-			fmt.Printf("Reference mark: $%s\n", event.Mark)
+			fmt.Fprintf(w, "Reference mark: $%s\n", event.Mark)
 		case "game_ended":
-			fmt.Println("Game ended:", event.Reason)
+			fmt.Fprintln(w, "Game ended:", event.Reason)
 		}
 	}
-	fmt.Printf("Turn fill cash: $%s | storage: $%s | turn P&L: $%s\n", result.Summary.NetFillCash, result.Summary.StorageCost, result.Summary.TurnPnL)
-	printState(result.State)
+	if attribution := result.Summary.PnLAttribution; attribution != nil {
+		fmt.Fprintln(w, "Turn P&L attribution:")
+		fmt.Fprintf(w, "  Execution edge: %s\n", signedMoney(attribution.ExecutionEdge))
+		fmt.Fprintf(w, "  Inventory mark: %s\n", signedMoney(attribution.InventoryMarkPnL))
+		fmt.Fprintf(w, "  Storage: %s\n", signedMoney(attribution.StoragePnL))
+		fmt.Fprintf(w, "  Total: %s\n", signedMoney(result.Summary.TurnPnL))
+	} else {
+		fmt.Fprintf(w, "Turn fill cash: $%s | storage: $%s | turn P&L: $%s\n", result.Summary.NetFillCash, result.Summary.StorageCost, result.Summary.TurnPnL)
+	}
+	if result.Summary.InformedOrders > 0 || result.Summary.InformedOrdersFilled > 0 || result.Summary.InformedUnitsTraded != 0 || result.Summary.InformedFlowPnL != 0 {
+		fmt.Fprintf(w, "Informed flow: %d arrived | %d filled | %s units | P&L %s\n", result.Summary.InformedOrders, result.Summary.InformedOrdersFilled, result.Summary.InformedUnitsTraded, signedMoney(result.Summary.InformedFlowPnL))
+	}
+	printState(w, result.State)
 }
 
-func printState(state exchange.State) {
-	fmt.Printf("Turn %d | Cash $%s | Position %s | Mark $%s | Equity $%s | Book %s / %s\n", state.Turn, state.Cash, state.Position, state.Mark, state.Equity, state.BestBid, state.BestAsk)
+func signedMoney(amount fixed.Money) string {
+	value := amount.String()
+	if strings.HasPrefix(value, "-") {
+		return "-$" + strings.TrimPrefix(value, "-")
+	}
+	if amount > 0 {
+		return "+$" + value
+	}
+	return "$" + value
+}
+
+func printState(w io.Writer, state exchange.State) {
+	fmt.Fprintf(w, "Turn %d | Cash $%s | Position %s | Mark $%s | Equity $%s | Book %s / %s\n", state.Turn, state.Cash, state.Position, state.Mark, state.Equity, state.BestBid, state.BestAsk)
 }

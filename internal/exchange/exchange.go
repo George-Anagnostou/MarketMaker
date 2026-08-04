@@ -41,22 +41,31 @@ const (
 	PlayerQuit    EndReason = "player_quit"
 )
 
+type SimulationVersion int
+
+const (
+	SimulationVersionLegacy           SimulationVersion = 1
+	SimulationVersionAdverseSelection SimulationVersion = 2
+)
+
 type Config struct {
-	Instrument           string      `json:"instrument"`
-	StartingCash         fixed.Money `json:"starting_cash"`
-	StartingPosition     fixed.Qty   `json:"starting_position"`
-	StartingMark         fixed.Price `json:"starting_mark"`
-	StoragePerUnit       fixed.Price `json:"storage_per_unit"`
-	NumTurns             int         `json:"num_turns"`
-	InitialMarginBps     int64       `json:"initial_margin_bps"`
-	MaintenanceMarginBps int64       `json:"maintenance_margin_bps"`
-	MaxPosition          fixed.Qty   `json:"max_position"`
-	MaxOrdersPerTurn     int         `json:"max_orders_per_turn"`
-	MaxOrderQty          fixed.Qty   `json:"max_order_qty"`
-	MaxFlowSlippageBps   int64       `json:"max_flow_slippage_bps"`
-	MinMoveBps           int64       `json:"min_move_bps"`
-	MaxMoveBps           int64       `json:"max_move_bps"`
-	Seed                 uint64      `json:"seed"`
+	Instrument           string            `json:"instrument"`
+	StartingCash         fixed.Money       `json:"starting_cash"`
+	StartingPosition     fixed.Qty         `json:"starting_position"`
+	StartingMark         fixed.Price       `json:"starting_mark"`
+	StoragePerUnit       fixed.Price       `json:"storage_per_unit"`
+	NumTurns             int               `json:"num_turns"`
+	InitialMarginBps     int64             `json:"initial_margin_bps"`
+	MaintenanceMarginBps int64             `json:"maintenance_margin_bps"`
+	MaxPosition          fixed.Qty         `json:"max_position"`
+	MaxOrdersPerTurn     int               `json:"max_orders_per_turn"`
+	MaxOrderQty          fixed.Qty         `json:"max_order_qty"`
+	MaxFlowSlippageBps   int64             `json:"max_flow_slippage_bps"`
+	MinMoveBps           int64             `json:"min_move_bps"`
+	MaxMoveBps           int64             `json:"max_move_bps"`
+	Seed                 uint64            `json:"seed"`
+	SimulationVersion    SimulationVersion `json:"simulation_version,omitempty"`
+	InformedFlowBps      int64             `json:"informed_flow_bps,omitempty"`
 }
 
 func (c Config) Validate() error {
@@ -81,7 +90,11 @@ func (c Config) Validate() error {
 	if c.MaxPosition <= 0 {
 		return errors.New("max position must be positive")
 	}
-	if fixed.AbsQty(c.StartingPosition) > c.MaxPosition {
+	startingPositionAbs, err := fixed.AbsQtyChecked(c.StartingPosition)
+	if err != nil {
+		return errors.New("starting position exceeds supported range")
+	}
+	if startingPositionAbs > c.MaxPosition {
 		return errors.New("starting position exceeds maximum position")
 	}
 	if c.MaxOrdersPerTurn < 0 || c.MaxOrdersPerTurn > 1_000 || !c.MaxOrderQty.Positive() || c.MaxFlowSlippageBps < 0 || c.MaxFlowSlippageBps > 10_000 {
@@ -104,7 +117,7 @@ func (c Config) Validate() error {
 	if err != nil || startingEquity <= 0 {
 		return errors.New("starting account has non-positive equity")
 	}
-	startingGross, err := fixed.Notional(c.StartingMark, fixed.AbsQty(c.StartingPosition))
+	startingGross, err := fixed.Notional(c.StartingMark, startingPositionAbs)
 	if err != nil {
 		return errors.New("starting exposure exceeds supported range")
 	}
@@ -114,6 +127,18 @@ func (c Config) Validate() error {
 	}
 	if c.Seed == 0 {
 		return errors.New("resolved seed must be non-zero")
+	}
+	switch c.SimulationVersion {
+	case 0, SimulationVersionLegacy:
+		if c.InformedFlowBps != 0 {
+			return errors.New("legacy simulation requires zero informed flow")
+		}
+	case SimulationVersionAdverseSelection:
+		if c.InformedFlowBps < 0 || c.InformedFlowBps > 10_000 {
+			return errors.New("informed flow must be between 0 and 10000 bps")
+		}
+	default:
+		return errors.New("unsupported simulation version")
 	}
 	return nil
 }
@@ -150,6 +175,7 @@ type Order struct {
 	Quantity  fixed.Qty   `json:"quantity"`
 	Remaining fixed.Qty   `json:"remaining"`
 	TIF       TimeInForce `json:"time_in_force"`
+	Informed  bool        `json:"informed,omitempty"`
 }
 
 type Trade struct {
@@ -160,6 +186,7 @@ type Trade struct {
 	Quantity     fixed.Qty   `json:"quantity"`
 	BuyerID      string      `json:"buyer_id"`
 	SellerID     string      `json:"seller_id"`
+	Informed     bool        `json:"informed,omitempty"`
 }
 
 type Event struct {
@@ -174,16 +201,28 @@ type Event struct {
 	Mark          fixed.Price   `json:"mark,omitempty"`
 	Reason        EndReason     `json:"reason,omitempty"`
 	Message       string        `json:"message,omitempty"`
+	PreviousMark  fixed.Price   `json:"previous_mark,omitempty"`
+}
+
+type PnLAttribution struct {
+	ExecutionEdge    fixed.Money `json:"execution_edge"`
+	InventoryMarkPnL fixed.Money `json:"inventory_mark_pnl"`
+	StoragePnL       fixed.Money `json:"storage_pnl"`
 }
 
 type Summary struct {
-	OrdersReceived int         `json:"orders_received"`
-	UnitsTraded    fixed.Qty   `json:"units_traded"`
-	NetFillCash    fixed.Money `json:"net_fill_cash"`
-	StorageCost    fixed.Money `json:"storage_cost"`
-	TurnPnL        fixed.Money `json:"turn_pnl"`
-	BuyVolume      fixed.Qty   `json:"buy_volume"`
-	SellVolume     fixed.Qty   `json:"sell_volume"`
+	OrdersReceived       int             `json:"orders_received"`
+	UnitsTraded          fixed.Qty       `json:"units_traded"`
+	NetFillCash          fixed.Money     `json:"net_fill_cash"`
+	StorageCost          fixed.Money     `json:"storage_cost"`
+	TurnPnL              fixed.Money     `json:"turn_pnl"`
+	BuyVolume            fixed.Qty       `json:"buy_volume"`
+	SellVolume           fixed.Qty       `json:"sell_volume"`
+	PnLAttribution       *PnLAttribution `json:"pnl_attribution,omitempty"`
+	InformedOrders       int             `json:"informed_orders,omitempty"`
+	InformedOrdersFilled int             `json:"informed_orders_filled,omitempty"`
+	InformedUnitsTraded  fixed.Qty       `json:"informed_units_traded,omitempty"`
+	InformedFlowPnL      fixed.Money     `json:"informed_flow_pnl,omitempty"`
 }
 
 type State struct {
@@ -237,20 +276,51 @@ const (
 // Engine owns the authoritative account state and price-time-priority book.
 // It is deliberately single-writer; callers serialize it per game/market.
 type Engine struct {
-	cfg       Config
-	rng       *rand.Rand
-	pcg       *rand.PCG
-	accounts  map[string]*Account
-	book      *orderbook.Book
-	ledger    ledger
-	nextOrder uint64
-	nextTrade uint64
-	nextEvent uint64
-	version   uint64
-	turn      int
-	mark      fixed.Price
-	isOver    bool
-	reason    EndReason
+	cfg         Config
+	rng         *rand.Rand
+	pcg         *rand.PCG
+	flowRNG     splitMix64
+	markRNG     splitMix64
+	informedRNG splitMix64
+	accounts    map[string]*Account
+	book        *orderbook.Book
+	ledger      ledger
+	nextOrder   uint64
+	nextTrade   uint64
+	nextEvent   uint64
+	version     uint64
+	turn        int
+	mark        fixed.Price
+	isOver      bool
+	reason      EndReason
+}
+
+const (
+	flowSeedDomain     uint64 = 0x666c6f772d737472
+	markSeedDomain     uint64 = 0x6d61726b2d737472
+	informedSeedDomain uint64 = 0x696e666f726d6564
+)
+
+type splitMix64 struct {
+	state uint64
+}
+
+func (r *splitMix64) next() uint64 {
+	r.state += 0x9e3779b97f4a7c15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+func (r *splitMix64) bounded(bound uint64) uint64 {
+	threshold := -bound % bound
+	for {
+		value := r.next()
+		if value >= threshold {
+			return value % bound
+		}
+	}
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -258,7 +328,11 @@ func New(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	pcg := rand.NewPCG(cfg.Seed, cfg.Seed>>1)
-	e := &Engine{cfg: cfg, rng: rand.New(pcg), pcg: pcg, accounts: map[string]*Account{}, book: orderbook.New(), ledger: newLedger(), mark: cfg.StartingMark}
+	e := &Engine{
+		cfg: cfg, rng: rand.New(pcg), pcg: pcg,
+		flowRNG: splitMix64{state: cfg.Seed ^ flowSeedDomain}, markRNG: splitMix64{state: cfg.Seed ^ markSeedDomain}, informedRNG: splitMix64{state: cfg.Seed ^ informedSeedDomain},
+		accounts: map[string]*Account{}, book: orderbook.New(), ledger: newLedger(), mark: cfg.StartingMark,
+	}
 	e.accounts[PlayerAccount] = &Account{ID: PlayerAccount, Cash: cfg.StartingCash, Position: cfg.StartingPosition}
 	e.accounts[FlowAccount] = &Account{ID: FlowAccount, External: true}
 	if err := e.postOpening(PlayerAccount, cfg.StartingCash, cfg.StartingPosition); err != nil {
@@ -513,6 +587,13 @@ func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
 }
 
 func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
+	if e.cfg.SimulationVersion == SimulationVersionAdverseSelection {
+		return e.submitQuoteV2(bid, ask)
+	}
+	return e.submitQuoteLegacy(bid, ask)
+}
+
+func (e *Engine) submitQuoteLegacy(bid, ask fixed.Price) (Result, error) {
 	if e.isOver {
 		return Result{State: e.State()}, errors.New("game is over")
 	}
@@ -523,7 +604,10 @@ func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
 	if !e.canPlaceQuotePair(bid, ask, qty) {
 		return Result{State: e.State()}, errors.New("quote would violate cash, position, or initial-margin limits")
 	}
-	before, _ := e.equity(e.accounts[PlayerAccount])
+	before, err := e.equity(e.accounts[PlayerAccount])
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
 	events := e.cancelAccountOrders(PlayerAccount)
 	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
 		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
@@ -543,8 +627,69 @@ func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
 	if err != nil {
 		return Result{State: e.State()}, err
 	}
-	after, _ := e.equity(e.accounts[PlayerAccount])
-	summary.TurnPnL = after - before
+	after, err := e.equity(e.accounts[PlayerAccount])
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	summary.TurnPnL, err = fixed.SubMoney(after, before)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	e.version++
+	return Result{State: e.State(), Summary: summary, Events: events}, nil
+}
+
+func (e *Engine) submitQuoteV2(bid, ask fixed.Price) (Result, error) {
+	if e.isOver {
+		return Result{State: e.State()}, errors.New("game is over")
+	}
+	if !bid.Positive() || !ask.Positive() || bid >= ask {
+		return Result{State: e.State()}, errors.New("bid must be positive and strictly less than ask")
+	}
+	qty := e.cfg.MaxOrderQty
+	if !e.canPlaceQuotePair(bid, ask, qty) {
+		return Result{State: e.State()}, errors.New("quote would violate cash, position, or initial-margin limits")
+	}
+	player := e.accounts[PlayerAccount]
+	before, err := e.equity(player)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	openingMark := e.mark
+	attribution := &PnLAttribution{}
+	events := e.cancelAccountOrders(PlayerAccount)
+	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
+		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
+		trades, lifecycle, err := e.submitBookOrder(order)
+		if err != nil {
+			return Result{State: e.State()}, err
+		}
+		for _, trade := range trades {
+			if err := addExecutionEdge(attribution, trade, openingMark); err != nil {
+				return Result{State: e.State()}, err
+			}
+			events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
+		}
+		events = append(events, e.emitLifecycle(lifecycle)...)
+	}
+	if err := e.reconcileReservations(); err != nil {
+		return Result{State: e.State()}, err
+	}
+	summary, err := e.advanceV2(&events, openingMark, attribution)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	after, err := e.equity(player)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	equityDelta, err := fixed.SubMoney(after, before)
+	if err != nil {
+		return Result{State: e.State()}, err
+	}
+	if summary.TurnPnL != equityDelta {
+		return Result{State: e.State()}, errors.New("turn P&L attribution does not reconcile to equity")
+	}
 	e.version++
 	return Result{State: e.State(), Summary: summary, Events: events}, nil
 }
@@ -577,14 +722,23 @@ func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
 	if err != nil {
 		return false
 	}
-	if fixed.AbsQty(longPosition) > e.cfg.MaxPosition || fixed.AbsQty(shortPosition) > e.cfg.MaxPosition {
+	longPositionAbs, err := fixed.AbsQtyChecked(longPosition)
+	if err != nil || longPositionAbs > e.cfg.MaxPosition {
+		return false
+	}
+	shortPositionAbs, err := fixed.AbsQtyChecked(shortPosition)
+	if err != nil || shortPositionAbs > e.cfg.MaxPosition {
 		return false
 	}
 	equity, err := e.equity(player)
 	if err != nil {
 		return false
 	}
-	positionNotional, err := fixed.Notional(e.mark, fixed.AbsQty(player.Position))
+	positionAbs, err := fixed.AbsQtyChecked(player.Position)
+	if err != nil {
+		return false
+	}
+	positionNotional, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -646,14 +800,23 @@ func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Pric
 	if positionErr != nil {
 		return false
 	}
-	if fixed.AbsQty(longWorst) > e.cfg.MaxPosition || fixed.AbsQty(shortWorst) > e.cfg.MaxPosition {
+	longWorstAbs, err := fixed.AbsQtyChecked(longWorst)
+	if err != nil || longWorstAbs > e.cfg.MaxPosition {
+		return false
+	}
+	shortWorstAbs, err := fixed.AbsQtyChecked(shortWorst)
+	if err != nil || shortWorstAbs > e.cfg.MaxPosition {
 		return false
 	}
 	equity, err := e.equity(account)
 	if err != nil {
 		return false
 	}
-	gross, err := fixed.Notional(e.mark, fixed.AbsQty(account.Position))
+	positionAbs, err := fixed.AbsQtyChecked(account.Position)
+	if err != nil {
+		return false
+	}
+	gross, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -783,14 +946,15 @@ func (e *Engine) accountWithinLimits(accountID string, maintenance bool) bool {
 	if a.External {
 		return true
 	}
-	if fixed.AbsQty(a.Position) > e.cfg.MaxPosition {
+	positionAbs, err := fixed.AbsQtyChecked(a.Position)
+	if err != nil || positionAbs > e.cfg.MaxPosition {
 		return false
 	}
 	eq, err := e.equity(a)
 	if err != nil || eq <= 0 {
 		return false
 	}
-	gross, err := fixed.Notional(e.mark, fixed.AbsQty(a.Position))
+	gross, err := fixed.Notional(e.mark, positionAbs)
 	if err != nil {
 		return false
 	}
@@ -825,16 +989,8 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 			}
 			for _, trade := range trades {
 				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
-				s.UnitsTraded += trade.Quantity
-				if trade.BuyerID == PlayerAccount {
-					s.SellVolume += trade.Quantity
-					n, _ := fixed.Notional(trade.Price, trade.Quantity)
-					s.NetFillCash -= n
-				}
-				if trade.SellerID == PlayerAccount {
-					s.BuyVolume += trade.Quantity
-					n, _ := fixed.Notional(trade.Price, trade.Quantity)
-					s.NetFillCash += n
+				if err := addLegacyFlowTrade(&s, trade); err != nil {
+					return Summary{}, err
 				}
 			}
 			*events = append(*events, e.emitLifecycle(lifecycle)...)
@@ -844,7 +1000,11 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 		}
 	}
 	player := e.accounts[PlayerAccount]
-	storage, err := fixed.Notional(e.cfg.StoragePerUnit, fixed.AbsQty(player.Position))
+	positionAbs, err := fixed.AbsQtyChecked(player.Position)
+	if err != nil {
+		return Summary{}, err
+	}
+	storage, err := fixed.Notional(e.cfg.StoragePerUnit, positionAbs)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -890,6 +1050,298 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 	return s, nil
 }
 
+func (e *Engine) advanceV2(events *[]Event, openingMark fixed.Price, attribution *PnLAttribution) (Summary, error) {
+	s := Summary{PnLAttribution: attribution}
+	nextMark, err := e.nextMarkV2()
+	if err != nil {
+		return Summary{}, err
+	}
+	informedTrades := make([]Trade, 0)
+	if e.cfg.MaxOrdersPerTurn > 0 {
+		n := 1 + int(e.flowRNG.bounded(uint64(e.cfg.MaxOrdersPerTurn)))
+		for range n {
+			s.OrdersReceived++
+			side := Buy
+			if e.flowRNG.bounded(2) == 1 {
+				side = Sell
+			}
+			qty := fixed.Qty(1 + e.flowRNG.bounded(uint64(e.cfg.MaxOrderQty)))
+			slip := int64(e.flowRNG.bounded(uint64(e.cfg.MaxFlowSlippageBps + 1)))
+			informedDraw := e.informedRNG.bounded(10_000)
+			informed := nextMark != openingMark && informedDraw < uint64(e.cfg.InformedFlowBps)
+			if informed {
+				s.InformedOrders++
+				if nextMark > openingMark {
+					side = Buy
+				} else {
+					side = Sell
+				}
+			}
+			price, err := e.flowLimitV2(side, slip)
+			if err != nil {
+				return Summary{}, err
+			}
+			order := e.newOrder(FlowAccount, side, price, qty, IOC)
+			order.Informed = informed
+			*events = append(*events, e.emit(Event{Type: "flow_order", Order: copyOrder(order)}))
+			trades, lifecycle, err := e.submitBookOrder(order)
+			if err != nil {
+				return Summary{}, err
+			}
+			informedPlayerFill := false
+			for _, trade := range trades {
+				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
+				if err := addFlowTrade(&s, trade); err != nil {
+					return Summary{}, err
+				}
+				if err := addExecutionEdge(attribution, trade, openingMark); err != nil {
+					return Summary{}, err
+				}
+				if informed && isPlayerTrade(trade) {
+					informedPlayerFill = true
+					s.InformedUnitsTraded, err = fixed.AddQty(s.InformedUnitsTraded, trade.Quantity)
+					if err != nil {
+						return Summary{}, err
+					}
+					informedTrades = append(informedTrades, trade)
+				}
+			}
+			if informedPlayerFill {
+				s.InformedOrdersFilled++
+			}
+			lifecycleEvents := e.emitLifecycle(lifecycle)
+			markLifecycleOrderInformed(lifecycleEvents, order.ID, informed)
+			*events = append(*events, lifecycleEvents...)
+			if err := e.reconcileReservations(); err != nil {
+				return Summary{}, err
+			}
+		}
+	}
+	player := e.accounts[PlayerAccount]
+	positionAbs, err := fixed.AbsQtyChecked(player.Position)
+	if err != nil {
+		return Summary{}, err
+	}
+	storage, err := fixed.Notional(e.cfg.StoragePerUnit, positionAbs)
+	if err != nil {
+		return Summary{}, err
+	}
+	if storage > 0 {
+		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(PlayerAccount), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
+			return Summary{}, err
+		}
+	}
+	player.Cash, err = fixed.SubMoney(player.Cash, storage)
+	if err != nil {
+		return Summary{}, err
+	}
+	s.StorageCost = storage
+	if storage > 0 {
+		*events = append(*events, e.emit(Event{Type: "storage_charged", Amount: storage}))
+	}
+	e.turn++
+	e.mark = nextMark
+	*events = append(*events, e.emit(Event{Type: "mark_updated", Mark: e.mark, PreviousMark: openingMark, Message: fmt.Sprintf("previous=%s", openingMark)}))
+
+	attribution.InventoryMarkPnL, err = markPnL(player.Position, openingMark, e.mark)
+	if err != nil {
+		return Summary{}, err
+	}
+	attribution.StoragePnL, err = fixed.NegMoney(storage)
+	if err != nil {
+		return Summary{}, err
+	}
+	s.TurnPnL, err = fixed.AddMoney(attribution.ExecutionEdge, attribution.InventoryMarkPnL)
+	if err != nil {
+		return Summary{}, err
+	}
+	s.TurnPnL, err = fixed.AddMoney(s.TurnPnL, attribution.StoragePnL)
+	if err != nil {
+		return Summary{}, err
+	}
+	for _, trade := range informedTrades {
+		pnl, err := playerFillPnL(trade, e.mark)
+		if err != nil {
+			return Summary{}, err
+		}
+		s.InformedFlowPnL, err = fixed.AddMoney(s.InformedFlowPnL, pnl)
+		if err != nil {
+			return Summary{}, err
+		}
+	}
+	if !e.accountWithinLimits(PlayerAccount, true) {
+		e.isOver = true
+		eq, _ := e.equity(player)
+		if eq <= 0 {
+			e.reason = Insolvent
+		} else {
+			e.reason = MarginBreach
+		}
+		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
+	} else if e.cfg.NumTurns > 0 && e.turn >= e.cfg.NumTurns {
+		e.isOver = true
+		e.reason = TurnsComplete
+		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
+	}
+	return s, nil
+}
+
+func (e *Engine) nextMarkV2() (fixed.Price, error) {
+	moveRange := uint64(e.cfg.MaxMoveBps - e.cfg.MinMoveBps + 1)
+	move := e.cfg.MinMoveBps + int64(e.markRNG.bounded(moveRange))
+	nextMark, err := fixed.ScalePrice(e.mark, 10_000+move, 10_000)
+	if err != nil || !nextMark.Positive() {
+		return 0, errors.New("mark movement produced invalid price")
+	}
+	return nextMark, nil
+}
+
+func (e *Engine) flowLimitV2(side Side, slip int64) (fixed.Price, error) {
+	factor := int64(10_000) + slip
+	if side == Sell {
+		factor = 10_000 - slip
+	}
+	p, err := fixed.ScalePrice(e.mark, factor, 10_000)
+	if err != nil {
+		return 0, err
+	}
+	if p < 1 {
+		return 1, nil
+	}
+	return p, nil
+}
+
+func addFlowTrade(summary *Summary, trade Trade) error {
+	if !isPlayerTrade(trade) {
+		return nil
+	}
+	var err error
+	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	notional, err := fixed.Notional(trade.Price, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	if trade.BuyerID == PlayerAccount {
+		summary.SellVolume, err = fixed.AddQty(summary.SellVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.SubMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	if trade.SellerID == PlayerAccount {
+		summary.BuyVolume, err = fixed.AddQty(summary.BuyVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.AddMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addLegacyFlowTrade(summary *Summary, trade Trade) error {
+	var err error
+	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	if trade.BuyerID == PlayerAccount {
+		summary.SellVolume, err = fixed.AddQty(summary.SellVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		notional, err := fixed.Notional(trade.Price, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.SubMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	if trade.SellerID == PlayerAccount {
+		summary.BuyVolume, err = fixed.AddQty(summary.BuyVolume, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		notional, err := fixed.Notional(trade.Price, trade.Quantity)
+		if err != nil {
+			return err
+		}
+		summary.NetFillCash, err = fixed.AddMoney(summary.NetFillCash, notional)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addExecutionEdge(attribution *PnLAttribution, trade Trade, mark fixed.Price) error {
+	pnl, err := playerFillPnL(trade, mark)
+	if err != nil {
+		return err
+	}
+	attribution.ExecutionEdge, err = fixed.AddMoney(attribution.ExecutionEdge, pnl)
+	return err
+}
+
+func playerFillPnL(trade Trade, mark fixed.Price) (fixed.Money, error) {
+	signedQty := fixed.Qty(0)
+	if trade.BuyerID == PlayerAccount {
+		signedQty = trade.Quantity
+	} else if trade.SellerID == PlayerAccount {
+		var err error
+		signedQty, err = fixed.NegQty(trade.Quantity)
+		if err != nil {
+			return 0, err
+		}
+	}
+	markValue, err := fixed.Notional(mark, signedQty)
+	if err != nil {
+		return 0, err
+	}
+	fillValue, err := fixed.Notional(trade.Price, signedQty)
+	if err != nil {
+		return 0, err
+	}
+	return fixed.SubMoney(markValue, fillValue)
+}
+
+func isPlayerTrade(trade Trade) bool {
+	return trade.BuyerID == PlayerAccount || trade.SellerID == PlayerAccount
+}
+
+func markPnL(position fixed.Qty, previous, current fixed.Price) (fixed.Money, error) {
+	currentValue, err := fixed.Notional(current, position)
+	if err != nil {
+		return 0, err
+	}
+	previousValue, err := fixed.Notional(previous, position)
+	if err != nil {
+		return 0, err
+	}
+	return fixed.SubMoney(currentValue, previousValue)
+}
+
+func markLifecycleOrderInformed(events []Event, orderID uint64, informed bool) {
+	if !informed {
+		return
+	}
+	for i := range events {
+		if events[i].Order != nil && events[i].Order.ID == orderID {
+			events[i].Order.Informed = true
+		}
+	}
+}
+
 func (e *Engine) flowLimit(side Side) (fixed.Price, error) {
 	slip := int64(0)
 	if e.cfg.MaxFlowSlippageBps > 0 {
@@ -922,6 +1374,11 @@ func (e *Engine) submitBookOrder(order *Order) ([]Trade, orderbook.Report, error
 	trades, err := e.settleReport(report)
 	if err != nil {
 		return nil, orderbook.Report{}, err
+	}
+	if order.Informed {
+		for i := range trades {
+			trades[i].Informed = true
+		}
 	}
 	return trades, report, nil
 }

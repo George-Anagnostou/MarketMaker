@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +21,7 @@ import (
 
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
+	"market-maker/internal/fixed"
 	"market-maker/internal/scenario"
 )
 
@@ -30,26 +34,67 @@ type exchangeService struct {
 	root           string
 	entries        map[string]*exchangeEntry
 	lookupScenario func(string) (scenario.Definition, bool)
+	syncLog        func(*eventlog.Log) error
 }
 
 type exchangeEntry struct {
-	mu       sync.Mutex
-	engine   *exchange.Engine
-	log      *eventlog.Log
-	commands map[string]eventlog.Record
-	scenario *scenario.Snapshot
-	coaching *scenario.Coaching
-	recap    *scenario.Recap
+	mu            sync.Mutex
+	engine        *exchange.Engine
+	log           *eventlog.Log
+	commands      map[string]eventlog.Record
+	latestTurn    *latestTurn
+	scenario      *scenario.Snapshot
+	coaching      *scenario.Coaching
+	recap         *scenario.Recap
+	storageFailed bool
+	syncLog       func(*eventlog.Log) error
 }
 
 func newExchangeService(root string) *exchangeService {
-	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get}
+	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get, syncLog: syncEventLog}
 }
+
+func syncEventLog(log *eventlog.Log) error { return log.Sync() }
 
 type createExchangeRequest struct {
 	GameID     string `json:"game_id"`
 	CommandID  string `json:"command_id"`
 	ScenarioID string `json:"scenario_id"`
+}
+
+type exchangeCommandRequest struct {
+	ID              string          `json:"id"`
+	Type            string          `json:"type"`
+	ExpectedVersion *uint64         `json:"expected_version"`
+	Bid             json.RawMessage `json:"bid"`
+	Ask             json.RawMessage `json:"ask"`
+}
+
+func (req exchangeCommandRequest) command() (exchange.Command, error) {
+	if req.ExpectedVersion == nil {
+		return exchange.Command{}, errors.New("expected_version is required")
+	}
+	switch req.Type {
+	case exchange.CommandSubmitQuote:
+		if len(req.Bid) == 0 || len(req.Ask) == 0 {
+			return exchange.Command{}, errors.New("submit_quote requires bid and ask")
+		}
+		var bid, ask fixed.Price
+		if err := json.Unmarshal(req.Bid, &bid); err != nil {
+			return exchange.Command{}, fmt.Errorf("invalid bid: %w", err)
+		}
+		if err := json.Unmarshal(req.Ask, &ask); err != nil {
+			return exchange.Command{}, fmt.Errorf("invalid ask: %w", err)
+		}
+		return exchange.Command{ID: req.ID, Type: req.Type, ExpectedVersion: *req.ExpectedVersion, Bid: bid, Ask: ask}, nil
+	case exchange.CommandQuit:
+		if len(req.Bid) != 0 || len(req.Ask) != 0 {
+			return exchange.Command{}, errors.New("quit does not accept bid or ask")
+		}
+		return exchange.Command{ID: req.ID, Type: req.Type, ExpectedVersion: *req.ExpectedVersion}, nil
+	default:
+		return exchange.Command{}, errors.New("unsupported command type")
+	}
 }
 
 type commandResponse struct {
@@ -70,6 +115,32 @@ type exchangeResponse struct {
 	Recap    *scenario.Recap    `json:"recap,omitempty"`
 }
 
+type exchangeStateResponse struct {
+	GameID     string             `json:"game_id"`
+	Version    uint64             `json:"version"`
+	State      exchange.State     `json:"state"`
+	LatestTurn *latestTurn        `json:"latest_turn,omitempty"`
+	Scenario   *scenario.Snapshot `json:"scenario,omitempty"`
+	Coaching   *scenario.Coaching `json:"coaching,omitempty"`
+	Recap      *scenario.Recap    `json:"recap,omitempty"`
+}
+
+type latestTurn struct {
+	Turn     int                `json:"turn"`
+	Summary  exchange.Summary   `json:"summary"`
+	Coaching *scenario.Coaching `json:"coaching,omitempty"`
+}
+
+type exchangeCreateResponse struct {
+	GameID   string             `json:"game_id"`
+	Version  uint64             `json:"version"`
+	State    exchange.State     `json:"state"`
+	Command  commandResponse    `json:"command"`
+	Scenario *scenario.Snapshot `json:"scenario,omitempty"`
+	Coaching *scenario.Coaching `json:"coaching,omitempty"`
+	Recap    *scenario.Recap    `json:"recap,omitempty"`
+}
+
 type apiError struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -79,6 +150,7 @@ type apiError struct {
 
 func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
 		return
 	}
@@ -106,17 +178,35 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry.mu.Lock()
+	if entry.storageFailed {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+		return
+	}
 	state := entry.engine.State()
+	snapshot, coaching, recap := entry.scenario, entry.coaching, entry.recap
+	if !created {
+		initial, err := exchange.New(entry.log.Meta().Config)
+		if err != nil {
+			entry.mu.Unlock()
+			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not restore create result")
+			return
+		}
+		state, coaching, recap = initial.State(), nil, nil
+	}
 	entry.mu.Unlock()
 	status := http.StatusCreated
 	if !created {
 		status = http.StatusOK
+	} else {
+		w.Header().Set("Location", "/api/v2/games/"+req.GameID)
 	}
-	writeJSON(w, status, exchangeResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap})
+	writeJSON(w, status, exchangeCreateResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: snapshot, Coaching: coaching, Recap: recap})
 }
 
 func (s *exchangeService) handleScenarios(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
 		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
 		return
 	}
@@ -130,6 +220,10 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id must be a UUID")
 		return
 	}
+	if len(parts) > 2 || (len(parts) == 2 && parts[1] != "commands" && parts[1] != "events") {
+		writeAPIError(w, http.StatusNotFound, "not_found", "game endpoint not found")
+		return
+	}
 	parts[0] = strings.ToLower(parts[0])
 	entry, err := s.load(parts[0])
 	if errors.Is(err, os.ErrNotExist) {
@@ -140,62 +234,108 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not load game")
 		return
 	}
-	if len(parts) == 1 && r.Method == http.MethodGet {
-		s.handleExchangeState(w, parts[0], entry)
+	if len(parts) == 1 {
+		if r.Method == http.MethodGet {
+			s.handleExchangeState(w, parts[0], entry)
+			return
+		}
+		w.Header().Set("Allow", http.MethodGet)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
 		return
 	}
-	if len(parts) == 2 && parts[1] == "commands" && r.Method == http.MethodPost {
-		s.handleExchangeCommand(w, r, parts[0], entry)
+	if parts[1] == "commands" {
+		if r.Method == http.MethodPost {
+			s.handleExchangeCommand(w, r, parts[0], entry)
+			return
+		}
+		w.Header().Set("Allow", http.MethodPost)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
 		return
 	}
-	if len(parts) == 2 && parts[1] == "events" && r.Method == http.MethodGet {
+	if r.Method == http.MethodGet {
 		s.handleExchangeEvents(w, r, entry)
 		return
 	}
-	writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "unsupported game endpoint")
+	w.Header().Set("Allow", http.MethodGet)
+	writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
 }
 
 func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, entry *exchangeEntry) {
 	entry.mu.Lock()
+	if entry.storageFailed {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+		return
+	}
 	state := entry.engine.State()
+	latest, snapshot, coaching, recap := entry.latestTurn, entry.scenario, entry.coaching, entry.recap
 	entry.mu.Unlock()
-	writeJSON(w, http.StatusOK, exchangeResponse{GameID: id, Version: state.Version, State: state, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap})
+	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap})
 }
 
 func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
-	var command exchange.Command
-	if err := decodeJSON(w, r, &command); err != nil {
+	data, err := readJSONRequest(w, r)
+	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if !validUUID(command.ID) {
-		writeAPIError(w, http.StatusBadRequest, "invalid_id", "command id must be a UUID")
+	var kind struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &kind); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	command.ID = strings.ToLower(command.ID)
-	if command.Type != exchange.CommandSubmitQuote && command.Type != exchange.CommandQuit {
+	if kind.Type != exchange.CommandSubmitQuote && kind.Type != exchange.CommandQuit {
 		writeAPIError(w, http.StatusForbidden, "venue_command_unavailable", "account commands require authenticated venue access")
 		return
 	}
+	var req exchangeCommandRequest
+	if err := decodeStrictJSON(data, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if !validUUID(req.ID) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_id", "command id must be a UUID")
+		return
+	}
+	req.ID = strings.ToLower(req.ID)
+	command, err := req.command()
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if entry.storageFailed {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+		return
+	}
 	if prior, ok := entry.commands[command.ID]; ok {
 		if prior.Command != command {
+			entry.mu.Unlock()
 			writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "command id has a different payload")
 			return
 		}
-		response := exchangeResult(id, prior.Result, command, true, entry)
-		response.Coaching, response.Recap = prior.Coaching, prior.Recap
+		response := exchangeResult(id, prior.Result, command, true, entry.scenario, prior.Coaching, prior.Recap)
+		entry.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
+	if command.ID == entry.log.Meta().CreateCommandID {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "command id was already used to create this game")
+		return
+	}
 	if command.ExpectedVersion != entry.engine.State().Version {
+		entry.mu.Unlock()
 		writeAPIError(w, http.StatusConflict, "version_conflict", "expected_version does not match current game version")
 		return
 	}
 	before := entry.engine.State()
 	result, err := entry.engine.Execute(command)
 	if err != nil {
+		entry.mu.Unlock()
 		writeAPIError(w, http.StatusConflict, "command_rejected", err.Error())
 		return
 	}
@@ -209,38 +349,63 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	if entry.scenario != nil && result.State.IsOver {
 		recap, err := scenario.BuildRecap(*entry.scenario, entry.log.Meta().Config, priorResults(entry.commands), result)
 		if err != nil {
-			if rebuilt, commands, rebuildErr := replay(entry.log); rebuildErr == nil {
-				entry.engine, entry.commands = rebuilt, commands
+			if recoverErr := entry.recover(); recoverErr != nil {
+				entry.storageFailed = true
 			}
+			entry.mu.Unlock()
 			writeAPIError(w, http.StatusInternalServerError, "recap_failure", "could not build session recap")
 			return
 		}
 		record.Recap = recap
 	}
-	if err := entry.log.Append(record); err != nil {
-		// Restore authoritative state from the last committed log before exposing an error.
-		if rebuilt, commands, rebuildErr := replay(entry.log); rebuildErr == nil {
-			entry.engine, entry.commands = rebuilt, commands
+	record, err = entry.log.Append(record)
+	if err != nil {
+		// A write or sync error leaves commit status uncertain. Rebuild so a
+		// retry can be answered idempotently, but never acknowledge the command
+		// here because durability was not confirmed.
+		if recoverErr := entry.recover(); recoverErr != nil {
+			entry.storageFailed = true
 		}
+		entry.mu.Unlock()
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command was not committed")
 		return
 	}
 	entry.commands[command.ID] = record
+	if command.Type == exchange.CommandSubmitQuote {
+		entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
+	}
 	entry.coaching, entry.recap = record.Coaching, record.Recap
-	writeJSON(w, http.StatusOK, exchangeResult(id, result, command, false, entry))
+	response := exchangeResult(id, record.Result, command, false, entry.scenario, entry.coaching, entry.recap)
+	entry.mu.Unlock()
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Request, entry *exchangeEntry) {
 	after := uint64(0)
-	if raw := r.URL.Query().Get("after"); raw != "" {
-		var err error
-		_, err = fmt.Sscan(raw, &after)
-		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request", "after must be an integer")
-			return
-		}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "malformed event query")
+		return
+	}
+	if parsed, present, err := canonicalUintQuery(query, "after"); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "after must be a canonical unsigned integer")
+		return
+	} else if present {
+		after = parsed
+	}
+	limit := uint64(100)
+	if parsed, present, err := canonicalUintQuery(query, "limit"); err != nil || (present && (parsed < 1 || parsed > 200)) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "limit must be a canonical unsigned integer between 1 and 200")
+		return
+	} else if present {
+		limit = parsed
 	}
 	entry.mu.Lock()
+	if entry.storageFailed {
+		entry.mu.Unlock()
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+		return
+	}
 	events := make([]exchange.Event, 0)
 	for _, record := range entry.commands {
 		for _, event := range record.Result.Events {
@@ -252,16 +417,7 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	entry.mu.Unlock()
 	// Command records are in a map; restore the global sequence before returning.
 	sort.Slice(events, func(i, j int) bool { return events[i].Sequence < events[j].Sequence })
-	limit := 100
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > 200 {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 200")
-			return
-		}
-		limit = parsed
-	}
-	hasMore := len(events) > limit
+	hasMore := uint64(len(events)) > limit
 	if hasMore {
 		events = events[:limit]
 	}
@@ -272,8 +428,23 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "next_after": nextAfter, "has_more": hasMore})
 }
 
-func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool, entry *exchangeEntry) exchangeResponse {
-	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}, Scenario: entry.scenario, Coaching: entry.coaching, Recap: entry.recap}
+func canonicalUintQuery(query url.Values, name string) (uint64, bool, error) {
+	values, present := query[name]
+	if !present {
+		return 0, false, nil
+	}
+	if len(values) != 1 {
+		return 0, true, errors.New("query parameter must have one value")
+	}
+	parsed, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil || strconv.FormatUint(parsed, 10) != values[0] {
+		return 0, true, errors.New("query parameter must be a canonical unsigned integer")
+	}
+	return parsed, true, nil
+}
+
+func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool, snapshot *scenario.Snapshot, coaching *scenario.Coaching, recap *scenario.Recap) exchangeResponse {
+	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}, Scenario: snapshot, Coaching: coaching, Recap: recap}
 }
 
 func priorResults(commands map[string]eventlog.Record) []exchange.Result {
@@ -332,7 +503,7 @@ func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: &snapshot}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), scenario: &snapshot, syncLog: s.syncLog}
 	s.entries[id] = entry
 	return entry, true, nil
 }
@@ -354,12 +525,51 @@ func (s *exchangeService) loadLocked(id string) (*exchangeEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.syncLog(log); err != nil {
+		return nil, err
+	}
+	entry, err := rebuildExchangeEntry(log, records)
+	if err != nil {
+		return nil, err
+	}
+	entry.syncLog = s.syncLog
+	s.entries[id] = entry
+	return entry, nil
+}
+
+func (entry *exchangeEntry) recover() error {
+	log, records, err := eventlog.Open(filepath.Dir(entry.log.Path()), filepath.Base(entry.log.Path()))
+	if err != nil {
+		return err
+	}
+	if err := entry.syncLog(log); err != nil {
+		return err
+	}
+	rebuilt, err := rebuildExchangeEntry(log, records)
+	if err != nil {
+		return err
+	}
+	entry.engine = rebuilt.engine
+	entry.log = rebuilt.log
+	entry.commands = rebuilt.commands
+	entry.latestTurn = rebuilt.latestTurn
+	entry.scenario = rebuilt.scenario
+	entry.coaching = rebuilt.coaching
+	entry.recap = rebuilt.recap
+	entry.storageFailed = false
+	return nil
+}
+
+func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchangeEntry, error) {
 	engine, commands, err := replayRecords(log.Meta().Config, records)
 	if err != nil {
 		return nil, err
 	}
 	entry := &exchangeEntry{engine: engine, log: log, commands: commands, scenario: log.Meta().Scenario}
 	for _, record := range records {
+		if record.Command.Type == exchange.CommandSubmitQuote {
+			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
+		}
 		if record.Coaching != nil {
 			entry.coaching = record.Coaching
 		}
@@ -367,16 +577,7 @@ func (s *exchangeService) loadLocked(id string) (*exchangeEntry, error) {
 			entry.recap = record.Recap
 		}
 	}
-	s.entries[id] = entry
 	return entry, nil
-}
-
-func replay(log *eventlog.Log) (*exchange.Engine, map[string]eventlog.Record, error) {
-	_, records, err := eventlog.Open(filepath.Dir(log.Path()), filepath.Base(log.Path()))
-	if err != nil {
-		return nil, nil, err
-	}
-	return replayRecords(log.Meta().Config, records)
 }
 
 func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.Engine, map[string]eventlog.Record, error) {
@@ -393,7 +594,7 @@ func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.En
 		for i := range result.Events {
 			result.Events[i].CommandID = record.Command.ID
 		}
-		if result.State != record.Result.State || result.Summary != record.Result.Summary || !reflect.DeepEqual(result.Events, record.Result.Events) || !reflect.DeepEqual(result.Ledger, record.Result.Ledger) {
+		if !durableResultsEqual(result, record.Result) {
 			return nil, nil, fmt.Errorf("replay result mismatch at version %d", record.Version)
 		}
 		commands[record.Command.ID] = record
@@ -401,18 +602,58 @@ func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.En
 	return engine, commands, nil
 }
 
+func durableResultsEqual(left, right exchange.Result) bool {
+	// An empty ledger is omitted on the wire and decodes as nil. Both represent
+	// a successful command with no journal entries.
+	if len(left.Ledger) == 0 {
+		left.Ledger = nil
+	}
+	if len(right.Ledger) == 0 {
+		right.Ledger = nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
-	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-		return errors.New("Content-Type must be application/json")
+	data, err := readJSONRequest(w, r)
+	if err != nil {
+		return err
+	}
+	return decodeStrictJSON(data, target)
+}
+
+func readJSONRequest(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	contentTypes := r.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		return nil, errors.New("exactly one Content-Type header is required")
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
+	if err != nil || mediaType != "application/json" {
+		return nil, errors.New("Content-Type must be application/json")
+	}
+	origins := r.Header.Values("Origin")
+	if len(origins) > 1 {
+		return nil, errors.New("cross-origin requests are not allowed")
 	}
 	if origin := r.Header.Get("Origin"); origin != "" {
 		parsed, err := url.Parse(origin)
-		if err != nil || parsed.Host != r.Host {
-			return errors.New("cross-origin requests are not allowed")
+		if err != nil || !validLocalOrigin(origin) || !validLocalHost(r.Host) || !strings.EqualFold(parsed.Host, r.Host) {
+			return nil, errors.New("cross-origin requests are not allowed")
 		}
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateUniqueJSONKeys(data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
@@ -423,8 +664,99 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 	return nil
 }
 
+func validateUniqueJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := consumeJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("request must contain one JSON value")
+		}
+		return fmt.Errorf("invalid trailing JSON: %w", err)
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			token, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := token.(string)
+			if !ok {
+				return errors.New("JSON object key must be a string")
+			}
+			if _, exists := keys[key]; exists {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func validLocalOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	return err == nil &&
+		parsed.Scheme == "http" &&
+		parsed.User == nil && parsed.Opaque == "" && validLocalAuthority(parsed.Host, parsed.Hostname()) &&
+		parsed.Path == "" && parsed.RawPath == "" && parsed.RawQuery == "" && parsed.Fragment == "" &&
+		!parsed.ForceQuery && origin == parsed.Scheme+"://"+parsed.Host
+}
+
+func validLocalHost(host string) bool {
+	parsed, err := url.Parse("http://" + host)
+	return err == nil && parsed.User == nil && parsed.Host == host && parsed.Path == "" && validLocalAuthority(parsed.Host, parsed.Hostname())
+}
+
+func validLocalAuthority(authority, hostname string) bool {
+	if authority == "" || strings.HasSuffix(authority, ":") || !isLoopbackHostname(hostname) {
+		return false
+	}
+	port := (&url.URL{Host: authority}).Port()
+	if port == "" {
+		return true
+	}
+	_, err := strconv.ParseUint(port, 10, 16)
+	return err == nil
+}
+
+func isLoopbackHostname(hostname string) bool {
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }

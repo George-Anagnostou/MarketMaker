@@ -18,7 +18,11 @@ func newServer() *server {
 	if indexPath == "" {
 		indexPath = "web/static/index.html"
 	}
-	return &server{indexPath: indexPath, v2: newExchangeService("data/games")}
+	gameRoot := os.Getenv("MMG_GAME_ROOT")
+	if gameRoot == "" {
+		gameRoot = "data/games"
+	}
+	return &server{indexPath: indexPath, v2: newExchangeService(gameRoot)}
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {

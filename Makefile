@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-cli build-server run test test-race test-cover vet fmt check clean
+.PHONY: help build build-cli build-server run test test-race test-cover vet fmt fmt-check check clean
 
 BIN_DIR := bin
 
@@ -35,7 +35,10 @@ vet: ## Run Go static analysis
 fmt: ## Format Go source files
 	gofmt -w $$(git ls-files '*.go')
 
-check: fmt vet test-race ## Format, vet, and run race tests
+fmt-check: ## Verify Go source files are formatted without modifying them
+	@gofmt -d $$(git ls-files '*.go') | diff -u /dev/null -
+
+check: fmt-check vet test-race build ## Verify formatting, vet, race tests, and builds
 
 clean: ## Remove local build artifacts
 	rm -rf $(BIN_DIR)
