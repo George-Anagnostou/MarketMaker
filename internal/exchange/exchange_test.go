@@ -308,6 +308,22 @@ func TestReservationsDeriveFromLiveOrdersAcrossLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "97"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.ReplaceLimit(PlayerAccount, 8, Buy, mustPrice(t, "96"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "110"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.ReplaceLimit(PlayerAccount, 10, Sell, mustPrice(t, "111"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
 }
 
 func TestExchangeReadModelsAreDefensiveCopies(t *testing.T) {
@@ -638,13 +654,25 @@ func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
 }
 
 type observableExchangeState struct {
-	state  State
-	orders []orderbook.Order
-	ledger []LedgerEntry
+	state                           State
+	orders                          []orderbook.Order
+	ledger                          []LedgerEntry
+	nextOrder, nextTrade, nextEvent uint64
+	flowRNG, markRNG, informedRNG   uint64
+	pcgState                        string
 }
 
 func exchangeObservableState(e *Engine) observableExchangeState {
-	return observableExchangeState{state: e.State(), orders: e.book.Orders(""), ledger: e.LedgerEntries()}
+	pcgState, err := e.pcg.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	return observableExchangeState{
+		state: e.State(), orders: e.book.Orders(""), ledger: e.LedgerEntries(),
+		nextOrder: e.nextOrder, nextTrade: e.nextTrade, nextEvent: e.nextEvent,
+		flowRNG: e.flowRNG.state, markRNG: e.markRNG.state, informedRNG: e.informedRNG.state,
+		pcgState: string(pcgState),
+	}
 }
 
 func TestSimulationVersionConfigValidation(t *testing.T) {

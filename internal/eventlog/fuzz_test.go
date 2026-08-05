@@ -15,12 +15,17 @@ type strictFuzzDocument struct {
 }
 
 func FuzzDecodeStrictJSON(f *testing.F) {
+	valid := []byte(`{"name":"value","count":1,"child":{"enabled":true}}`)
+	f.Add(valid)
 	for _, seed := range [][]byte{
-		[]byte(`{"name":"value","count":1,"child":{"enabled":true}}`),
-		[]byte(`{"key":1,"key":2}`),
-		[]byte(`{"key":1} {"next":2}`),
-		[]byte(`[`),
+		[]byte(`{"name":"first","name":"second"}`),
+		[]byte(`{"name":"value"} {"name":"next"}`),
+		[]byte(`{"unknown":true}`),
 	} {
+		var decoded strictFuzzDocument
+		if err := decodeStrictJSON(seed, &decoded); err == nil {
+			f.Fatalf("strict decoder accepted malformed seed %q", seed)
+		}
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
