@@ -706,7 +706,9 @@ func (e *Engine) Quit() (Result, error) {
 }
 
 func (e *Engine) canPlaceQuotePair(bid, ask fixed.Price, qty fixed.Qty) bool {
-	return e.canPlaceOrders(PlayerAccount, []riskOrder{{side: Buy, price: bid, qty: qty}, {side: Sell, price: ask, qty: qty}}, 0)
+	// A quote renewal cancels every player order before either new side rests.
+	// Assess the proposed pair against that post-replacement order set.
+	return e.canPlaceOrders(PlayerAccount, []riskOrder{{side: Buy, price: bid, qty: qty}, {side: Sell, price: ask, qty: qty}}, 0, false)
 }
 
 func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fixed.Qty) bool {
@@ -714,7 +716,7 @@ func (e *Engine) canPlace(accountID string, side Side, price fixed.Price, qty fi
 }
 
 func (e *Engine) canPlaceExcluding(accountID string, side Side, price fixed.Price, qty fixed.Qty, excludedOrderID uint64) bool {
-	return e.canPlaceOrders(accountID, []riskOrder{{side: side, price: price, qty: qty}}, excludedOrderID)
+	return e.canPlaceOrders(accountID, []riskOrder{{side: side, price: price, qty: qty}}, excludedOrderID, true)
 }
 
 type riskOrder struct {
@@ -723,7 +725,7 @@ type riskOrder struct {
 	qty   fixed.Qty
 }
 
-func (e *Engine) canPlaceOrders(accountID string, proposed []riskOrder, excludedOrderID uint64) bool {
+func (e *Engine) canPlaceOrders(accountID string, proposed []riskOrder, excludedOrderID uint64, includeExisting bool) bool {
 	account := e.accounts[accountID]
 	if account.External {
 		return true
@@ -739,12 +741,15 @@ func (e *Engine) canPlaceOrders(accountID string, proposed []riskOrder, excluded
 		return false
 	}
 
-	orders := make([]riskOrder, 0, len(e.book.Orders(accountID))+len(proposed))
-	for _, order := range e.book.Orders(accountID) {
-		if order.ID == excludedOrderID {
-			continue
+	orders := make([]riskOrder, 0, len(proposed))
+	if includeExisting {
+		orders = make([]riskOrder, 0, len(e.book.Orders(accountID))+len(proposed))
+		for _, order := range e.book.Orders(accountID) {
+			if order.ID == excludedOrderID {
+				continue
+			}
+			orders = append(orders, riskOrder{side: Side(order.Side), price: order.Price, qty: order.Remaining})
 		}
-		orders = append(orders, riskOrder{side: Side(order.Side), price: order.Price, qty: order.Remaining})
 	}
 	orders = append(orders, proposed...)
 	for _, order := range orders {
