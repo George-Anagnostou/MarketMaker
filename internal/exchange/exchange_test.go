@@ -3,6 +3,7 @@ package exchange
 import (
 	"encoding/json"
 	"market-maker/internal/fixed"
+	"market-maker/internal/orderbook"
 	"math"
 	"reflect"
 	"strings"
@@ -261,6 +262,143 @@ func TestAccountReservationsFollowOrderLifecycle(t *testing.T) {
 	}
 }
 
+func TestReservationsDeriveFromLiveOrdersAcrossLifecycle(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.Cancel(PlayerAccount, 1); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "98"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.Cancel(PlayerAccount, 5); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "90"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "97"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.ReplaceLimit(PlayerAccount, 8, Buy, mustPrice(t, "96"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "110"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.ReplaceLimit(PlayerAccount, 10, Sell, mustPrice(t, "111"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+}
+
+func TestExchangeReadModelsAreDefensiveCopies(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "1"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	ordersBefore := e.OpenOrders(PlayerAccount)
+	ledgerBefore := e.LedgerEntries()
+	orders := e.OpenOrders(PlayerAccount)
+	ledger := e.LedgerEntries()
+	orders[0].Remaining = 0
+	ledger[0].Postings[0].Money++
+	if got := e.OpenOrders(PlayerAccount); !reflect.DeepEqual(got, ordersBefore) {
+		t.Fatalf("orders changed through read model: got=%+v want=%+v", got, ordersBefore)
+	}
+	if got := e.LedgerEntries(); !reflect.DeepEqual(got, ledgerBefore) {
+		t.Fatalf("ledger changed through read model: got=%+v want=%+v", got, ledgerBefore)
+	}
+}
+
+func assertReservationsDerivedFromBook(t *testing.T, e *Engine) {
+	t.Helper()
+	type reservation struct {
+		cash      fixed.Money
+		buy, sell fixed.Qty
+	}
+	want := make(map[string]reservation)
+	for _, order := range e.book.Orders("") {
+		account := e.accounts[order.OwnerID]
+		if account.External {
+			continue
+		}
+		current := want[order.OwnerID]
+		if order.Side == orderbook.Buy {
+			notional, err := fixed.Notional(order.Price, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.cash, err = fixed.AddMoney(current.cash, notional)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.buy, err = fixed.AddQty(current.buy, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			var err error
+			current.sell, err = fixed.AddQty(current.sell, order.Remaining)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		want[order.OwnerID] = current
+	}
+	for id, account := range e.accounts {
+		if account.External {
+			continue
+		}
+		got, ok := e.Account(id)
+		if !ok {
+			t.Fatalf("account %q missing", id)
+		}
+		if got.ReservedCash != want[id].cash || got.OpenBuyQuantity != want[id].buy || got.OpenSellQuantity != want[id].sell {
+			t.Fatalf("account %q reservations=%+v want=%+v", id, got, want[id])
+		}
+	}
+}
+
 func TestOpenAccountIsAVersionedVenueCommand(t *testing.T) {
 	cfg := config(t)
 	cfg.MaxOrdersPerTurn = 0
@@ -459,6 +597,81 @@ func TestDeterministicResults(t *testing.T) {
 		if r1.State != r2.State || r1.Summary != r2.Summary || !reflect.DeepEqual(r1.Events, r2.Events) || !reflect.DeepEqual(r1.Ledger, r2.Ledger) {
 			t.Fatal("same scenario diverged")
 		}
+	}
+}
+
+func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 3
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+	cfg.MaxOrderQty = mustQty(t, "1")
+	left, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := []Command{
+		{ID: "01", Type: CommandOpenAccount, AccountID: "seller", InitialCash: mustMoney(t, "10000"), InitialPosition: mustQty(t, "2")},
+		{ID: "02", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "03", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Sell, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: IOC},
+		{ID: "04", Type: CommandReplaceOrder, AccountID: PlayerAccount, OrderID: 1, Side: Buy, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "05", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 2},
+		{ID: "06", Type: CommandPlaceOrder, AccountID: "seller", Side: Sell, Price: mustPrice(t, "100"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "07", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), TIF: IOC},
+		{ID: "08", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "09", Type: CommandSubmitQuote, Bid: mustPrice(t, "99"), Ask: mustPrice(t, "101")},
+		{ID: "10", Type: CommandQuit},
+		{ID: "11", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+	}
+	for step, command := range stream {
+		leftBefore := exchangeObservableState(left)
+		rightBefore := exchangeObservableState(right)
+		leftResult, leftErr := left.Execute(command)
+		rightResult, rightErr := right.Execute(command)
+		if (leftErr == nil) != (rightErr == nil) {
+			t.Fatalf("step %d command=%+v errors differ: left=%v right=%v", step, command, leftErr, rightErr)
+		}
+		if leftErr != nil && leftErr.Error() != rightErr.Error() {
+			t.Fatalf("step %d command=%+v error left=%v right=%v", step, command, leftErr, rightErr)
+		}
+		if !reflect.DeepEqual(leftResult, rightResult) || !reflect.DeepEqual(exchangeObservableState(left), exchangeObservableState(right)) {
+			t.Fatalf("step %d command=%+v produced divergent engines", step, command)
+		}
+		if leftErr != nil {
+			if !reflect.DeepEqual(exchangeObservableState(left), leftBefore) || !reflect.DeepEqual(exchangeObservableState(right), rightBefore) {
+				t.Fatalf("step %d rejected command changed engine state", step)
+			}
+		}
+		assertReservationsDerivedFromBook(t, left)
+		assertReservationsDerivedFromBook(t, right)
+		assertLedgerMatchesAccounts(t, left)
+		assertLedgerMatchesAccounts(t, right)
+	}
+}
+
+type observableExchangeState struct {
+	state                           State
+	orders                          []orderbook.Order
+	ledger                          []LedgerEntry
+	nextOrder, nextTrade, nextEvent uint64
+	flowRNG, markRNG, informedRNG   uint64
+	pcgState                        string
+}
+
+func exchangeObservableState(e *Engine) observableExchangeState {
+	pcgState, err := e.pcg.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	return observableExchangeState{
+		state: e.State(), orders: e.book.Orders(""), ledger: e.LedgerEntries(),
+		nextOrder: e.nextOrder, nextTrade: e.nextTrade, nextEvent: e.nextEvent,
+		flowRNG: e.flowRNG.state, markRNG: e.markRNG.state, informedRNG: e.informedRNG.state,
+		pcgState: string(pcgState),
 	}
 }
 

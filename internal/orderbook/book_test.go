@@ -195,3 +195,27 @@ func TestReplaceRejectsLevelQuantityOverflowAtomically(t *testing.T) {
 		t.Fatal("rejected replacement changed book")
 	}
 }
+
+func TestCloneIsIndependentAndPreservesFIFO(t *testing.T) {
+	original := New()
+	for _, resting := range []Order{
+		order(1, 1, "first", Sell, "100", "1", GTC, t),
+		order(2, 2, "second", Sell, "100", "1", GTC, t),
+	} {
+		if _, err := original.Submit(resting, RejectTaker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clone := original.Clone()
+	cloneReport, err := clone.Submit(order(3, 3, "clone-buyer", Buy, "100", "2", IOC, t), RejectTaker)
+	if err != nil || len(cloneReport.Fills) != 2 || cloneReport.Fills[0].Maker.ID != 1 || cloneReport.Fills[1].Maker.ID != 2 {
+		t.Fatalf("clone report=%+v err=%v", cloneReport, err)
+	}
+	if original.Len() != 2 {
+		t.Fatalf("clone mutation changed original len=%d", original.Len())
+	}
+	originalReport, err := original.Submit(order(3, 3, "original-buyer", Buy, "100", "1", IOC, t), RejectTaker)
+	if err != nil || len(originalReport.Fills) != 1 || originalReport.Fills[0].Maker.ID != 1 {
+		t.Fatalf("original report=%+v err=%v", originalReport, err)
+	}
+}

@@ -20,4 +20,5 @@ jobs:
       - run: make vet
       - run: make test-js
       - run: make test-race
+      - run: make fuzz
       - run: make build
