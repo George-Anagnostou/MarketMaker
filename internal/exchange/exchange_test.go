@@ -561,6 +561,68 @@ func TestDeterministicResults(t *testing.T) {
 	}
 }
 
+func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
+	cfg := config(t)
+	cfg.MaxOrdersPerTurn = 0
+	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+	cfg.MaxOrderQty = mustQty(t, "1")
+	left, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := []Command{
+		{ID: "01", Type: CommandOpenAccount, AccountID: "seller", InitialCash: mustMoney(t, "10000"), InitialPosition: mustQty(t, "2")},
+		{ID: "02", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "03", Type: CommandReplaceOrder, AccountID: PlayerAccount, OrderID: 1, Side: Buy, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "04", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 2},
+		{ID: "05", Type: CommandPlaceOrder, AccountID: "seller", Side: Sell, Price: mustPrice(t, "100"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "06", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), TIF: IOC},
+		{ID: "07", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "08", Type: CommandSubmitQuote, Bid: mustPrice(t, "99"), Ask: mustPrice(t, "101")},
+		{ID: "09", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 6},
+		{ID: "10", Type: CommandQuit},
+		{ID: "11", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+	}
+	for step, command := range stream {
+		leftBefore := exchangeObservableState(left)
+		rightBefore := exchangeObservableState(right)
+		leftResult, leftErr := left.Execute(command)
+		rightResult, rightErr := right.Execute(command)
+		if (leftErr == nil) != (rightErr == nil) {
+			t.Fatalf("step %d command=%+v errors differ: left=%v right=%v", step, command, leftErr, rightErr)
+		}
+		if leftErr != nil && leftErr.Error() != rightErr.Error() {
+			t.Fatalf("step %d command=%+v error left=%v right=%v", step, command, leftErr, rightErr)
+		}
+		if !reflect.DeepEqual(leftResult, rightResult) || !reflect.DeepEqual(exchangeObservableState(left), exchangeObservableState(right)) {
+			t.Fatalf("step %d command=%+v produced divergent engines", step, command)
+		}
+		if leftErr != nil {
+			if !reflect.DeepEqual(exchangeObservableState(left), leftBefore) || !reflect.DeepEqual(exchangeObservableState(right), rightBefore) {
+				t.Fatalf("step %d rejected command changed engine state", step)
+			}
+		}
+		assertReservationsDerivedFromBook(t, left)
+		assertReservationsDerivedFromBook(t, right)
+		assertLedgerMatchesAccounts(t, left)
+		assertLedgerMatchesAccounts(t, right)
+	}
+}
+
+type observableExchangeState struct {
+	state  State
+	orders []orderbook.Order
+	ledger []LedgerEntry
+}
+
+func exchangeObservableState(e *Engine) observableExchangeState {
+	return observableExchangeState{state: e.State(), orders: e.book.Orders(""), ledger: e.LedgerEntries()}
+}
+
 func TestSimulationVersionConfigValidation(t *testing.T) {
 	tests := []struct {
 		name     string
