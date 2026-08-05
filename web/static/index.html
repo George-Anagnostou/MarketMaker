@@ -30,6 +30,7 @@
   button:active:not(:disabled) { transform: translateY(1px); }
   button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--pine); outline-offset: 3px; }
   [hidden] { display: none !important; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
   .skip-link { position: fixed; z-index: 10; top: 8px; left: 8px; padding: 9px 12px; border-radius: 7px; background: var(--ink); color: #fff; font-weight: 700; transform: translateY(-150%); }
   .skip-link:focus { transform: translateY(0); }
   .shell { max-width: 1120px; margin: 0 auto; padding: 0 24px 44px; }
@@ -56,7 +57,7 @@
   .price-field { border: 1px solid var(--line); background: var(--card); padding: 10px 12px; border-radius: 9px; }
   .price-field:focus-within { border-color: var(--pine); box-shadow: 0 0 0 1px var(--pine); }
   .price-field label { display: block; color: var(--ink-soft); font-weight: 700; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
-  .price-field input { width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font: 500 26px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.035em; }
+  .price-field input { width: 100%; min-height: 44px; border: 0; outline: 0; color: var(--ink); background: transparent; font: 500 26px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.035em; }
   .price-field input:focus-visible { outline: 2px solid var(--pine); outline-offset: 6px; }
   .quote-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-soft); font-size: 12px; margin: 10px 0 13px; }
   .quote-meta strong { color: var(--ink); font-variant-numeric: tabular-nums; }
@@ -143,9 +144,9 @@
   .scenario-option:hover { border-color: #8fa095; background: #fbfaf5; }
   .scenario-option[aria-pressed="true"] { border-color: var(--pine); background: var(--pine-soft); box-shadow: inset 0 0 0 1px var(--pine); }
   .scenario-option:disabled { cursor: not-allowed; opacity: .55; }
-  .scenario-option-title { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
-  .scenario-option-title strong { font: 500 20px/1.15 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
-  .scenario-option-meta { color: var(--ink-soft); font-size: 11px; white-space: nowrap; }
+  .scenario-option-title { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 16px; align-items: baseline; }
+  .scenario-option-title strong { min-width: 0; overflow-wrap: anywhere; font: 500 20px/1.15 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
+  .scenario-option-meta { color: var(--ink-soft); font-size: 11px; }
   .scenario-option-copy { color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
   .scenario-option-goal { padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--pine) 20%, var(--line)); color: var(--pine); font-size: 12px; font-weight: 650; line-height: 1.45; }
   .scenario-selection { display: flex; justify-content: space-between; align-items: center; gap: 20px; min-height: 56px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
@@ -178,7 +179,8 @@
     .scenario-options { grid-template-columns: 1fr; }
     .scenario-option { min-height: 0; }
     .scenario-selection, .game-context { align-items: stretch; flex-direction: column; }
-    .scenario-selection-actions, .scenario-selection .primary, .game-context-actions, .game-context-actions button { width: 100%; }
+    .scenario-selection-actions { flex-direction: column; }
+    .scenario-selection-actions, .scenario-selection-actions button, .scenario-selection .primary, .game-context-actions, .game-context-actions button { width: 100%; }
     .turn-heading, .audit-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
   }
   @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } .game-context-actions { flex-direction: column; } }
@@ -204,7 +206,8 @@
         <div id="scenario-options" class="scenario-options" aria-busy="true"><span class="quiet">Loading lessons…</span></div>
         <div class="scenario-selection">
           <div class="scenario-selection-copy"><strong id="scenario-title">Loading lessons…</strong><span id="scenario-brief">The lesson catalog is loading.</span><span id="scenario-objective" hidden></span><span id="scenario-turns" hidden></span></div>
-          <div class="scenario-selection-actions"><button id="retry-catalog" class="secondary" onclick="loadScenarios()" hidden>Retry loading</button><button id="start-default" class="primary" onclick="startDefault()" disabled>Start lesson</button></div>
+          <div class="scenario-selection-actions"><button id="retry-catalog" class="secondary" onclick="loadScenarios()" hidden>Retry loading</button><button id="discard-recovery" class="secondary" onclick="abandonSavedLesson()" hidden>Choose a new lesson</button><button id="start-default" class="primary" onclick="startDefault()" disabled>Start lesson</button></div>
+          <span id="selection-alert" class="sr-only" role="alert"></span>
         </div>
       </section>
     </div>
@@ -284,7 +287,7 @@
 let gameId = null, version = 0, isOver = false, startingEquityFixed = 0n, history = [];
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
 let scenarios = [], selectedScenarioID = null;
-let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, retryHydrationID = null, restorationState = null;
+let catalogReady = false, catalogLoading = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, retryHydrationID = null, restorationState = null;
 let turnAudits = [], auditGeneration = 0;
 let replacementApproved = false;
 const $ = id => document.getElementById(id);
@@ -754,8 +757,8 @@ function renderTutorial(snapshot) {
 }
 function renderScenarios(focusID) {
   const list = $('scenario-options'), buttons = [];
-  const disabled = Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest);
-  list.setAttribute('aria-busy', disabled ? 'true' : 'false');
+  const disabled = Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || Boolean(retryHydrationID) || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest);
+  list.setAttribute('aria-busy', catalogLoading || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest) ? 'true' : 'false');
   for (const snapshot of scenarios) {
     const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = disabled; button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
     const heading = document.createElement('div'); heading.className = 'scenario-option-title';
@@ -766,7 +769,7 @@ function renderScenarios(focusID) {
     const briefing = document.createElement('div'); briefing.className = 'scenario-option-copy'; briefing.textContent = snapshot.briefing;
     const goal = document.createElement('div'); goal.className = 'scenario-option-goal'; goal.textContent = `Goal: ${snapshot.objective}`;
     button.append(heading, briefing, goal);
-    button.onclick = () => { retryHydrationID = null; selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(snapshot.id); setStartButtonsEnabled(catalogReady); };
+    button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(snapshot.id); setStartButtonsEnabled(catalogReady); };
     buttons.push(button);
   }
   list.replaceChildren(...buttons);
@@ -777,23 +780,33 @@ function setStartButtonsEnabled(enabled) {
   $('start-default').disabled = disabled;
   $('start-default').textContent = startingSession ? 'Starting lesson…' : retryHydrationID ? 'Resume lesson' : retryCreateRequest ? 'Retry starting lesson' : 'Start lesson';
   $('play-again').textContent = retryHydrationID ? 'Resume lesson' : 'Play again';
+  $('discard-recovery').hidden = !retryHydrationID;
+  $('discard-recovery').disabled = Boolean(restorationState) || startingSession;
 }
 async function loadScenarios() {
-  $('scenario-options').setAttribute('aria-busy', 'true'); $('retry-catalog').hidden = true;
+  if (catalogLoading) return;
+  catalogLoading = true;
+  const retry = $('retry-catalog'), retrying = !retry.hidden;
+  $('scenario-options').setAttribute('aria-busy', 'true'); $('selection-alert').textContent = '';
+  if (retrying) { retry.disabled = true; retry.textContent = 'Loading lessons…'; }
   try {
     const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
     const data = plain(await responseJSON(response), 'scenario response'); if (!Array.isArray(data.scenarios)) throw new Error('scenarios must be an array'); scenarios = data.scenarios.map((item, index) => validateScenario(item, `scenarios[${index}]`));
     const selected = scenarios.find(item => item.id === selectedScenarioID);
     if (selected) applyScenario(selected);
-    else if (!retryHydrationID) { selectedScenarioID = null; $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.'; $('scenario-objective').textContent = ''; $('scenario-turns').textContent = ''; }
+    else if (!retryHydrationID && !gameId) { selectedScenarioID = null; $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.'; $('scenario-objective').textContent = ''; $('scenario-turns').textContent = ''; }
     renderScenarios(); catalogReady = scenarios.length > 0;
-    if (!catalogReady) { $('scenario-title').textContent = 'No lessons available'; $('scenario-brief').textContent = 'The server returned an empty lesson catalog. Restart the local server, then try again.'; $('retry-catalog').hidden = false; }
+    retry.hidden = catalogReady;
+    if (!catalogReady) { $('scenario-title').textContent = 'No lessons available'; $('scenario-brief').textContent = 'The server returned an empty lesson catalog. Restart the local server, then try again.'; $('selection-alert').textContent = 'No lessons are available. Retry loading the catalog.'; }
     setStartButtonsEnabled(catalogReady);
   } catch (_) {
     if (!gameId) {
       $('scenario-title').textContent = 'Lesson catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server, then reload this page.'; $('scenario-objective').textContent = ''; $('scenario-turns').textContent = '';
     }
-    $('scenario-options').replaceChildren(); $('scenario-options').setAttribute('aria-busy', 'false'); $('retry-catalog').hidden = false; catalogReady = false; setStartButtonsEnabled(false);
+    $('scenario-options').replaceChildren(); $('scenario-options').setAttribute('aria-busy', 'false'); retry.hidden = false; $('selection-alert').textContent = 'The lesson catalog could not be loaded. Retry loading it.'; catalogReady = false; setStartButtonsEnabled(false);
+  } finally {
+    catalogLoading = false; $('scenario-options').setAttribute('aria-busy', 'false'); retry.disabled = false; retry.textContent = 'Retry loading';
+    if (retrying) { if (retryHydrationID) $('start-default').focus(); else if (catalogReady) $('scenario-options').children[0]?.focus(); else retry.focus(); }
   }
 }
 function pendingCreate() {
@@ -844,10 +857,24 @@ async function startDefault() {
 
 function showLessonStage(moveFocus = false) { $('lesson-stage').hidden = false; $('game-stage').hidden = true; $('turn').hidden = true; $('session-label').textContent = 'Choose a lesson'; if (moveFocus) $('lesson-picker-title').focus(); }
 function showGameStage(moveFocus = false) { $('lesson-stage').hidden = true; $('game-stage').hidden = false; $('turn').hidden = false; if (moveFocus) $('active-lesson-title').focus(); }
+function discardHydrationRecovery() {
+  if (!retryHydrationID) return true;
+  if (!confirm('Stop trying to resume this saved lesson? Starting another lesson will replace its browser recovery link.')) return false;
+  if (stored('mmg.game_id') === retryHydrationID) removeStored('mmg.game_id');
+  retryHydrationID = null; return true;
+}
+function abandonSavedLesson() {
+  if (!discardHydrationRecovery()) return;
+  selectedScenarioID = null; $('selection-alert').textContent = 'Saved lesson recovery was dismissed. Choose a new lesson.';
+  $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.';
+  renderScenarios(); setStartButtonsEnabled(catalogReady);
+  const firstLesson = $('scenario-options').children[0]; if (firstLesson) firstLesson.focus(); else $('retry-catalog').focus();
+}
 function chooseAnotherLesson() {
   if (pendingCommand || startingSession || restorationState || retryCommand || retryQuitCommand) return;
+  if (!discardHydrationRecovery()) return;
   if (gameId && !isOver && !confirm('Choose another lesson? Your current session will be replaced when you start a new one.')) return;
-  replacementApproved = Boolean(gameId && !isOver); retryHydrationID = null; selectedScenarioID = null;
+  replacementApproved = Boolean(gameId && !isOver); selectedScenarioID = null;
   $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.'; renderScenarios(); setStartButtonsEnabled(catalogReady); showLessonStage(true);
 }
 
@@ -941,7 +968,12 @@ function showSummary(state, recap) {
   }
   $('gamesummary').focus();
 }
-function playAgain() { if (!pendingCommand && !retryCommand && !retryQuitCommand && !startingSession && !restorationState) return retryHydrationID ? startDefault() : startNewGame(); }
+function playAgain() {
+  if (pendingCommand || retryCommand || retryQuitCommand || startingSession || restorationState) return;
+  if (retryHydrationID) return startDefault();
+  if (!scenarios.some(snapshot => snapshot.id === selectedScenarioID)) { chooseAnotherLesson(); return {status:'ignored'}; }
+  return startNewGame();
+}
 function reviewHistory() {
   if (pendingCommand || startingSession || restorationState) return;
   const heading = $('history-title'), reducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -989,7 +1021,9 @@ async function hydrateGameInternal(id, moveFocus) {
 async function resumeGame() {
   const id = stored('mmg.game_id'); if (!id) return {status:'none'};
   const result = await hydrateGame(id);
-  if (result.status === 'failed') { retryHydrationID = id; setStartButtonsEnabled(catalogReady); }
+  if (result.status === 'failed') {
+    retryHydrationID = id; $('scenario-title').textContent = 'Saved lesson could not be loaded'; $('scenario-brief').textContent = 'Check the local server, then resume this lesson or explicitly choose a new one.'; $('selection-alert').textContent = 'The saved lesson could not be loaded.'; renderScenarios(); setStartButtonsEnabled(catalogReady);
+  }
   return result;
 }
 function installKeyboardHandler() { document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } }); }
@@ -1006,7 +1040,7 @@ function seedTestModel(id, rawState, baseline) {
   history = []; turnAudits = []; pendingCommand = retryCommand = retryQuitCommand = null; restorationState = null; setState(state); showGameStage(); return state;
 }
 globalThis.__MM_TEST__ = {
-  hydrateGame, startDefault, startNewGame, submitTurn, quitSession, chooseAnotherLesson, playAgain, seedTestModel,
+  hydrateGame, loadScenarios, startDefault, startNewGame, submitTurn, quitSession, chooseAnotherLesson, abandonSavedLesson, playAgain, seedTestModel,
   setCatalog(items, selected) { scenarios = items.map((item, index) => validateScenario(item, `test scenarios[${index}]`)); selectedScenarioID = selected || null; catalogReady = scenarios.length > 0; if (selectedScenarioID) applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(catalogReady); },
   model() { return {gameId, version, isOver, startingEquityFixed:String(startingEquityFixed), pendingCommand, retryCommand, retryQuitCommand, retryHydrationID, restoration:Boolean(restorationState), historyLength:history.length, view:$('game-stage').hidden ? 'lessons' : 'game'}; }
 };

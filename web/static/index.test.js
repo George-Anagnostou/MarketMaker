@@ -53,6 +53,8 @@ function loadApp(fetchImpl, timeout = 100) {
   document.getElementById('bid').value = '99.50';
   document.getElementById('ask').value = '100.50';
   document.getElementById('game-stage').hidden = true;
+  document.getElementById('retry-catalog').hidden = true;
+  document.getElementById('discard-recovery').hidden = true;
   const storage = new Map(), alerts = [];
   let uuid = 5;
   const context = {
@@ -159,9 +161,11 @@ test('definitive create acknowledgement clears create retry but retains game ID 
   assert.equal(app.api.model().retryHydrationID, GAME_ID);
   await app.api.startDefault();
   assert.equal(createCalls, 1);
-  app.elements.get('scenario-options').children[0].onclick();
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, true);
+  app.api.abandonSavedLesson();
   assert.equal(app.api.model().retryHydrationID, null);
   assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
+  assert.equal(app.storage.has('mmg.game_id'), false);
   assert.equal(app.api.model().restoration, false);
 });
 
@@ -211,6 +215,21 @@ test('lesson and game stages replace one another', () => {
   assert.equal(app.elements.get('lesson-stage').hidden, false);
   assert.equal(app.elements.get('scenario-options').children[0].disabled, false);
   assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
+});
+
+test('removed restored lesson returns play again to the lesson picker', async () => {
+  const replacement = {...scenario, id:'inventory-pressure-v1', title:'Inventory Pressure'};
+  const app = loadApp(async url => {
+    if (url === `/api/v2/games/${GAME_ID}`) return response(200, envelope());
+    if (url === '/api/v2/scenarios') return response(200, {scenarios:[replacement]});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  assert.equal((await app.api.hydrateGame(GAME_ID)).status, 'hydrated');
+  await app.api.loadScenarios();
+  assert.equal(app.api.model().view, 'game');
+  app.api.playAgain();
+  assert.equal(app.api.model().view, 'lessons');
+  assert.equal(app.elements.get('start-default').disabled, true);
 });
 
 test('version conflict clears the quote and hydrates canonical state before controls resume', async () => {
