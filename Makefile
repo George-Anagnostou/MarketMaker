@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-cli build-server run test test-js test-race test-cover vet fmt fmt-check check clean
+.PHONY: help build build-cli build-server run test test-js test-race test-cover fuzz fuzz-fixed fuzz-eventlog vet fmt fmt-check check clean
 
 BIN_DIR := bin
 
@@ -31,6 +31,14 @@ test-race: ## Run all tests with the race detector
 
 test-cover: ## Run all tests with coverage summaries
 	go test -cover ./...
+
+fuzz: fuzz-fixed fuzz-eventlog ## Run bounded fuzz targets
+
+fuzz-fixed: ## Fuzz fixed-point parsing and serialization for 10 seconds
+	go test -fuzz=FuzzDecimalRoundTrip -fuzztime=10s ./internal/fixed
+
+fuzz-eventlog: ## Fuzz strict JSON decoding for 10 seconds
+	go test -fuzz=FuzzDecodeStrictJSON -fuzztime=10s ./internal/eventlog
 
 vet: ## Run Go static analysis
 	go vet ./...

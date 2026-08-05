@@ -23,6 +23,7 @@ make run        # local web server
 make build      # CLI and server binaries in bin/
 make test       # all tests
 make test-race  # race-enabled tests
+make fuzz       # bounded fixed-point and strict-JSON fuzzing
 make check      # format, vet, and race tests
 ```
 
