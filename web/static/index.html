@@ -16,90 +16,91 @@
     --coral: #a94032;
     --coral-soft: #f4dfd9;
     --gold: #b77b20;
+    --gold-strong: #79500f;
     --gold-soft: #f5e9cc;
     --navy: #233d4d;
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: "Avenir Next", Avenir, ui-sans-serif, system-ui, sans-serif;
     color: var(--ink);
     background: var(--paper);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: radial-gradient(circle at 80% -20%, #e4ede5 0, transparent 29rem), var(--paper); }
+  body { margin: 0; background: var(--paper); }
   button, input { font: inherit; }
-  button { cursor: pointer; }
-  .shell { max-width: 1200px; margin: 0 auto; padding: 0 20px 36px; }
-  .masthead { display: flex; justify-content: space-between; align-items: center; min-height: 72px; border-bottom: 1px solid var(--line); gap: 16px; }
-  .wordmark { font-family: Georgia, "Times New Roman", serif; font-size: 24px; letter-spacing: -.04em; }
-  .eyebrow, .section-label { color: var(--ink-soft); font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
-  .session { display: flex; align-items: center; gap: 9px; color: var(--ink-soft); font-size: 12px; }
+  button { min-height: 44px; cursor: pointer; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--pine); outline-offset: 3px; }
+  [hidden] { display: none !important; }
+  .skip-link { position: fixed; z-index: 10; top: 8px; left: 8px; padding: 9px 12px; border-radius: 7px; background: var(--ink); color: #fff; font-weight: 700; transform: translateY(-150%); }
+  .skip-link:focus { transform: translateY(0); }
+  .shell { max-width: 1120px; margin: 0 auto; padding: 0 24px 44px; }
+  .masthead { display: flex; justify-content: space-between; align-items: center; min-height: 64px; border-bottom: 1px solid var(--line); gap: 16px; }
+  .wordmark { flex: none; font-family: Georgia, "Times New Roman", serif; font-size: 24px; letter-spacing: -.04em; white-space: nowrap; }
+  .session { display: flex; flex: 1; align-items: center; justify-content: flex-end; min-width: 0; gap: 9px; color: var(--ink-soft); font-size: 12px; }
+  #session-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .session strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+  #turn { flex: none; white-space: nowrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 0 4px var(--gold-soft); }
-  main { padding-top: 20px; }
-  .intro { display: flex; justify-content: space-between; gap: 22px; margin-bottom: 17px; align-items: end; }
-  h1 { margin: 3px 0 0; font: 500 clamp(30px, 4vw, 44px)/.98 Georgia, "Times New Roman", serif; letter-spacing: -.05em; max-width: 600px; }
-  .lede { max-width: 320px; color: var(--ink-soft); line-height: 1.45; margin: 0; font-size: 13px; }
-  .desk { display: grid; grid-template-columns: minmax(0, 1.38fr) minmax(280px, .62fr); gap: 12px; }
-  .card { background: color-mix(in srgb, var(--card) 92%, transparent); border: 1px solid var(--line); border-radius: 12px; }
-  .quote-card { padding: 18px; border-color: #b8c7ba; background: linear-gradient(145deg, #fffdf8, #f2f6ef); }
+  main { padding-top: 30px; }
+  .intro { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .52fr); gap: 28px; margin-bottom: 28px; align-items: end; }
+  h1 { margin: 0; font: 500 clamp(34px, 5vw, 50px)/1 Georgia, "Times New Roman", serif; letter-spacing: -.035em; max-width: 620px; text-wrap: balance; }
+  .lede { max-width: 34ch; color: var(--ink-soft); line-height: 1.5; margin: 0; font-size: 14px; }
+  .desk { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(270px, .65fr); gap: 22px; align-items: start; }
+  .card { background: transparent; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
+  .quote-card { padding: 20px; border: 1px solid #b8c7ba; border-radius: 14px; background: var(--card); }
   .quote-top { display: flex; justify-content: space-between; gap: 16px; align-items: start; }
   h2 { margin: 3px 0 0; font: 500 24px/1 Georgia, "Times New Roman", serif; letter-spacing: -.035em; }
-  .mark { text-align: right; font-variant-numeric: tabular-nums; }
+  .mark { min-width: 0; max-width: 100%; text-align: right; font-variant-numeric: tabular-nums; }
   .mark span { display: block; color: var(--ink-soft); font-size: 12px; }
-  .mark strong { font: 500 22px/1 Georgia, "Times New Roman", serif; }
+  .mark strong { display: block; overflow-wrap: anywhere; font: 500 clamp(17px, 3vw, 22px)/1.1 Georgia, "Times New Roman", serif; }
   .quote-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0 10px; }
   .price-field { border: 1px solid var(--line); background: var(--card); padding: 10px 12px; border-radius: 9px; }
+  .price-field:focus-within { border-color: var(--pine); box-shadow: 0 0 0 1px var(--pine); }
   .price-field label { display: block; color: var(--ink-soft); font-weight: 700; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
-  .price-field input { width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font: 500 26px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.07em; }
+  .price-field input { width: 100%; border: 0; outline: 0; color: var(--ink); background: transparent; font: 500 26px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.035em; }
+  .price-field input:focus-visible { outline: 2px solid var(--pine); outline-offset: 6px; }
   .quote-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-soft); font-size: 12px; margin: 10px 0 13px; }
   .quote-meta strong { color: var(--ink); font-variant-numeric: tabular-nums; }
   .primary { width: 100%; border: 0; border-radius: 8px; background: var(--pine); color: #fff; padding: 11px 16px; font-weight: 700; letter-spacing: .01em; }
   .primary:hover { background: #143e30; }
   .primary:disabled, .secondary:disabled { cursor: not-allowed; opacity: .55; }
+  .quote-actions { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
   .risk-note { margin: 10px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
-  .guide { margin-top: 12px; padding: 16px; }
-  .guide-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; margin-bottom: 12px; }
-  .guide-head h2 { font-size: 21px; }
-  .guide-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-  .guide-card { padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #f8f5ed; }
-  .guide-card h3 { margin: 0 0 6px; font: 500 16px/1.1 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
-  .guide-card p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
-  .guide-rule { margin-top: 9px !important; padding-top: 9px; border-top: 1px solid var(--line); color: var(--ink) !important; }
-  .guide-rule strong { color: var(--pine); }
-  .snapshot { padding: 16px; display: grid; gap: 12px; }
+  .snapshot { padding: 4px 0; display: grid; gap: 10px; }
   .metric { padding-bottom: 11px; border-bottom: 1px solid var(--line); }
   .metric:last-child { border: 0; padding: 0; }
   .metric-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
   .metric-name { color: var(--ink-soft); font-size: 13px; }
-  .metric-value { font: 500 19px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
-  .metric-caption { margin: 5px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.35; }
+  .metric-value { min-width: 0; max-width: 64%; overflow-wrap: anywhere; text-align: right; font: 500 clamp(14px, 2vw, 19px)/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+  .metric-caption { margin: 4px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.4; }
   .positive { color: var(--pine); } .negative { color: var(--coral); }
-  .turn-grid { display: grid; grid-template-columns: minmax(0, 1.38fr) minmax(280px, .62fr); gap: 12px; margin-top: 12px; }
-  .turn-card, .history-card { padding: 16px; }
-  .turn-card { min-height: 210px; }
+  .turn-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(270px, .65fr); gap: 22px; margin-top: 22px; }
+  .turn-card, .history-card { padding: 16px 0; }
+  .turn-card { min-height: 160px; }
   .turn-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 11px; }
   .turn-heading h2 { font-size: 21px; }
   .turn-status { color: var(--ink-soft); font-size: 12px; }
   .story { color: var(--ink-soft); line-height: 1.45; margin: 0 0 12px; font-size: 13px; }
-  .coaching { margin: 0 0 12px; padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; font-size: 12px; line-height: 1.4; }
+  .coaching { margin: 0 0 12px; padding: 9px 10px; border-top: 1px solid var(--gold); background: var(--gold-soft); color: #65501e; font-size: 12px; line-height: 1.4; }
   .attribution { margin: 0 0 12px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #f8f5ed; }
   .attribution-title { margin-bottom: 7px; color: var(--ink); font-size: 12px; font-weight: 700; }
   .attribution-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line); }
   .attribution-row:first-of-type { border-top: 0; }
   .attribution-row strong { font-size: 12px; }
   .attribution-row span { font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
-  .attribution-row small { grid-column: 1 / -1; color: var(--ink-soft); font-size: 10px; line-height: 1.35; }
-  .informed-flow { margin: 0 0 12px; padding: 8px 10px; border-left: 3px solid var(--navy); background: #e8eef0; color: var(--navy); font-size: 11px; line-height: 1.45; }
-  .turn-empty { display: grid; place-items: center; min-height: 120px; text-align: center; color: var(--ink-soft); font: 18px/1.3 Georgia, "Times New Roman", serif; }
-  .audit-card { margin-top: 12px; padding: 16px; }
+  .attribution-row small { grid-column: 1 / -1; color: var(--ink-soft); font-size: 11px; line-height: 1.4; }
+  .informed-flow { margin: 0 0 12px; padding: 8px 10px; border-top: 1px solid var(--navy); background: #e8eef0; color: var(--navy); font-size: 11px; line-height: 1.45; }
+  .turn-empty { display: grid; place-items: center; min-height: 92px; text-align: center; color: var(--ink-soft); font: 17px/1.35 Georgia, "Times New Roman", serif; }
+  .audit-card { margin-top: 22px; padding: 16px 0; }
   .audit-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }
   .audit-heading h2 { font-size: 21px; }
   .audit-status { color: var(--ink-soft); font-size: 12px; }
   .audit-empty { color: var(--ink-soft); line-height: 1.45; font-size: 13px; }
   .audit-explainer { margin: 0 0 12px; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
   .audit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-  .audit-panel { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .audit-panel { border: 1px solid var(--line); border-radius: 9px; overflow-x: auto; }
   .audit-panel h3 { margin: 0; padding: 10px 11px; border-bottom: 1px solid var(--line); background: #f8f5ed; font: 500 16px/1 Georgia, "Times New Roman", serif; }
-  .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .audit-table th { color: var(--ink-soft); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; text-align: left; padding: 9px 11px 6px; }
+  .audit-table { width: 100%; min-width: 360px; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .audit-table th { color: var(--ink-soft); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; text-align: left; padding: 9px 11px 6px; }
   .audit-table td { padding: 8px 11px; border-top: 1px solid var(--line); color: var(--ink-soft); vertical-align: top; }
   .audit-table td:first-child { color: var(--ink); font-weight: 650; }
   .audit-table .filled { color: var(--pine); }
@@ -107,82 +108,127 @@
   .tape { margin-top: 10px; }
   .tape summary { padding: 3px 0; }
   .tape-list { display: grid; gap: 7px; margin-top: 9px; }
-  .tape-entry { padding: 9px 10px; border-left: 3px solid var(--line); background: #f8f5ed; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
-  .history-card { overflow: hidden; }
-  .history-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .history-table th { color: var(--ink-soft); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; text-align: right; padding: 0 0 8px; }
+  .tape-entry { padding: 9px 10px; border-top: 1px solid var(--line); background: #f8f5ed; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
+  .history-card { overflow-x: auto; }
+  .history-table { width: 100%; min-width: 300px; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .history-card h2 { margin: 0 0 12px; font-size: 21px; }
+  .history-table th { color: var(--ink-soft); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; text-align: right; padding: 0 0 8px; }
   .history-table th:first-child, .history-table td:first-child { text-align: left; }
+  abbr[title] { text-decoration: none; }
   .history-table td { text-align: right; padding: 7px 0; border-top: 1px solid var(--line); }
   .history-table tbody tr:first-child td { border-top: 1px solid var(--line); }
-  .summary { margin-top: 12px; padding: 17px; border: 1px solid #b7c8ba; background: #eef5ef; }
+  .summary { margin-top: 22px; padding: 20px; border: 1px solid #b7c8ba; border-radius: 14px; background: #eef5ef; }
   .summary h2 { margin-bottom: 10px; }
   .summary-copy { color: var(--ink-soft); line-height: 1.55; }
   .scorecard { margin-top: 13px; padding-top: 13px; border-top: 1px solid #b7c8ba; }
-  .scorecard-label { color: var(--ink-soft); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+  .scorecard-label { color: var(--ink-soft); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .score-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 8px; }
   .score-metric { padding: 10px; border-radius: 8px; background: #fffdf8; }
   .score-metric span { display: block; color: var(--ink-soft); font-size: 11px; }
-  .score-metric strong { display: block; margin-top: 4px; font: 500 20px/1 ui-monospace, monospace; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+  .score-metric strong { display: block; margin-top: 4px; font: 500 20px/1 ui-monospace, monospace; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
   .score-note, .score-reflection { margin: 9px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
-  .score-reflection { padding: 9px 10px; border-left: 3px solid var(--gold); background: var(--gold-soft); color: #65501e; }
+  .score-reflection { padding: 9px 10px; border-top: 1px solid var(--gold); background: var(--gold-soft); color: #65501e; }
   .actions { display: flex; gap: 8px; margin-top: 11px; flex-wrap: wrap; }
-  .secondary { border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--ink); padding: 8px 11px; font-size: 12px; font-weight: 650; }
+  .secondary { border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--ink); padding: 8px 12px; font-size: 12px; font-weight: 650; }
   .secondary:hover { background: #f7f2e9; }
   details { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
-  summary { cursor: pointer; color: var(--ink-soft); font-size: 13px; font-weight: 650; }
-  .scenario-actions { display: flex; gap: 9px; }
+  summary { min-height: 44px; cursor: pointer; color: var(--ink-soft); font-size: 13px; font-weight: 650; }
   .quiet { color: var(--ink-soft); font-size: 12px; }
-  .scenario-card { margin-top: 12px; padding: 14px 16px; }
-  .scenario-card-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
-  .scenario-card h3 { margin: 3px 0 0; font: 500 20px/1 Georgia, "Times New Roman", serif; letter-spacing: -.025em; }
-  .scenario-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
-  .scenario-option { text-align: left; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); padding: 10px; min-height: 86px; }
-  .scenario-option:hover, .scenario-option[aria-pressed="true"] { border-color: var(--pine); background: var(--pine-soft); }
-  .scenario-option strong { display: block; font-size: 13px; margin-bottom: 4px; }
-  .scenario-option span { display: block; color: var(--ink-soft); font-size: 11px; line-height: 1.35; }
-  .objective { margin: 11px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.4; }
-  .lesson-plan { margin-top: 13px; padding: 13px; border: 1px solid #d8c58e; border-radius: 9px; background: #fffae9; }
-  .lesson-plan-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
-  .lesson-plan h4 { margin: 3px 0 0; font: 500 17px/1 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
+  .scenario-card { padding: 20px 0 28px; }
+  .scenario-card-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .55fr); gap: 24px; align-items: end; margin-bottom: 16px; }
+  .scenario-card-head h2 { margin: 0; font-size: 27px; }
+  .scenario-card-head p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.5; }
+  .scenario-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .scenario-option { display: grid; grid-template-rows: auto 1fr auto; gap: 9px; min-height: 168px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); text-align: left; }
+  .scenario-option:hover { border-color: #8fa095; background: #fbfaf5; }
+  .scenario-option[aria-pressed="true"] { border-color: var(--pine); background: var(--pine-soft); box-shadow: inset 0 0 0 1px var(--pine); }
+  .scenario-option:disabled { cursor: not-allowed; opacity: .55; }
+  .scenario-option-title { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
+  .scenario-option-title strong { font: 500 20px/1.15 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
+  .scenario-option-meta { color: var(--ink-soft); font-size: 11px; white-space: nowrap; }
+  .scenario-option-copy { color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
+  .scenario-option-goal { padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--pine) 20%, var(--line)); color: var(--pine); font-size: 12px; font-weight: 650; line-height: 1.45; }
+  .scenario-selection { display: flex; justify-content: space-between; align-items: center; gap: 20px; min-height: 56px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .scenario-selection-copy { min-width: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+  .scenario-selection-copy strong { display: block; margin-bottom: 2px; color: var(--ink); font-size: 14px; }
+  .scenario-selection-actions { display: flex; flex: none; gap: 8px; }
+  .scenario-selection .primary { width: auto; white-space: nowrap; }
+  .game-context { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 14px 0; margin-bottom: 20px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .game-context h2 { margin: 0; font-size: 24px; }
+  .game-context p { margin: 5px 0 0; color: var(--ink-soft); font-size: 12px; }
+  .game-context-actions { display: flex; align-items: center; gap: 9px; }
+  .lesson-plan { margin: -6px 0 18px; padding: 11px 0 0; border: 0; border-top: 1px solid #d8c58e; border-radius: 0; background: transparent; }
+  .lesson-plan summary { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; color: var(--ink); font: 500 17px/1 Georgia, "Times New Roman", serif; letter-spacing: -.02em; }
   .lesson-steps { display: grid; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; counter-reset: lesson; }
   .lesson-step { display: grid; grid-template-columns: 23px 1fr; gap: 8px; color: var(--ink-soft); font-size: 12px; line-height: 1.42; }
-  .lesson-step::before { counter-increment: lesson; content: counter(lesson); display: grid; place-items: center; align-self: start; width: 22px; height: 22px; border-radius: 50%; background: var(--gold); color: #fff; font: 700 11px/1 ui-monospace, monospace; }
+  .lesson-step::before { counter-increment: lesson; content: counter(lesson); display: grid; place-items: center; align-self: start; width: 22px; height: 22px; border-radius: 50%; background: var(--gold-strong); color: #fff; font: 700 11px/1 ui-monospace, monospace; }
   .lesson-step strong { color: var(--ink); }
   .lesson-check { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid #dfd0a3; color: #65501e; font-size: 12px; line-height: 1.4; }
   @media (max-width: 780px) {
     .shell { padding: 0 16px 32px; }
     .masthead { min-height: 72px; }
-    .intro, .quote-top { align-items: start; flex-direction: column; }
+    .intro { grid-template-columns: 1fr; gap: 14px; }
+    .quote-top { align-items: start; flex-direction: column; }
     .mark { text-align: left; }
-    .desk, .turn-grid, .guide-grid, .audit-grid, .score-grid { grid-template-columns: 1fr; }
-    .scenario-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .desk, .turn-grid, .audit-grid, .score-grid { grid-template-columns: 1fr; }
+    .scenario-card-head { grid-template-columns: 1fr; gap: 10px; align-items: start; }
   }
-  @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } }
+  @media (max-width: 560px) {
+    main { padding-top: 24px; }
+    .scenario-options { grid-template-columns: 1fr; }
+    .scenario-option { min-height: 0; }
+    .scenario-selection, .game-context { align-items: stretch; flex-direction: column; }
+    .scenario-selection-actions, .scenario-selection .primary, .game-context-actions, .game-context-actions button { width: 100%; }
+    .turn-heading, .audit-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
+  }
+  @media (max-width: 460px) { .quote-grid { grid-template-columns: 1fr; } .session { font-size: 11px; } .game-context-actions { flex-direction: column; } }
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
 <div class="shell">
   <header class="masthead">
-    <div><div class="eyebrow">Market making simulator</div><div class="wordmark">Market Maker</div></div>
-    <div class="session"><span class="dot"></span><span id="session-label">Ready to quote</span><strong id="turn">Turn —</strong></div>
+    <div class="wordmark">Market Maker</div>
+    <div class="session"><span class="dot" aria-hidden="true"></span><span id="session-label">Choose a lesson</span><strong id="turn" hidden>Turn —</strong></div>
   </header>
 
-  <main>
-    <section class="intro">
-      <div><div class="eyebrow">Practice desk</div><h1>Make a market.<br>Carry the risk.</h1><div class="actions"><button id="start-default" class="secondary" onclick="startDefault()" disabled>Start a practice session</button></div></div>
-      <p class="lede">Post a two-sided quote, meet simulated customer flow, and learn how price movement changes the value of your inventory.</p>
-    </section>
+  <main id="main-content">
+    <div id="lesson-stage">
+      <section class="intro">
+        <h1>Make a market.<br>Carry the risk.</h1>
+        <p class="lede">Choose a lesson. Set a bid and ask. See what traded and what risk you carry next.</p>
+      </section>
+
+      <section class="card scenario-card" aria-labelledby="lesson-picker-title">
+        <div class="scenario-card-head"><h2 id="lesson-picker-title" tabindex="-1">Choose your lesson</h2><p>Each lesson isolates one market-making skill. Pick a desk, review its goal, then start when you are ready.</p></div>
+        <div id="scenario-options" class="scenario-options" aria-busy="true"><span class="quiet">Loading lessons…</span></div>
+        <div class="scenario-selection">
+          <div class="scenario-selection-copy"><strong id="scenario-title">Loading lessons…</strong><span id="scenario-brief">The lesson catalog is loading.</span><span id="scenario-objective" hidden></span><span id="scenario-turns" hidden></span></div>
+          <div class="scenario-selection-actions"><button id="retry-catalog" class="secondary" onclick="loadScenarios()" hidden>Retry loading</button><button id="start-default" class="primary" onclick="startDefault()" disabled>Start lesson</button></div>
+        </div>
+      </section>
+    </div>
+
+    <div id="game-stage" hidden>
+      <section class="game-context" aria-labelledby="active-lesson-title">
+        <div><h2 id="active-lesson-title" tabindex="-1">Lesson</h2><p><span id="active-lesson-turns"></span> · Make one quote decision at a time, then inspect the outcome.</p></div>
+        <div class="game-context-actions"><button id="choose-lesson" class="secondary" onclick="chooseAnotherLesson()">Choose another lesson</button><button id="quit-session" class="secondary" onclick="quitSession()" disabled>End session</button></div>
+      </section>
+      <details id="lesson-plan" class="lesson-plan" hidden aria-labelledby="lesson-plan-title">
+        <summary><span id="lesson-plan-title">Lesson guide</span><span id="lesson-plan-progress" class="quiet"></span></summary>
+        <ol id="lesson-steps" class="lesson-steps"></ol>
+        <p id="lesson-check" class="lesson-check"></p>
+      </details>
 
     <section class="desk" aria-label="Quote desk">
       <article class="card quote-card">
-        <div class="quote-top"><div><div class="section-label">Your next decision</div><h2>Post a two-sided quote</h2></div><div class="mark"><span>Reference mark</span><strong id="mid">$0.00</strong></div></div>
+        <div class="quote-top"><div><h2>Post a two-sided quote</h2></div><div class="mark"><span>Reference mark</span><strong id="mid">$0.00</strong></div></div>
         <div class="quote-grid">
-          <div class="price-field"><label for="bid">Bid · you buy</label><input id="bid" type="number" step="0.01" value="99.50" inputmode="decimal"></div>
-          <div class="price-field"><label for="ask">Ask · you sell</label><input id="ask" type="number" step="0.01" value="100.50" inputmode="decimal"></div>
+          <div class="price-field"><label for="bid">Bid · buy at</label><input id="bid" type="number" step="0.01" value="99.50" inputmode="decimal" aria-describedby="quote-note risk-note"></div>
+          <div class="price-field"><label for="ask">Ask · sell at</label><input id="ask" type="number" step="0.01" value="100.50" inputmode="decimal" aria-describedby="quote-note risk-note"></div>
         </div>
-        <div class="quote-meta"><span>Spread <strong id="spread">$1.00</strong></span><span id="quote-note">Quote around the reference mark.</span><span>$0.01 steps</span></div>
-        <button id="submitbtn" class="primary" onclick="submitTurn()">Post quote for this turn</button>
-        <p class="risk-note" id="risk-note">Start a session below to begin. Tighter quotes can trade more often; inventory makes the next price move matter.</p>
+        <div class="quote-meta"><span>Spread <strong id="spread">$1.00</strong></span><span id="quote-note">Set both prices around the mark.</span></div>
+        <div class="quote-actions"><button id="submitbtn" class="primary" onclick="submitTurn()">Post quote</button><p class="risk-note" id="risk-note">Start the selected lesson to enable quoting.</p></div>
       </article>
 
       <aside class="card snapshot" aria-label="Position snapshot">
@@ -192,43 +238,10 @@
       </aside>
     </section>
 
-    <section class="card guide" aria-labelledby="guide-title">
-      <div class="guide-head"><div><div class="section-label">Desk guide</div><h2 id="guide-title">How to make a market well</h2></div><span class="quiet">Aim for marked P&amp;L, not just fills.</span></div>
-      <div class="guide-grid">
-        <article class="guide-card">
-          <h3>1. Quote two prices</h3>
-          <p>Your <strong>bid</strong> is the price where you buy. Your <strong>ask</strong> is where you sell. The ask minus the bid is the bid-ask spread.</p>
-          <p class="guide-rule"><strong>Spread is opportunity, not guaranteed profit.</strong> You earn it only if customer flow trades with you and later price moves do not overwhelm the position you carry.</p>
-        </article>
-        <article class="guide-card">
-          <h3>2. Trade flow for risk</h3>
-          <p><strong>Tighten</strong> the spread when you are flat and want more chance of trading. <strong>Widen</strong> it when the market feels volatile or you already carry enough inventory.</p>
-          <p class="guide-rule"><strong>Do not chase every fill.</strong> A wide quote may miss trades; a tight quote may fill quickly and leave you exposed to the next mark move.</p>
-        </article>
-        <article class="guide-card">
-          <h3>3. Move with inventory</h3>
-          <p><strong>Long?</strong> Shift both prices down: a lower ask helps you sell, and a lower bid discourages more buying. <strong>Short?</strong> Shift both up: a higher bid helps you buy back, and a higher ask discourages more selling.</p>
-          <p class="guide-rule"><strong>Flat?</strong> Keep a balanced quote around the reference mark. After every turn, use inventory, the mark, and coaching to decide whether to tighten, widen, or shift.</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="card scenario-card" aria-label="Scenario selection">
-      <div class="scenario-card-head"><div><div class="section-label">Choose a lesson</div><h3 id="scenario-title">Loading scenarios…</h3></div><span id="scenario-turns" class="quiet"></span></div>
-      <p id="scenario-brief" class="objective"></p>
-      <div id="scenario-options" class="scenario-options"></div>
-      <p id="scenario-objective" class="objective"></p>
-      <section id="lesson-plan" class="lesson-plan" hidden aria-labelledby="lesson-plan-title">
-        <div class="lesson-plan-head"><div><div class="section-label">Guided practice</div><h4 id="lesson-plan-title">First Spread tutorial</h4></div><span id="lesson-plan-progress" class="quiet"></span></div>
-        <ol id="lesson-steps" class="lesson-steps"></ol>
-        <p id="lesson-check" class="lesson-check"></p>
-      </section>
-    </section>
-
     <section class="turn-grid">
       <article class="card turn-card">
-        <div class="turn-heading"><div><div class="section-label">What just happened</div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status" role="status" aria-live="polite">No turn submitted</span></div>
-        <div id="turn-empty" class="turn-empty">Your next quote will turn market flow into a short, reviewable story.</div>
+        <div class="turn-heading"><div><h2>Turn narrative</h2></div><span id="turn-status" class="turn-status" role="status" aria-live="polite">No turn submitted</span></div>
+        <div id="turn-empty" class="turn-empty">Post a quote to see what traded and why.</div>
         <div id="turn-detail" hidden>
           <p id="turn-story" class="story"></p>
           <section id="turn-attribution" class="attribution" hidden aria-labelledby="turn-attribution-title">
@@ -243,31 +256,27 @@
         </div>
       </article>
       <article class="card history-card">
-        <div class="section-label" style="margin-bottom:14px">Session path</div>
-        <table class="history-table"><thead><tr><th>Turn</th><th>Mark</th><th>Inv.</th><th>Equity</th><th>P&amp;L</th></tr></thead><tbody id="historybody"></tbody></table>
+        <h2 id="history-title" tabindex="-1">Session path</h2>
+        <table class="history-table" aria-labelledby="history-title"><thead><tr><th scope="col">Turn</th><th scope="col">Mark</th><th scope="col"><abbr title="Inventory">Inv.</abbr></th><th scope="col">Equity</th><th scope="col">P&amp;L</th></tr></thead><tbody id="historybody"></tbody></table>
       </article>
     </section>
 
     <section class="card audit-card" aria-labelledby="audit-title">
-      <div class="audit-heading"><div><div class="section-label">Exchange tape</div><h2 id="audit-title">Turn audit</h2></div><span id="audit-status" class="audit-status">No customer flow yet</span></div>
-      <div id="audit-empty" class="audit-empty">When you post a quote, the exchange places your bid and ask as resting orders. Simulated customer IOC orders then arrive: they trade immediately only if their limit crosses your quote; otherwise, they expire.</div>
+      <div class="audit-heading"><div><h2 id="audit-title">Turn audit</h2></div><span id="audit-status" class="audit-status">No customer flow yet</span></div>
+      <div id="audit-empty" class="audit-empty">Post a quote to inspect customer orders and any fills.</div>
       <div id="audit-detail" hidden>
         <p id="audit-explainer" class="audit-explainer"></p>
         <div class="audit-grid">
-          <article class="audit-panel"><h3>Customer orders</h3><table class="audit-table"><thead><tr><th>Order</th><th>Limit</th><th>Outcome</th></tr></thead><tbody id="ordersbody"></tbody></table></article>
-          <article class="audit-panel"><h3>Your matched trades</h3><table class="audit-table"><thead><tr><th>You</th><th>Execution</th><th>Why it traded</th></tr></thead><tbody id="tradesbody"></tbody></table></article>
+          <article class="audit-panel"><h3 id="orders-title">Customer orders</h3><table class="audit-table" aria-labelledby="orders-title"><thead><tr><th scope="col">Order</th><th scope="col">Limit</th><th scope="col">Outcome</th></tr></thead><tbody id="ordersbody"></tbody></table></article>
+          <article class="audit-panel"><h3 id="trades-title">Your matched trades</h3><table class="audit-table" aria-labelledby="trades-title"><thead><tr><th scope="col">You</th><th scope="col">Execution</th><th scope="col">Why it traded</th></tr></thead><tbody id="tradesbody"></tbody></table></article>
         </div>
         <details class="tape"><summary>Session tape: earlier customer flow</summary><div id="tapebody" class="tape-list"></div></details>
       </div>
     </section>
 
-    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><div class="section-label">Session complete</div><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><p id="recap-informed-flow" class="informed-flow" hidden></p><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button id="play-again" class="primary" style="width:auto" onclick="playAgain()">Play again</button><button id="review-history" class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
+    <section id="gamesummary" class="card summary" hidden tabindex="-1" aria-labelledby="summary-title"><h2 id="summary-title">Review the risk you carried.</h2><div id="summarycontent" class="summary-copy"></div><p id="recap-informed-flow" class="informed-flow" hidden></p><section id="scorecard" class="scorecard" hidden aria-labelledby="scorecard-title"><div id="scorecard-title" class="scorecard-label">Lesson scorecard</div><div class="score-grid"><div class="score-metric"><span>Marked P&amp;L</span><strong id="score-pnl"></strong></div><div class="score-metric"><span id="score-focus-label"></span><strong id="score-focus-value"></strong></div></div><p id="score-focus-note" class="score-note"></p><p id="score-reflection" class="score-reflection"></p></section><div class="actions"><button id="play-again" class="primary" style="width:auto" onclick="playAgain()">Play again</button><button id="review-history" class="secondary" onclick="reviewHistory()">Review turns</button></div></section>
+    </div>
 
-    <details>
-      <summary>Session controls</summary>
-      <div class="scenario-actions" style="margin-top:12px"><button id="start-selected" class="secondary" onclick="startNewGame()" disabled>Start selected lesson</button><button id="quit-session" class="secondary" onclick="quitSession()" disabled>End current session</button></div>
-      <p class="quiet">Lessons use server-owned, fixed scenarios so the same session can be replayed and compared fairly.</p>
-    </details>
   </main>
 </div>
 
@@ -275,8 +284,9 @@
 let gameId = null, version = 0, isOver = false, startingEquityFixed = 0n, history = [];
 let pendingCommand = null, retryCommand = null, retryQuitCommand = null;
 let scenarios = [], selectedScenarioID = null;
-let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, restorationState = null;
+let catalogReady = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, retryHydrationID = null, restorationState = null;
 let turnAudits = [], auditGeneration = 0;
+let replacementApproved = false;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -473,6 +483,7 @@ function syncQuoteControls() {
   $('bid').disabled = disabled || unresolved; $('ask').disabled = disabled || unresolved;
   $('quit-session').disabled = disabled || Boolean(retryCommand);
   $('quit-session').textContent = retryQuitCommand ? 'Retry ending session' : 'End current session';
+  $('choose-lesson').disabled = Boolean(pendingCommand) || startingSession || restoring || unresolved;
   $('play-again').disabled = Boolean(pendingCommand) || startingSession || restoring || unresolved;
   $('review-history').disabled = Boolean(pendingCommand) || startingSession || restoring;
 }
@@ -491,7 +502,7 @@ function setState(state, summary, recap) {
   const risk = state.inventory < 0n ? -state.inventory : state.inventory;
   $('position-caption').textContent = direction === 'Flat' ? 'Flat. No inventory exposure yet.' : `${direction} ${quantity(risk)} units. A $1 mark move changes equity by about ${money(risk, 4)}.`;
   $('risk-note').textContent = direction === 'Flat' ? 'Tighter quotes can trade more often; inventory makes the next price move matter.' : `${direction} inventory is live. Quote with the next mark move in mind.`;
-  $('session-label').textContent = state.isOver ? 'Session complete' : gameId ? 'Live scenario' : 'Ready to quote';
+  $('session-label').textContent = state.isOver ? 'Session complete' : gameId ? 'Live scenario' : 'Choose a lesson';
   isOver = state.isOver;
   syncQuoteControls();
   if (state.isOver) showSummary(state, recap);
@@ -722,7 +733,8 @@ function previousMark(message) {
 function applyScenario(snapshot) {
   if (!snapshot) return;
   $('scenario-title').textContent = snapshot.title; $('scenario-brief').textContent = snapshot.briefing;
-  $('scenario-objective').textContent = `Goal: ${snapshot.objective}`; $('scenario-turns').textContent = `${snapshot.turns} turns`; renderTutorial(snapshot);
+  $('scenario-objective').textContent = `Goal: ${snapshot.objective}`; $('scenario-turns').textContent = `${snapshot.turns} turns`;
+  $('active-lesson-title').textContent = snapshot.title; $('active-lesson-turns').textContent = `${snapshot.turns} turns`; renderTutorial(snapshot);
 }
 function renderTutorial(snapshot) {
   const plan = $('lesson-plan'), steps = snapshot?.tutorial || [];
@@ -740,37 +752,59 @@ function renderTutorial(snapshot) {
   }
   list.replaceChildren(...items);
 }
-function renderScenarios() {
+function renderScenarios(focusID) {
   const list = $('scenario-options'), buttons = [];
+  const disabled = Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest);
+  list.setAttribute('aria-busy', disabled ? 'true' : 'false');
   for (const snapshot of scenarios) {
-    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState) || Boolean(retryCreateRequest) || Boolean(gameId && !isOver); button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
-    const title = document.createElement('strong'), briefing = document.createElement('span');
-    title.textContent = snapshot.title; briefing.textContent = snapshot.briefing; button.append(title, briefing);
-    button.onclick = () => { selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(); };
+    const button = document.createElement('button'); button.className = 'scenario-option'; button.disabled = disabled; button.setAttribute('aria-pressed', snapshot.id === selectedScenarioID ? 'true' : 'false');
+    const heading = document.createElement('div'); heading.className = 'scenario-option-title';
+    const title = document.createElement('strong'), meta = document.createElement('span'); title.textContent = snapshot.title; meta.className = 'scenario-option-meta';
+    const guidedSteps = snapshot.tutorial?.length || 0, selected = snapshot.id === selectedScenarioID;
+    meta.textContent = `${selected ? 'Selected · ' : ''}${snapshot.turns} turns${guidedSteps ? ` · ${guidedSteps} steps` : ''}`;
+    heading.append(title, meta);
+    const briefing = document.createElement('div'); briefing.className = 'scenario-option-copy'; briefing.textContent = snapshot.briefing;
+    const goal = document.createElement('div'); goal.className = 'scenario-option-goal'; goal.textContent = `Goal: ${snapshot.objective}`;
+    button.append(heading, briefing, goal);
+    button.onclick = () => { retryHydrationID = null; selectedScenarioID = snapshot.id; applyScenario(snapshot); renderScenarios(snapshot.id); setStartButtonsEnabled(catalogReady); };
     buttons.push(button);
   }
   list.replaceChildren(...buttons);
+  if (focusID) buttons[scenarios.findIndex(snapshot => snapshot.id === focusID)]?.focus();
 }
 function setStartButtonsEnabled(enabled) {
-  const disabled = (!enabled && !retryCreateRequest) || Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState);
-  $('start-default').disabled = disabled; $('start-selected').disabled = disabled;
+  const disabled = ((!enabled || !selectedScenarioID) && !retryCreateRequest && !retryHydrationID) || Boolean(pendingCommand) || Boolean(retryCommand) || Boolean(retryQuitCommand) || startingSession || Boolean(restorationState);
+  $('start-default').disabled = disabled;
+  $('start-default').textContent = startingSession ? 'Starting lesson…' : retryHydrationID ? 'Resume lesson' : retryCreateRequest ? 'Retry starting lesson' : 'Start lesson';
+  $('play-again').textContent = retryHydrationID ? 'Resume lesson' : 'Play again';
 }
 async function loadScenarios() {
+  $('scenario-options').setAttribute('aria-busy', 'true'); $('retry-catalog').hidden = true;
   try {
     const response = await fetch('/api/v2/scenarios'); if (!response.ok) throw new Error();
     const data = plain(await responseJSON(response), 'scenario response'); if (!Array.isArray(data.scenarios)) throw new Error('scenarios must be an array'); scenarios = data.scenarios.map((item, index) => validateScenario(item, `scenarios[${index}]`));
-    if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
-    applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); catalogReady = scenarios.length > 0; setStartButtonsEnabled(catalogReady);
-  } catch (_) { $('scenario-title').textContent = 'Scenario catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server and try again.'; catalogReady = false; setStartButtonsEnabled(false); }
+    const selected = scenarios.find(item => item.id === selectedScenarioID);
+    if (selected) applyScenario(selected);
+    else if (!retryHydrationID) { selectedScenarioID = null; $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.'; $('scenario-objective').textContent = ''; $('scenario-turns').textContent = ''; }
+    renderScenarios(); catalogReady = scenarios.length > 0;
+    if (!catalogReady) { $('scenario-title').textContent = 'No lessons available'; $('scenario-brief').textContent = 'The server returned an empty lesson catalog. Restart the local server, then try again.'; $('retry-catalog').hidden = false; }
+    setStartButtonsEnabled(catalogReady);
+  } catch (_) {
+    if (!gameId) {
+      $('scenario-title').textContent = 'Lesson catalog unavailable'; $('scenario-brief').textContent = 'Restart the local server, then reload this page.'; $('scenario-objective').textContent = ''; $('scenario-turns').textContent = '';
+    }
+    $('scenario-options').replaceChildren(); $('scenario-options').setAttribute('aria-busy', 'false'); $('retry-catalog').hidden = false; catalogReady = false; setStartButtonsEnabled(false);
+  }
 }
 function pendingCreate() {
   try { return JSON.parse(stored('mmg.pending_create')); } catch (_) { removeStored('mmg.pending_create'); return null; }
 }
 async function startNewGame(request) {
   if (pendingCommand || retryCommand || retryQuitCommand || startingSession || restorationState) return {status:'ignored'};
-  if (!request && gameId && !isOver && !confirm('Start a new lesson? This replaces the current session in the desk.')) return {status:'ignored'};
+  if (!request && !retryCreateRequest && gameId && !isOver && !replacementApproved && !confirm('Start a new lesson? This replaces the current session in the desk.')) return {status:'ignored'};
   if (!selectedScenarioID) { alert('Choose a lesson before starting.'); return {status:'ignored'}; }
   const create = request || retryCreateRequest || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
+  replacementApproved = false;
   const attempt = ++startAttempt; startingSession = true; retryCreateRequest = create;
   const savedCreate = store('mmg.pending_create', JSON.stringify(create)); renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
   let acknowledged = false;
@@ -789,7 +823,7 @@ async function startNewGame(request) {
     if (!savedGame) alert('Session was acknowledged, but browser storage is unavailable. Keep this tab open to continue this lesson.');
     if (attempt !== startAttempt) return {status:'stale'};
     const hydration = await hydrateGame(create.game_id);
-    if (hydration.status !== 'hydrated' && hydration.status !== 'stale') alert('The session was created, but its canonical state could not be loaded. The game ID was kept for retry.');
+    if (hydration.status !== 'hydrated' && hydration.status !== 'stale') { retryHydrationID = create.game_id; alert('The session was created, but its canonical state could not be loaded. Use Resume lesson to try again.'); }
     return {status:hydration.status === 'hydrated' ? 'started' : hydration.status};
   } catch (_) {
     if (attempt === startAttempt && !acknowledged) alert(savedCreate ? 'The create response was uncertain. Start the lesson again to safely retry the same request.' : 'The create response was uncertain. Keep this tab open to retry the same request.');
@@ -799,9 +833,22 @@ async function startNewGame(request) {
   }
 }
 
-function startDefault() {
-  if (!selectedScenarioID && scenarios.length) selectedScenarioID = scenarios[0].id;
+async function startDefault() {
+  if (retryHydrationID) {
+    const result = await hydrateGame(retryHydrationID);
+    if (result.status === 'failed') alert('The saved lesson still could not be loaded. Check the local server, then use Resume lesson again.');
+    return result;
+  }
   return startNewGame();
+}
+
+function showLessonStage(moveFocus = false) { $('lesson-stage').hidden = false; $('game-stage').hidden = true; $('turn').hidden = true; $('session-label').textContent = 'Choose a lesson'; if (moveFocus) $('lesson-picker-title').focus(); }
+function showGameStage(moveFocus = false) { $('lesson-stage').hidden = true; $('game-stage').hidden = false; $('turn').hidden = false; if (moveFocus) $('active-lesson-title').focus(); }
+function chooseAnotherLesson() {
+  if (pendingCommand || startingSession || restorationState || retryCommand || retryQuitCommand) return;
+  if (gameId && !isOver && !confirm('Choose another lesson? Your current session will be replaced when you start a new one.')) return;
+  replacementApproved = Boolean(gameId && !isOver); retryHydrationID = null; selectedScenarioID = null;
+  $('scenario-title').textContent = 'Select a lesson to continue'; $('scenario-brief').textContent = 'Compare the goals above, then choose the desk you want to practice.'; renderScenarios(); setStartButtonsEnabled(catalogReady); showLessonStage(true);
 }
 
 async function submitTurn() {
@@ -817,7 +864,7 @@ async function submitTurn() {
       if (epoch !== sessionEpoch || pendingCommand !== command) return;
       if (response.status === 409 && apiErrorCode(body) === 'version_conflict') {
         retryCommand = null; pendingCommand = null;
-        const hydration = await hydrateGame(gameId);
+        const hydration = await hydrateGameWithoutFocus(gameId);
         if (hydration.status === 'failed') alert('The quote conflicted with canonical state, which could not be reloaded. Retry after reconnecting.');
         return;
       }
@@ -852,7 +899,7 @@ async function quitSession() {
       if (epoch !== sessionEpoch || pendingCommand !== command) return;
       if (response.status === 409 && apiErrorCode(body) === 'version_conflict') {
         retryQuitCommand = null; pendingCommand = null;
-        const hydration = await hydrateGame(gameId);
+        const hydration = await hydrateGameWithoutFocus(gameId);
         if (hydration.status === 'failed') alert('The end-session command conflicted with canonical state, which could not be reloaded. Retry after reconnecting.');
         return;
       }
@@ -894,22 +941,29 @@ function showSummary(state, recap) {
   }
   $('gamesummary').focus();
 }
-function playAgain() { if (!pendingCommand && !retryCommand && !retryQuitCommand && !startingSession && !restorationState) return startNewGame(); }
-function reviewHistory() { if (!pendingCommand && !startingSession && !restorationState) $('historybody').scrollIntoView({behavior:'smooth', block:'center'}); }
-function commitHydration(id, staged) {
+function playAgain() { if (!pendingCommand && !retryCommand && !retryQuitCommand && !startingSession && !restorationState) return retryHydrationID ? startDefault() : startNewGame(); }
+function reviewHistory() {
+  if (pendingCommand || startingSession || restorationState) return;
+  const heading = $('history-title'), reducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  heading.focus(); heading.scrollIntoView({behavior:reducedMotion ? 'auto' : 'smooth', block:'center'});
+}
+function commitHydration(id, staged, moveFocus) {
   gameId = id; version = staged.state.version; isOver = staged.state.isOver; startingEquityFixed = staged.startingEquity;
   history = staged.history; turnAudits = staged.audits; auditGeneration++;
-  pendingCommand = retryCommand = retryQuitCommand = null;
+  pendingCommand = retryCommand = retryQuitCommand = null; retryHydrationID = null;
   const saved = store('mmg.game_id', id); removeStored('mmg.starting_equity');
   selectedScenarioID = staged.scenario.id; applyScenario(staged.scenario); renderScenarios(); renderHistory();
   if (staged.latestTurn) renderLatestTurn(staged.latestTurn); else resetLatestTurn();
   if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
   else { $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet'; }
-  $('gamesummary').hidden = true; setState(staged.state, staged.latestTurn?.summary, staged.recap); renderTopCoaching(staged.coaching, staged.state);
+  $('gamesummary').hidden = true; showGameStage(); setState(staged.state, staged.latestTurn?.summary, staged.recap); renderTopCoaching(staged.coaching, staged.state);
+  if (!staged.state.isOver && moveFocus) $('active-lesson-title').focus();
   if (!saved) alert('Canonical state loaded, but browser storage is unavailable. Keep this tab open to continue.');
 }
 
-async function hydrateGame(id) {
+function hydrateGame(id) { return hydrateGameInternal(id, true); }
+function hydrateGameWithoutFocus(id) { return hydrateGameInternal(id, false); }
+async function hydrateGameInternal(id, moveFocus) {
   if (!UUID_PATTERN.test(id)) return {status:'failed', error:new Error('stored game ID is invalid')};
   const epoch = ++sessionEpoch, restoration = {id, epoch};
   restorationState = restoration; renderScenarios(); setStartButtonsEnabled(catalogReady); syncQuoteControls();
@@ -922,7 +976,7 @@ async function hydrateGame(id) {
     const events = await loadAuditHistory(id, staged.eventsThrough, controller.signal);
     staged.audits = buildAudits(events); staged.history = restoreHistory(events, staged.state, staged.startingEquity);
     if (epoch !== sessionEpoch || restorationState !== restoration) return {status:'stale'};
-    commitHydration(id, staged); return {status:'hydrated'};
+    commitHydration(id, staged, moveFocus); return {status:'hydrated'};
   } catch (error) { return {status:'failed', error}; }
   finally {
     clearTimeout(timeout);
@@ -932,7 +986,12 @@ async function hydrateGame(id) {
     }
   }
 }
-async function resumeGame() { const id = stored('mmg.game_id'); return id ? hydrateGame(id) : {status:'none'}; }
+async function resumeGame() {
+  const id = stored('mmg.game_id'); if (!id) return {status:'none'};
+  const result = await hydrateGame(id);
+  if (result.status === 'failed') { retryHydrationID = id; setStartButtonsEnabled(catalogReady); }
+  return result;
+}
 function installKeyboardHandler() { document.addEventListener('keydown', event => { if (event.key === 'Enter' && document.activeElement && ['bid','ask'].includes(document.activeElement.id)) { event.preventDefault(); submitTurn(); } }); }
 async function initialize() {
   const catalog = loadScenarios(), request = pendingCreate();
@@ -944,12 +1003,12 @@ async function initialize() {
 }
 function seedTestModel(id, rawState, baseline) {
   const state = uiState(rawState); gameId = id; version = state.version; isOver = state.isOver; startingEquityFixed = requireFixed(baseline, 8, 'baseline');
-  history = []; turnAudits = []; pendingCommand = retryCommand = retryQuitCommand = null; restorationState = null; setState(state); return state;
+  history = []; turnAudits = []; pendingCommand = retryCommand = retryQuitCommand = null; restorationState = null; setState(state); showGameStage(); return state;
 }
 globalThis.__MM_TEST__ = {
-  hydrateGame, startNewGame, submitTurn, quitSession, seedTestModel,
-  setCatalog(items, selected) { scenarios = items.map((item, index) => validateScenario(item, `test scenarios[${index}]`)); selectedScenarioID = selected || scenarios[0]?.id || null; catalogReady = scenarios.length > 0; if (selectedScenarioID) applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(catalogReady); },
-  model() { return {gameId, version, isOver, startingEquityFixed:String(startingEquityFixed), pendingCommand, retryCommand, retryQuitCommand, restoration:Boolean(restorationState), historyLength:history.length}; }
+  hydrateGame, startDefault, startNewGame, submitTurn, quitSession, chooseAnotherLesson, playAgain, seedTestModel,
+  setCatalog(items, selected) { scenarios = items.map((item, index) => validateScenario(item, `test scenarios[${index}]`)); selectedScenarioID = selected || null; catalogReady = scenarios.length > 0; if (selectedScenarioID) applyScenario(scenarios.find(item => item.id === selectedScenarioID)); renderScenarios(); setStartButtonsEnabled(catalogReady); },
+  model() { return {gameId, version, isOver, startingEquityFixed:String(startingEquityFixed), pendingCommand, retryCommand, retryQuitCommand, retryHydrationID, restoration:Boolean(restorationState), historyLength:history.length, view:$('game-stage').hidden ? 'lessons' : 'game'}; }
 };
 if (!globalThis.__MM_TEST_MODE__) {
   ['bid', 'ask'].forEach(id => $(id).addEventListener('input', updateQuotePreview));

@@ -52,6 +52,7 @@ function loadApp(fetchImpl, timeout = 100) {
   };
   document.getElementById('bid').value = '99.50';
   document.getElementById('ask').value = '100.50';
+  document.getElementById('game-stage').hidden = true;
   const storage = new Map(), alerts = [];
   let uuid = 5;
   const context = {
@@ -131,7 +132,7 @@ test('replayed create is only an acknowledgement and hydrates advanced canonical
     if (url.includes('/events?')) return response(200, {events:[markEvent(1, QUOTE_ID, '101.0000', '100.0000')], next_after:1, has_more:false});
     throw new Error(`unexpected fetch ${url}`);
   });
-  app.api.setCatalog([scenario]);
+  app.api.setCatalog([scenario], scenario.id);
   const result = await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
   assert.equal(result.status, 'started');
   assert.equal(app.api.model().version, 1);
@@ -142,18 +143,74 @@ test('replayed create is only an acknowledgement and hydrates advanced canonical
 });
 
 test('definitive create acknowledgement clears create retry but retains game ID when hydration fails', async () => {
+  let createCalls = 0;
   const app = loadApp(async url => {
-    if (url === '/api/v2/games') return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}});
+    if (url === '/api/v2/games') { createCalls++; return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}}); }
     return response(503, {error:{code:'storage_failure', message:'unavailable'}});
   });
-  app.api.setCatalog([scenario]);
+  app.api.setCatalog([scenario], scenario.id);
   const result = await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
   assert.equal(result.status, 'failed');
   assert.equal(app.storage.get('mmg.game_id'), GAME_ID);
   assert.equal(app.storage.has('mmg.pending_create'), false);
   assert.equal(app.api.model().gameId, null);
   assert.equal(app.elements.get('start-default').disabled, false);
+  assert.equal(app.elements.get('start-default').textContent, 'Resume lesson');
+  assert.equal(app.api.model().retryHydrationID, GAME_ID);
+  await app.api.startDefault();
+  assert.equal(createCalls, 1);
+  app.elements.get('scenario-options').children[0].onclick();
+  assert.equal(app.api.model().retryHydrationID, null);
+  assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
   assert.equal(app.api.model().restoration, false);
+});
+
+test('play again resumes an acknowledged game instead of creating a duplicate', async () => {
+  let createCalls = 0;
+  const app = loadApp(async (url, options = {}) => {
+    if (url === '/api/v2/games' && options.method === 'POST') { createCalls++; return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}}); }
+    if (url === `/api/v2/games/${GAME_ID}`) return response(503, {error:{code:'storage_failure', message:'unavailable'}});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  app.api.setCatalog([scenario], scenario.id);
+  app.api.seedTestModel(GAME_ID, state({isOver:true, reason:'completed'}), '1000.00000000');
+  await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
+  assert.equal(app.elements.get('play-again').textContent, 'Resume lesson');
+  await app.api.playAgain();
+  assert.equal(createCalls, 1);
+});
+
+test('lesson picker renders catalog options and updates the lesson preview', () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  const second = {...scenario, id:'inventory-pressure-v1', title:'Inventory Pressure', briefing:'Manage the position.', objective:'Reduce inventory.', turns:7};
+  app.api.setCatalog([scenario, second]);
+  const picker = app.elements.get('scenario-options');
+  assert.equal(picker.children.length, 2);
+  assert.equal(picker.children[0].children[0].children[0].textContent, 'First Spread');
+  assert.equal(picker.children[1].children[0].children[0].textContent, 'Inventory Pressure');
+  assert.equal(picker.children[0].attributes.get('aria-pressed'), 'false');
+  assert.equal(app.elements.get('start-default').disabled, true);
+  picker.children[1].onclick();
+  assert.equal(picker.children[1].attributes.get('aria-pressed'), 'true');
+  assert.equal(picker.children[1].focused, true);
+  assert.equal(app.elements.get('start-default').disabled, false);
+  assert.equal(app.elements.get('scenario-title').textContent, 'Inventory Pressure');
+  assert.equal(app.elements.get('scenario-brief').textContent, 'Manage the position.');
+  assert.equal(app.elements.get('scenario-objective').textContent, 'Goal: Reduce inventory.');
+});
+
+test('lesson and game stages replace one another', () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  app.api.setCatalog([scenario]);
+  assert.equal(app.api.model().view, 'lessons');
+  app.api.seedTestModel(GAME_ID, state(), '1000.00000000');
+  assert.equal(app.api.model().view, 'game');
+  assert.equal(app.elements.get('lesson-stage').hidden, true);
+  app.api.chooseAnotherLesson();
+  assert.equal(app.api.model().view, 'lessons');
+  assert.equal(app.elements.get('lesson-stage').hidden, false);
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, false);
+  assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
 });
 
 test('version conflict clears the quote and hydrates canonical state before controls resume', async () => {
