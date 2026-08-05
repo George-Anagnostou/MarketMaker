@@ -77,6 +77,40 @@ func TestPartialFillCancelAndBestPrices(t *testing.T) {
 	}
 }
 
+func TestPartiallyFilledGTCTakerRestsRemainder(t *testing.T) {
+	b := New()
+	if _, err := b.Submit(order(1, 1, "seller-a", Sell, "100", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+	report, err := b.Submit(order(2, 2, "buyer", Buy, "101", "2", GTC, t), RejectTaker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Fills) != 1 || report.Fills[0].Maker.ID != 1 || report.Fills[0].Price != price(t, "100") || len(report.Completed) != 1 || report.Completed[0].ID != 1 || report.Resting == nil || report.Resting.ID != 2 || report.Resting.Remaining != qty(t, "1") {
+		t.Fatalf("report=%+v", report)
+	}
+	if _, ok := b.Order(1); ok {
+		t.Fatal("filled maker remains live")
+	}
+	if resting, ok := b.Order(2); !ok || resting.Remaining != qty(t, "1") {
+		t.Fatalf("resting taker=%+v", resting)
+	}
+	if _, err := b.Submit(order(3, 3, "buyer-later", Buy, "101", "1", GTC, t), RejectTaker); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := b.Submit(order(4, 4, "seller-b", Sell, "101", "2", IOC, t), RejectTaker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Fills) != 2 || second.Fills[0].Maker.ID != 2 || second.Fills[1].Maker.ID != 3 || second.Fills[0].Price != price(t, "101") || second.Fills[1].Price != price(t, "101") || len(second.Completed) != 3 || second.Completed[0].ID != 2 || second.Completed[1].ID != 3 || second.Completed[2].ID != 4 {
+		t.Fatalf("second fill=%+v", second.Fills)
+	}
+	if b.Len() != 0 {
+		t.Fatalf("book retains completed orders: %+v", b.Orders(""))
+	}
+}
+
 func TestDepthSnapshotsAreBestPriceFirst(t *testing.T) {
 	b := New()
 	for _, o := range []Order{order(1, 1, "a", Buy, "99", "1", GTC, t), order(2, 2, "b", Buy, "100", "2", GTC, t), order(3, 3, "c", Buy, "100", "3", GTC, t), order(4, 4, "d", Sell, "102", "1", GTC, t), order(5, 5, "e", Sell, "101", "2", GTC, t)} {

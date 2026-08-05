@@ -39,6 +39,23 @@ func config(t *testing.T) Config {
 	return Config{Instrument: "SIM", StartingCash: mustMoney(t, "100000"), StartingMark: mustPrice(t, "100"), MaxPosition: mustQty(t, "1000"), MaxOrderQty: mustQty(t, "10"), InitialMarginBps: 5000, MaintenanceMarginBps: 2500, MaxOrdersPerTurn: 1, MaxFlowSlippageBps: 100, MinMoveBps: 0, MaxMoveBps: 0, Seed: 42}
 }
 
+func forEachSimulationVersion(t *testing.T, test func(t *testing.T, cfg Config)) {
+	t.Helper()
+	for _, version := range []struct {
+		name    string
+		version SimulationVersion
+	}{
+		{name: "legacy", version: SimulationVersionLegacy},
+		{name: "adverse selection", version: SimulationVersionAdverseSelection},
+	} {
+		t.Run(version.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.SimulationVersion = version.version
+			test(t, cfg)
+		})
+	}
+}
+
 func TestQuoteOnlyFillsWhenCustomerLimitCrosses(t *testing.T) {
 	cfg := config(t)
 	cfg.MaxFlowSlippageBps = 0
@@ -69,49 +86,169 @@ func TestQuoteReservesCashAndPosition(t *testing.T) {
 }
 
 func TestQuoteRenewalAssessesPostReplacementRisk(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		version SimulationVersion
-	}{
-		{name: "legacy", version: SimulationVersionLegacy},
-		{name: "adverse selection", version: SimulationVersionAdverseSelection},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cfg := config(t)
-			cfg.SimulationVersion = test.version
-			cfg.StartingCash = mustMoney(t, "100")
-			cfg.MaxOrderQty = mustQty(t, "1")
-			cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
-			cfg.MaxFlowSlippageBps = 0
-			e, err := New(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
+	forEachSimulationVersion(t, func(t *testing.T, cfg Config) {
+		cfg.StartingCash = mustMoney(t, "100")
+		cfg.MaxOrderQty = mustQty(t, "1")
+		cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+		cfg.MaxFlowSlippageBps = 0
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
-				t.Fatalf("identical quote renewal was rejected: %v", err)
-			}
-			orders := e.OpenOrders(PlayerAccount)
-			if len(orders) != 2 || orders[0].Price != mustPrice(t, "90") || orders[1].Price != mustPrice(t, "110") {
-				t.Fatalf("renewed orders=%+v", orders)
-			}
-			assertReservationsDerivedFromBook(t, e)
-			assertLedgerMatchesAccounts(t, e)
+		if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
+			t.Fatalf("identical quote renewal was rejected: %v", err)
+		}
+		orders := e.OpenOrders(PlayerAccount)
+		if len(orders) != 2 || orders[0].Price != mustPrice(t, "90") || orders[1].Price != mustPrice(t, "110") {
+			t.Fatalf("renewed orders=%+v", orders)
+		}
+		assertReservationsDerivedFromBook(t, e)
+		assertLedgerMatchesAccounts(t, e)
 
-			before := exchangeObservableState(e)
-			if _, err := e.SubmitQuote(mustPrice(t, "101"), mustPrice(t, "102")); err == nil {
-				t.Fatal("expected cash-reservation rejection")
+		before := exchangeObservableState(e)
+		if _, err := e.SubmitQuote(mustPrice(t, "101"), mustPrice(t, "102")); err == nil {
+			t.Fatal("expected cash-reservation rejection")
+		}
+		if got := exchangeObservableState(e); !reflect.DeepEqual(got, before) {
+			t.Fatal("rejected quote renewal changed venue")
+		}
+		assertReservationsDerivedFromBook(t, e)
+		assertLedgerMatchesAccounts(t, e)
+	})
+}
+
+func TestQuoteRenewalReplacesManualPlayerOrders(t *testing.T) {
+	forEachSimulationVersion(t, func(t *testing.T, cfg Config) {
+		cfg.StartingCash = mustMoney(t, "100")
+		cfg.MaxOrderQty = mustQty(t, "1")
+		cfg.MaxOrdersPerTurn = 0
+		cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buy, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "80"), mustQty(t, "1"), GTC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sell, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "120"), mustQty(t, "1"), GTC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlaceLimit(FlowAccount, Sell, mustPrice(t, "121"), mustQty(t, "1"), GTC); err != nil {
+			t.Fatal(err)
+		}
+		before := exchangeObservableState(e)
+		if _, err := e.SubmitQuote(mustPrice(t, "101"), mustPrice(t, "102")); err == nil {
+			t.Fatal("expected replacement cash-reservation rejection")
+		}
+		if got := exchangeObservableState(e); !reflect.DeepEqual(got, before) {
+			t.Fatal("rejected renewal changed manual orders")
+		}
+
+		result, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []uint64{buy.Events[0].Order.ID, sell.Events[0].Order.ID} {
+			if _, ok := e.book.Order(id); ok {
+				t.Fatalf("manual player order %d remains live", id)
 			}
-			if got := exchangeObservableState(e); !reflect.DeepEqual(got, before) {
-				t.Fatal("rejected quote renewal changed venue")
-			}
-			assertReservationsDerivedFromBook(t, e)
-			assertLedgerMatchesAccounts(t, e)
-		})
-	}
+		}
+		if orders := e.OpenOrders(FlowAccount); len(orders) != 1 || orders[0].Price != mustPrice(t, "121") {
+			t.Fatalf("non-player liquidity changed: %+v", orders)
+		}
+		if orders := e.OpenOrders(PlayerAccount); len(orders) != 2 || orders[0].Price != mustPrice(t, "90") || orders[1].Price != mustPrice(t, "110") {
+			t.Fatalf("replacement orders=%+v", orders)
+		}
+		if len(result.Events) < 4 || result.Events[0].Type != "order_canceled" || result.Events[1].Type != "order_canceled" || result.Events[2].Type != "order_accepted" {
+			t.Fatalf("renewal events=%+v", result.Events)
+		}
+		assertReservationsDerivedFromBook(t, e)
+		assertLedgerMatchesAccounts(t, e)
+	})
+}
+
+func TestQuoteRenewalCancelsPartiallyFilledPlayerOrder(t *testing.T) {
+	forEachSimulationVersion(t, func(t *testing.T, cfg Config) {
+		cfg.MaxOrderQty = mustQty(t, "1")
+		cfg.MaxOrdersPerTurn = 0
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlaceLimit(FlowAccount, Sell, mustPrice(t, "100"), mustQty(t, "1"), GTC); err != nil {
+			t.Fatal(err)
+		}
+		placed, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "2"), GTC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldID := placed.Events[0].Order.ID
+		remaining, ok := e.book.Order(oldID)
+		if !ok || remaining.Remaining != mustQty(t, "1") {
+			t.Fatalf("partially filled order=%+v", remaining)
+		}
+
+		result, err := e.SubmitQuote(mustPrice(t, "99"), mustPrice(t, "102"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := e.book.Order(oldID); ok {
+			t.Fatal("partially filled order remains live")
+		}
+		if result.Events[0].Type != "order_canceled" || result.Events[0].Order == nil || result.Events[0].Order.ID != oldID || result.Events[0].Order.Remaining != mustQty(t, "1") {
+			t.Fatalf("cancellation=%+v", result.Events[0])
+		}
+		account, _ := e.Account(PlayerAccount)
+		if account.Cash != mustMoney(t, "99900") || account.Position != mustQty(t, "1") {
+			t.Fatalf("filled account=%+v", account)
+		}
+		if orders := e.OpenOrders(PlayerAccount); len(orders) != 2 || orders[0].Side != Buy || orders[0].Price != mustPrice(t, "99") || orders[0].Remaining != mustQty(t, "1") || orders[1].Side != Sell || orders[1].Price != mustPrice(t, "102") || orders[1].Remaining != mustQty(t, "1") {
+			t.Fatalf("replacement orders=%+v", orders)
+		}
+		assertReservationsDerivedFromBook(t, e)
+		assertLedgerMatchesAccounts(t, e)
+	})
+}
+
+func TestQuoteRenewalReconcilesReservationsAfterImmediateFill(t *testing.T) {
+	forEachSimulationVersion(t, func(t *testing.T, cfg Config) {
+		cfg.StartingCash = mustMoney(t, "100")
+		cfg.MaxOrderQty = mustQty(t, "1")
+		cfg.MaxOrdersPerTurn = 0
+		cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+		e, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "80"), mustQty(t, "1"), GTC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.PlaceLimit(FlowAccount, Sell, mustPrice(t, "90"), mustQty(t, "1"), GTC); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.SubmitQuote(mustPrice(t, "95"), mustPrice(t, "105")); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := e.book.Order(old.Events[0].Order.ID); ok {
+			t.Fatal("old reservation order remains live")
+		}
+		account, _ := e.Account(PlayerAccount)
+		if account.Cash != mustMoney(t, "10") || account.Position != mustQty(t, "1") || account.ReservedCash != 0 || account.OpenBuyQuantity != 0 || account.OpenSellQuantity != mustQty(t, "1") {
+			t.Fatalf("account=%+v", account)
+		}
+		if orders := e.OpenOrders(PlayerAccount); len(orders) != 1 || orders[0].Side != Sell || orders[0].Price != mustPrice(t, "105") {
+			t.Fatalf("remaining orders=%+v", orders)
+		}
+		assertReservationsDerivedFromBook(t, e)
+		assertLedgerMatchesAccounts(t, e)
+	})
 }
 
 func TestRestingBuyOrdersReserveCashCollectively(t *testing.T) {
@@ -619,6 +756,9 @@ func assertLedgerMatchesAccounts(t *testing.T, e *Engine) {
 		if cash != account.Cash || position != account.Position {
 			t.Fatalf("ledger projection account=%s cash=%s/%s position=%s/%s", id, cash, account.Cash, position, account.Position)
 		}
+		if e.LedgerBalance(cashReserved(id)).Money != account.ReservedCash || e.LedgerBalance(instrumentReserved(id)).Instrument != account.OpenSellQuantity {
+			t.Fatalf("ledger reservations account=%s cash=%s/%s sell=%s/%s", id, e.LedgerBalance(cashReserved(id)).Money, account.ReservedCash, e.LedgerBalance(instrumentReserved(id)).Instrument, account.OpenSellQuantity)
+		}
 	}
 }
 
@@ -701,6 +841,7 @@ func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
 
 type observableExchangeState struct {
 	state                           State
+	accounts                        map[string]Account
 	orders                          []orderbook.Order
 	ledger                          []LedgerEntry
 	nextOrder, nextTrade, nextEvent uint64
@@ -713,8 +854,12 @@ func exchangeObservableState(e *Engine) observableExchangeState {
 	if err != nil {
 		panic(err)
 	}
+	accounts := make(map[string]Account, len(e.accounts))
+	for id, account := range e.accounts {
+		accounts[id] = *account
+	}
 	return observableExchangeState{
-		state: e.State(), orders: e.book.Orders(""), ledger: e.LedgerEntries(),
+		state: e.State(), accounts: accounts, orders: e.book.Orders(""), ledger: e.LedgerEntries(),
 		nextOrder: e.nextOrder, nextTrade: e.nextTrade, nextEvent: e.nextEvent,
 		flowRNG: e.flowRNG.state, markRNG: e.markRNG.state, informedRNG: e.informedRNG.state,
 		pcgState: string(pcgState),
