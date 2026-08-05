@@ -68,6 +68,52 @@ func TestQuoteReservesCashAndPosition(t *testing.T) {
 	}
 }
 
+func TestQuoteRenewalAssessesPostReplacementRisk(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version SimulationVersion
+	}{
+		{name: "legacy", version: SimulationVersionLegacy},
+		{name: "adverse selection", version: SimulationVersionAdverseSelection},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config(t)
+			cfg.SimulationVersion = test.version
+			cfg.StartingCash = mustMoney(t, "100")
+			cfg.MaxOrderQty = mustQty(t, "1")
+			cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
+			cfg.MaxFlowSlippageBps = 0
+			e, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.SubmitQuote(mustPrice(t, "90"), mustPrice(t, "110")); err != nil {
+				t.Fatalf("identical quote renewal was rejected: %v", err)
+			}
+			orders := e.OpenOrders(PlayerAccount)
+			if len(orders) != 2 || orders[0].Price != mustPrice(t, "90") || orders[1].Price != mustPrice(t, "110") {
+				t.Fatalf("renewed orders=%+v", orders)
+			}
+			assertReservationsDerivedFromBook(t, e)
+			assertLedgerMatchesAccounts(t, e)
+
+			before := exchangeObservableState(e)
+			if _, err := e.SubmitQuote(mustPrice(t, "101"), mustPrice(t, "102")); err == nil {
+				t.Fatal("expected cash-reservation rejection")
+			}
+			if got := exchangeObservableState(e); !reflect.DeepEqual(got, before) {
+				t.Fatal("rejected quote renewal changed venue")
+			}
+			assertReservationsDerivedFromBook(t, e)
+			assertLedgerMatchesAccounts(t, e)
+		})
+	}
+}
+
 func TestRestingBuyOrdersReserveCashCollectively(t *testing.T) {
 	cfg := config(t)
 	cfg.StartingCash = mustMoney(t, "100")
