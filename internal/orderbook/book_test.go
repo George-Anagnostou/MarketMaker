@@ -207,11 +207,8 @@ func TestCloneIsIndependentAndPreservesFIFO(t *testing.T) {
 		}
 	}
 	clone := original.Clone()
-	if _, ok := clone.Cancel(1); !ok {
-		t.Fatal("clone did not contain first order")
-	}
-	cloneReport, err := clone.Submit(order(3, 3, "clone-buyer", Buy, "100", "1", IOC, t), RejectTaker)
-	if err != nil || len(cloneReport.Fills) != 1 || cloneReport.Fills[0].Maker.ID != 2 {
+	cloneReport, err := clone.Submit(order(3, 3, "clone-buyer", Buy, "100", "2", IOC, t), RejectTaker)
+	if err != nil || len(cloneReport.Fills) != 2 || cloneReport.Fills[0].Maker.ID != 1 || cloneReport.Fills[1].Maker.ID != 2 {
 		t.Fatalf("clone report=%+v err=%v", cloneReport, err)
 	}
 	if original.Len() != 2 {

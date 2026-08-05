@@ -273,7 +273,18 @@ func TestReservationsDeriveFromLiveOrdersAcrossLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertReservationsDerivedFromBook(t, e)
-	if _, err := e.PlaceLimit(PlayerAccount, Sell, mustPrice(t, "101"), mustQty(t, "1"), GTC); err != nil {
+	if err := e.AddAccount("seller", mustMoney(t, "100000"), mustQty(t, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "100"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "101"), mustQty(t, "1"), IOC); err != nil {
 		t.Fatal(err)
 	}
 	assertReservationsDerivedFromBook(t, e)
@@ -281,7 +292,19 @@ func TestReservationsDeriveFromLiveOrdersAcrossLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertReservationsDerivedFromBook(t, e)
-	if _, err := e.ReplaceLimit(PlayerAccount, 2, Sell, mustPrice(t, "102"), mustQty(t, "1"), GTC); err != nil {
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "99"), mustQty(t, "2"), GTC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit("seller", Sell, mustPrice(t, "98"), mustQty(t, "1"), IOC); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.Cancel(PlayerAccount, 5); err != nil {
+		t.Fatal(err)
+	}
+	assertReservationsDerivedFromBook(t, e)
+	if _, err := e.PlaceLimit(PlayerAccount, Buy, mustPrice(t, "90"), mustQty(t, "1"), IOC); err != nil {
 		t.Fatal(err)
 	}
 	assertReservationsDerivedFromBook(t, e)
@@ -563,7 +586,8 @@ func TestDeterministicResults(t *testing.T) {
 
 func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
 	cfg := config(t)
-	cfg.MaxOrdersPerTurn = 0
+	cfg.MaxOrdersPerTurn = 3
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
 	cfg.InitialMarginBps, cfg.MaintenanceMarginBps = 0, 0
 	cfg.MaxOrderQty = mustQty(t, "1")
 	left, err := New(cfg)
@@ -577,13 +601,13 @@ func TestCommandStreamIsDeterministicAndTransactional(t *testing.T) {
 	stream := []Command{
 		{ID: "01", Type: CommandOpenAccount, AccountID: "seller", InitialCash: mustMoney(t, "10000"), InitialPosition: mustQty(t, "2")},
 		{ID: "02", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
-		{ID: "03", Type: CommandReplaceOrder, AccountID: PlayerAccount, OrderID: 1, Side: Buy, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: GTC},
-		{ID: "04", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 2},
-		{ID: "05", Type: CommandPlaceOrder, AccountID: "seller", Side: Sell, Price: mustPrice(t, "100"), Quantity: mustQty(t, "1"), TIF: GTC},
-		{ID: "06", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), TIF: IOC},
-		{ID: "07", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
-		{ID: "08", Type: CommandSubmitQuote, Bid: mustPrice(t, "99"), Ask: mustPrice(t, "101")},
-		{ID: "09", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 6},
+		{ID: "03", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Sell, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: IOC},
+		{ID: "04", Type: CommandReplaceOrder, AccountID: PlayerAccount, OrderID: 1, Side: Buy, Price: mustPrice(t, "98"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "05", Type: CommandCancelOrder, AccountID: PlayerAccount, OrderID: 2},
+		{ID: "06", Type: CommandPlaceOrder, AccountID: "seller", Side: Sell, Price: mustPrice(t, "100"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "07", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "101"), Quantity: mustQty(t, "1"), TIF: IOC},
+		{ID: "08", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
+		{ID: "09", Type: CommandSubmitQuote, Bid: mustPrice(t, "99"), Ask: mustPrice(t, "101")},
 		{ID: "10", Type: CommandQuit},
 		{ID: "11", Type: CommandPlaceOrder, AccountID: PlayerAccount, Side: Buy, Price: mustPrice(t, "99"), Quantity: mustQty(t, "1"), TIF: GTC},
 	}
