@@ -57,8 +57,8 @@ func TestIndexServesGuidedQuoteUI(t *testing.T) {
 			t.Errorf("missing %q", expected)
 		}
 	}
-	if count := strings.Count(body, `aria-live="polite"`); count != 1 {
-		t.Errorf("aria-live polite regions=%d, want 1", count)
+	if count := strings.Count(body, `aria-live="polite"`); count != 2 {
+		t.Errorf("aria-live polite regions=%d, want 2", count)
 	}
 	if count := strings.Count(body, `role="status"`); count != 1 {
 		t.Errorf("status roles=%d, want 1", count)

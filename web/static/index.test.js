@@ -52,6 +52,11 @@ function loadApp(fetchImpl, timeout = 100) {
   };
   document.getElementById('bid').value = '99.50';
   document.getElementById('ask').value = '100.50';
+  document.getElementById('game-stage').hidden = true;
+  document.getElementById('retry-catalog').hidden = true;
+  document.getElementById('discard-recovery').hidden = true;
+  document.getElementById('retry-sync').hidden = true;
+  document.getElementById('quote-error').hidden = true;
   const storage = new Map(), alerts = [];
   let uuid = 5;
   const context = {
@@ -131,7 +136,7 @@ test('replayed create is only an acknowledgement and hydrates advanced canonical
     if (url.includes('/events?')) return response(200, {events:[markEvent(1, QUOTE_ID, '101.0000', '100.0000')], next_after:1, has_more:false});
     throw new Error(`unexpected fetch ${url}`);
   });
-  app.api.setCatalog([scenario]);
+  app.api.setCatalog([scenario], scenario.id);
   const result = await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
   assert.equal(result.status, 'started');
   assert.equal(app.api.model().version, 1);
@@ -142,18 +147,178 @@ test('replayed create is only an acknowledgement and hydrates advanced canonical
 });
 
 test('definitive create acknowledgement clears create retry but retains game ID when hydration fails', async () => {
+  let createCalls = 0;
   const app = loadApp(async url => {
-    if (url === '/api/v2/games') return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}});
+    if (url === '/api/v2/games') { createCalls++; return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}}); }
     return response(503, {error:{code:'storage_failure', message:'unavailable'}});
   });
-  app.api.setCatalog([scenario]);
+  app.api.setCatalog([scenario], scenario.id);
   const result = await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
   assert.equal(result.status, 'failed');
   assert.equal(app.storage.get('mmg.game_id'), GAME_ID);
   assert.equal(app.storage.has('mmg.pending_create'), false);
   assert.equal(app.api.model().gameId, null);
   assert.equal(app.elements.get('start-default').disabled, false);
+  assert.equal(app.elements.get('start-default').textContent, 'Resume lesson');
+  assert.equal(app.api.model().retryHydrationID, GAME_ID);
+  await app.api.startDefault();
+  assert.equal(createCalls, 1);
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, true);
+  app.api.abandonSavedLesson();
+  assert.equal(app.api.model().retryHydrationID, null);
+  assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
+  assert.equal(app.storage.has('mmg.game_id'), false);
   assert.equal(app.api.model().restoration, false);
+});
+
+test('play again resumes an acknowledged game instead of creating a duplicate', async () => {
+  let createCalls = 0;
+  const app = loadApp(async (url, options = {}) => {
+    if (url === '/api/v2/games' && options.method === 'POST') { createCalls++; return response(201, {game_id:GAME_ID, command:{id:CREATE_ID, type:'create_game', replayed:false}}); }
+    if (url === `/api/v2/games/${GAME_ID}`) return response(503, {error:{code:'storage_failure', message:'unavailable'}});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  app.api.setCatalog([scenario], scenario.id);
+  app.api.seedTestModel(GAME_ID, state({isOver:true, reason:'completed'}), '1000.00000000');
+  await app.api.startNewGame({game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id});
+  assert.equal(app.elements.get('play-again').textContent, 'Resume lesson');
+  await app.api.playAgain();
+  assert.equal(createCalls, 1);
+});
+
+test('uncertain create times out and can be explicitly abandoned', async () => {
+  const app = loadApp((_url, options = {}) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('aborted')), {once:true});
+  }), 10);
+  app.api.setCatalog([scenario], scenario.id);
+  assert.equal((await app.api.startNewGame()).status, 'retryable');
+  assert.equal(app.api.model().retryCreate, true);
+  assert.equal(app.storage.has('mmg.pending_create'), true);
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, true);
+  app.api.abandonSavedLesson();
+  assert.equal(app.api.model().retryCreate, false);
+  assert.equal(app.storage.has('mmg.pending_create'), false);
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, false);
+});
+
+test('catalog timeout exposes a retry action', async () => {
+  const app = loadApp((_url, options = {}) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('aborted')), {once:true});
+  }), 10);
+  await app.api.loadScenarios();
+  assert.equal(app.api.model().catalogLoading, false);
+  assert.equal(app.elements.get('retry-catalog').hidden, false);
+  assert.equal(app.elements.get('retry-catalog').disabled, false);
+});
+
+test('catalog timeout also bounds a stalled response body', async () => {
+  const app = loadApp(async (_url, options = {}) => ({ok:true, status:200, text:() => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('aborted')), {once:true});
+  })}), 10);
+  await app.api.loadScenarios();
+  assert.equal(app.api.model().catalogLoading, false);
+  assert.equal(app.elements.get('retry-catalog').hidden, false);
+});
+
+test('uncertain create retries the exact persisted request', async () => {
+  const posted = [];
+  const app = loadApp(async (url, options = {}) => {
+    if (url === '/api/v2/games') {
+      posted.push(JSON.parse(options.body));
+      if (posted.length === 1) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), {once:true}));
+      return response(200, {game_id:posted[0].game_id, command:{id:posted[0].command_id, type:'create_game', replayed:true}});
+    }
+    if (url === `/api/v2/games/${posted[0].game_id}`) return response(200, {...envelope(), game_id:posted[0].game_id});
+    throw new Error(`unexpected fetch ${url}`);
+  }, 10);
+  app.api.setCatalog([scenario], scenario.id);
+  assert.equal((await app.api.startNewGame()).status, 'retryable');
+  assert.equal((await app.api.startDefault()).status, 'started');
+  assert.equal(JSON.stringify(posted[1]), JSON.stringify(posted[0]));
+  assert.equal(app.api.model().retryCreate, false);
+});
+
+test('pending create remains retryable when its scenario leaves the catalog', async () => {
+  let postCalls = 0;
+  const request = {game_id:GAME_ID, command_id:CREATE_ID, scenario_id:scenario.id};
+  const replacement = {...scenario, id:'inventory-pressure-v1'};
+  const app = loadApp(async (url, options = {}) => {
+    if (url === '/api/v2/scenarios') return response(200, {scenarios:[replacement]});
+    if (url === '/api/v2/games') {
+      postCalls++;
+      if (postCalls === 1) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted')), {once:true}));
+      return response(400, {error:{code:'unknown_scenario'}});
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }, 10);
+  app.storage.set('mmg.pending_create', JSON.stringify(request));
+  await app.api.initialize();
+  assert.equal(app.api.model().retryCreate, true);
+  assert.equal((await app.api.startDefault()).status, 'rejected');
+  assert.equal(postCalls, 2);
+  assert.equal(app.elements.get('start-default').disabled, true);
+  assert.equal(app.elements.get('scenario-title').textContent, 'Select a lesson to continue');
+});
+
+test('lesson picker renders catalog options and updates the lesson preview', () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  const second = {...scenario, id:'inventory-pressure-v1', title:'Inventory Pressure', briefing:'Manage the position.', objective:'Reduce inventory.', turns:7};
+  app.api.setCatalog([scenario, second]);
+  const picker = app.elements.get('scenario-options');
+  assert.equal(picker.children.length, 2);
+  assert.equal(picker.children[0].children[0].children[0].textContent, 'First Spread');
+  assert.equal(picker.children[1].children[0].children[0].textContent, 'Inventory Pressure');
+  assert.equal(picker.children[0].attributes.get('aria-pressed'), 'false');
+  assert.equal(app.elements.get('start-default').disabled, true);
+  picker.children[1].onclick();
+  assert.equal(picker.children[1].attributes.get('aria-pressed'), 'true');
+  assert.equal(picker.children[1].focused, true);
+  assert.equal(app.elements.get('start-default').disabled, false);
+  assert.equal(app.elements.get('scenario-title').textContent, 'Inventory Pressure');
+  assert.equal(app.elements.get('scenario-brief').textContent, 'Manage the position.');
+  assert.equal(app.elements.get('scenario-objective').textContent, 'Goal: Reduce inventory.');
+});
+
+test('lesson and game stages replace one another', () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  app.api.setCatalog([scenario]);
+  assert.equal(app.api.model().view, 'lessons');
+  app.api.seedTestModel(GAME_ID, state(), '1000.00000000');
+  assert.equal(app.api.model().view, 'game');
+  assert.equal(app.elements.get('lesson-stage').hidden, true);
+  app.api.chooseAnotherLesson();
+  assert.equal(app.api.model().view, 'lessons');
+  assert.equal(app.elements.get('lesson-stage').hidden, false);
+  assert.equal(app.elements.get('scenario-options').children[0].disabled, false);
+  assert.equal(app.elements.get('start-default').textContent, 'Start lesson');
+});
+
+test('removed restored lesson returns play again to the lesson picker', async () => {
+  const replacement = {...scenario, id:'inventory-pressure-v1', title:'Inventory Pressure'};
+  const app = loadApp(async url => {
+    if (url === `/api/v2/games/${GAME_ID}`) return response(200, envelope());
+    if (url === '/api/v2/scenarios') return response(200, {scenarios:[replacement]});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  assert.equal((await app.api.hydrateGame(GAME_ID)).status, 'hydrated');
+  await app.api.loadScenarios();
+  assert.equal(app.api.model().view, 'game');
+  app.api.playAgain();
+  assert.equal(app.api.model().view, 'lessons');
+  assert.equal(app.elements.get('start-default').disabled, true);
+});
+
+test('late catalog data does not overwrite the restored scenario snapshot', async () => {
+  const changed = {...scenario, title:'Changed Catalog Title', revision:'99'};
+  const app = loadApp(async url => {
+    if (url === `/api/v2/games/${GAME_ID}`) return response(200, envelope());
+    if (url === '/api/v2/scenarios') return response(200, {scenarios:[changed]});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  assert.equal((await app.api.hydrateGame(GAME_ID)).status, 'hydrated');
+  assert.equal(app.elements.get('active-lesson-title').textContent, 'First Spread');
+  await app.api.loadScenarios();
+  assert.equal(app.elements.get('active-lesson-title').textContent, 'First Spread');
 });
 
 test('version conflict clears the quote and hydrates canonical state before controls resume', async () => {
@@ -174,6 +339,48 @@ test('version conflict clears the quote and hydrates canonical state before cont
   assert.equal(app.api.model().retryCommand, null);
   assert.equal(app.elements.get('submitbtn').disabled, false);
   assert.equal(calls[1], `/api/v2/games/${GAME_ID}`);
+});
+
+test('failed conflict recovery locks mutations until canonical sync succeeds', async () => {
+  let recover = false;
+  const app = loadApp(async (url, options = {}) => {
+    if (options.method === 'POST') return response(409, {error:{code:'version_conflict', message:'stale'}});
+    if (url === `/api/v2/games/${GAME_ID}`) return recover ? response(200, envelope()) : response(503, {error:{code:'storage_failure'}});
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  app.api.seedTestModel(GAME_ID, state(), '1000.00000000');
+  await app.api.submitTurn();
+  assert.equal(app.api.model().syncRequired, true);
+  assert.equal(app.elements.get('submitbtn').disabled, true);
+  assert.equal(app.elements.get('retry-sync').hidden, false);
+  recover = true;
+  assert.equal((await app.api.retryCanonicalState()).status, 'hydrated');
+  assert.equal(app.api.model().syncRequired, false);
+  assert.equal(app.elements.get('submitbtn').disabled, false);
+});
+
+test('invalid quote exposes inline field errors and focuses the invalid input', async () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  app.api.seedTestModel(GAME_ID, state(), '1000.00000000');
+  app.elements.get('bid').value = '-1';
+  await app.api.submitTurn();
+  assert.equal(app.elements.get('quote-error').hidden, false);
+  assert.equal(app.elements.get('bid').attributes.get('aria-invalid'), 'true');
+  assert.equal(app.elements.get('bid').focused, true);
+});
+
+test('quote validation rejects non-fixed-point input and clears stale errors when corrected', async () => {
+  const app = loadApp(async () => { throw new Error('fetch not expected'); });
+  app.api.seedTestModel(GAME_ID, state(), '1000.00000000');
+  app.elements.get('bid').value = '1e2'; app.elements.get('ask').value = '101';
+  await app.api.submitTurn();
+  assert.equal(app.elements.get('quote-error').hidden, false);
+  assert.equal(app.elements.get('spread').textContent, '—');
+  app.elements.get('bid').value = '99.5000'; app.elements.get('ask').value = '100.5000';
+  app.api.updateQuotePreview();
+  assert.equal(app.elements.get('quote-error').hidden, true);
+  assert.equal(app.elements.get('bid').attributes.get('aria-invalid'), 'false');
+  assert.equal(app.elements.get('spread').textContent, '$1.00');
 });
 
 test('state GET deadline abort preserves the prior model and restores controls', async () => {
