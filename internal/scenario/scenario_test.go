@@ -86,6 +86,7 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 		CarryPerUnit:                fixed.Price(10_000),
 		CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
 		MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
+		InformedSeedDomain:          "first-spread-v1/realtime/informed/v1",
 	}
 	if !reflect.DeepEqual(first.RealTime, wantRealTime) || !reflect.DeepEqual(first.Snapshot().Modes, []game.PlayMode{game.PlayModeTurnBased, game.PlayModeRealTime}) {
 		t.Fatalf("first real-time config=%+v modes=%v", first.RealTime, first.Snapshot().Modes)
@@ -192,6 +193,7 @@ func TestRealTimeConfigValidation(t *testing.T) {
 		"negative carry":    func(config *RealTimeConfig) { config.CarryPerUnit = -1 },
 		"customer domain":   func(config *RealTimeConfig) { config.CustomerSeedDomain = "" },
 		"duplicate domains": func(config *RealTimeConfig) { config.CustomerSeedDomain = config.MarkSeedDomain },
+		"informed domain":   func(config *RealTimeConfig) { config.InformedSeedDomain = "" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

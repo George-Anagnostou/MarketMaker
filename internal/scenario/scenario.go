@@ -47,6 +47,7 @@ type RealTimeConfig struct {
 	CarryPerUnit                fixed.Price   `json:"carry_per_unit"`
 	CustomerSeedDomain          string        `json:"customer_seed_domain"`
 	MarkSeedDomain              string        `json:"mark_seed_domain"`
+	InformedSeedDomain          string        `json:"informed_seed_domain"`
 }
 
 // Snapshot is persisted with every game so its lesson cannot change when the
@@ -122,6 +123,7 @@ var catalog = []Definition{
 			CarryPerUnit:                fixed.Price(10_000),
 			CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
 			MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
+			InformedSeedDomain:          "first-spread-v1/realtime/informed/v1",
 		},
 	},
 	{
@@ -292,8 +294,8 @@ func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConf
 	if _, err := fixed.Notional(config.CarryPerUnit, exchangeConfig.MaxPosition); err != nil {
 		return errors.New("carry and position exceed supported range")
 	}
-	if config.CustomerSeedDomain == "" || config.MarkSeedDomain == "" || config.CustomerSeedDomain == config.MarkSeedDomain {
-		return errors.New("customer and mark seed domains must be distinct")
+	if config.CustomerSeedDomain == "" || config.MarkSeedDomain == "" || config.InformedSeedDomain == "" || config.CustomerSeedDomain == config.MarkSeedDomain || config.CustomerSeedDomain == config.InformedSeedDomain || config.MarkSeedDomain == config.InformedSeedDomain {
+		return errors.New("generator seed domains must be non-empty and distinct")
 	}
 	return nil
 }

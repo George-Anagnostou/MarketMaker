@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -27,6 +28,15 @@ type Action struct {
 type ScheduledAction struct {
 	Due    time.Duration
 	Action Action
+}
+
+// Schedule returns one stable next action until Commit advances it. Commit is
+// an in-memory cursor update after the executor's durable work succeeds. A
+// failed Commit must leave the cursor unchanged; recovery advances it by
+// replaying already-durable system actions.
+type Schedule interface {
+	Next() (ScheduledAction, bool, error)
+	Commit(ScheduledAction) error
 }
 
 type Execution struct {
@@ -136,7 +146,7 @@ type response struct {
 type Sequencer struct {
 	clock     Clock
 	executor  Executor
-	schedule  []ScheduledAction
+	schedule  Schedule
 	wake      chan struct{}
 	done      chan struct{}
 	admission sync.Mutex
@@ -153,29 +163,141 @@ func New(schedule []ScheduledAction, executor Executor) (*Sequencer, error) {
 }
 
 func NewWithClock(schedule []ScheduledAction, executor Executor, clock Clock) (*Sequencer, error) {
-	if executor == nil || clock == nil {
-		return nil, errors.New("executor and clock are required")
+	static, err := newStaticSchedule(schedule)
+	if err != nil {
+		return nil, err
 	}
-	copySchedule := append([]ScheduledAction(nil), schedule...)
-	actionIDs := make(map[string]struct{}, len(copySchedule))
-	for i, item := range copySchedule {
-		if item.Due < 0 {
-			return nil, errors.New("scheduled time must be non-negative")
+	return NewWithScheduleAndClock(static, executor, clock)
+}
+
+func NewWithSchedule(schedule Schedule, executor Executor) (*Sequencer, error) {
+	return NewWithScheduleAndClock(schedule, executor, systemClock{})
+}
+
+func NewWithScheduleAndClock(schedule Schedule, executor Executor, clock Clock) (*Sequencer, error) {
+	if isNilInterface(schedule) || executor == nil || isNilInterface(clock) {
+		return nil, errors.New("schedule, executor, and clock are required")
+	}
+	if _, err := currentTime(clock); err != nil {
+		return nil, err
+	}
+	sequencer := &Sequencer{clock: clock, executor: executor, schedule: schedule, wake: make(chan struct{}, 1), done: make(chan struct{}), accepting: true}
+	go sequencer.run()
+	return sequencer, nil
+}
+
+func isNilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}
+
+func nextScheduledAction(schedule Schedule) (action ScheduledAction, ok bool, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("schedule next panicked: %v", recovered)
 		}
-		if err := validateAction(item.Action, SourceSystem); err != nil {
+	}()
+	return schedule.Next()
+}
+
+func commitScheduledAction(schedule Schedule, action ScheduledAction) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("schedule commit panicked: %v", recovered)
+		}
+	}()
+	return schedule.Commit(action)
+}
+
+func createTimer(clock Clock, delay time.Duration) (timer Timer, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("clock timer panicked: %v", recovered)
+		}
+	}()
+	timer = clock.NewTimer(delay)
+	if isNilInterface(timer) {
+		return nil, errors.New("clock returned a nil timer")
+	}
+	return timer, nil
+}
+
+func currentTime(clock Clock) (now time.Time, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("clock now panicked: %v", recovered)
+		}
+	}()
+	return clock.Now(), nil
+}
+
+func clockTimerChannel(timer Timer) (channel <-chan time.Time, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("clock timer channel panicked: %v", recovered)
+		}
+	}()
+	channel = timer.C()
+	if channel == nil {
+		return nil, errors.New("clock returned a nil timer channel")
+	}
+	return channel, nil
+}
+
+func stopClockTimer(timer Timer) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("clock timer stop panicked: %v", recovered)
+		}
+	}()
+	timer.Stop()
+	return nil
+}
+
+type staticSchedule struct {
+	actions []ScheduledAction
+	next    int
+}
+
+func newStaticSchedule(schedule []ScheduledAction) (*staticSchedule, error) {
+	actions := append([]ScheduledAction(nil), schedule...)
+	actionIDs := make(map[string]struct{}, len(actions))
+	for i, item := range actions {
+		if err := validateScheduledAction(item); err != nil {
 			return nil, fmt.Errorf("scheduled action %d: %w", i, err)
 		}
 		if _, exists := actionIDs[item.Action.ID]; exists {
 			return nil, fmt.Errorf("scheduled action id %q is duplicated", item.Action.ID)
 		}
 		actionIDs[item.Action.ID] = struct{}{}
-		if i > 0 && item.Due < copySchedule[i-1].Due {
+		if i > 0 && item.Due < actions[i-1].Due {
 			return nil, errors.New("schedule must be ordered by due time")
 		}
 	}
-	sequencer := &Sequencer{clock: clock, executor: executor, schedule: copySchedule, wake: make(chan struct{}, 1), done: make(chan struct{}), accepting: true}
-	go sequencer.run()
-	return sequencer, nil
+	return &staticSchedule{actions: actions}, nil
+}
+
+func (s *staticSchedule) Next() (ScheduledAction, bool, error) {
+	if s.next >= len(s.actions) {
+		return ScheduledAction{}, false, nil
+	}
+	return s.actions[s.next], true, nil
+}
+
+func (s *staticSchedule) Commit(action ScheduledAction) error {
+	if s.next >= len(s.actions) || s.actions[s.next].Due != action.Due || s.actions[s.next].Action.ID != action.Action.ID {
+		return errors.New("committed action does not match schedule head")
+	}
+	s.next++
+	return nil
 }
 
 func (s *Sequencer) Start(ctx context.Context) error {
@@ -254,7 +376,12 @@ func (s *Sequencer) request(ctx context.Context, req request) (response, error) 
 		s.admission.Unlock()
 		return response{}, err
 	}
-	req.received = s.clock.Now()
+	now, err := currentTime(s.clock)
+	if err != nil {
+		s.admission.Unlock()
+		return response{}, err
+	}
+	req.received = now
 	s.pending = append(s.pending, req)
 	s.admission.Unlock()
 	select {
@@ -298,6 +425,13 @@ func validateAction(action Action, source Source) error {
 	return nil
 }
 
+func validateScheduledAction(action ScheduledAction) error {
+	if action.Due < 0 {
+		return errors.New("scheduled time must be non-negative")
+	}
+	return validateAction(action.Action, SourceSystem)
+}
+
 func (s *Sequencer) run() {
 	defer func() {
 		for _, req := range s.stopAdmission() {
@@ -307,11 +441,15 @@ func (s *Sequencer) run() {
 	}()
 	status := StatusPreparing
 	elapsed := time.Duration(0)
-	anchor := s.clock.Now()
+	anchor := time.Time{}
 	nextScheduled := 0
 	sequence := uint64(0)
 	var failure error
 	var timer Timer
+	var candidate ScheduledAction
+	hasCandidate := false
+	lastScheduledDue := time.Duration(0)
+	scheduledIDs := make(map[string]struct{})
 
 	logicalAt := func(now time.Time) time.Duration {
 		if status != StatusRunning || now.Before(anchor) {
@@ -319,22 +457,84 @@ func (s *Sequencer) run() {
 		}
 		return elapsed + now.Sub(anchor)
 	}
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
+	stopTimer := func() error {
+		current := timer
+		timer = nil
+		if current != nil {
+			return stopClockTimer(current)
 		}
+		return nil
 	}
-	armTimer := func() {
-		stopTimer()
-		if status != StatusRunning || nextScheduled >= len(s.schedule) {
-			return
+	fail := func(at time.Duration, err error) {
+		failure, elapsed, status = err, at, StatusFailed
+		_ = stopTimer()
+	}
+	loadCandidate := func() (ScheduledAction, bool, error) {
+		if hasCandidate {
+			return candidate, true, nil
 		}
-		delay := s.schedule[nextScheduled].Due - logicalAt(s.clock.Now())
+		next, ok, err := nextScheduledAction(s.schedule)
+		if err != nil || !ok {
+			return ScheduledAction{}, ok, err
+		}
+		if err := validateScheduledAction(next); err != nil {
+			return ScheduledAction{}, false, err
+		}
+		if nextScheduled > 0 && next.Due < lastScheduledDue {
+			return ScheduledAction{}, false, errors.New("schedule moved backward")
+		}
+		if _, exists := scheduledIDs[next.Action.ID]; exists {
+			return ScheduledAction{}, false, fmt.Errorf("scheduled action id %q is duplicated", next.Action.ID)
+		}
+		candidate, hasCandidate = next, true
+		return candidate, true, nil
+	}
+	commitCandidate := func(item ScheduledAction) error {
+		if !hasCandidate || candidate.Due != item.Due || candidate.Action.ID != item.Action.ID {
+			return errors.New("executed action does not match schedule head")
+		}
+		if err := commitScheduledAction(s.schedule, item); err != nil {
+			return err
+		}
+		scheduledIDs[item.Action.ID] = struct{}{}
+		lastScheduledDue = item.Due
+		nextScheduled++
+		hasCandidate = false
+		candidate = ScheduledAction{}
+		return nil
+	}
+	armTimer := func() error {
+		if err := stopTimer(); err != nil {
+			fail(elapsed, err)
+			return failure
+		}
+		if status != StatusRunning {
+			return nil
+		}
+		now, err := currentTime(s.clock)
+		if err != nil {
+			fail(elapsed, err)
+			return failure
+		}
+		next, ok, err := loadCandidate()
+		if err != nil {
+			fail(logicalAt(now), fmt.Errorf("load next scheduled action: %w", err))
+			return failure
+		}
+		if !ok {
+			return nil
+		}
+		delay := next.Due - logicalAt(now)
 		if delay < 0 {
 			delay = 0
 		}
-		timer = s.clock.NewTimer(delay)
+		created, err := createTimer(s.clock, delay)
+		if err != nil {
+			fail(logicalAt(now), err)
+			return failure
+		}
+		timer = created
+		return nil
 	}
 	execute := func(action Action, at time.Duration) (execution Execution) {
 		sequence++
@@ -364,26 +564,31 @@ func (s *Sequencer) run() {
 		}
 		return execution
 	}
-	fail := func(at time.Duration, err error) {
-		failure, elapsed, status = err, at, StatusFailed
-		stopTimer()
-	}
 	processDue := func(target time.Duration) error {
-		for nextScheduled < len(s.schedule) && s.schedule[nextScheduled].Due <= target {
-			item := s.schedule[nextScheduled]
+		for {
+			item, ok, err := loadCandidate()
+			if err != nil {
+				fail(target, fmt.Errorf("load next scheduled action: %w", err))
+				return failure
+			}
+			if !ok || item.Due > target {
+				return nil
+			}
 			execution := execute(item.Action, item.Due)
 			if execution.Disposition == DispositionReject || execution.Disposition == DispositionFail {
 				fail(item.Due, fmt.Errorf("scheduled action %q failed: %w", item.Action.ID, execution.Err))
 				return failure
 			}
-			nextScheduled++
+			if err := commitCandidate(item); err != nil {
+				fail(item.Due, fmt.Errorf("commit scheduled action %q: %w", item.Action.ID, err))
+				return failure
+			}
 			if execution.Disposition == DispositionComplete {
 				elapsed, status = item.Due, StatusCompleted
 				stopTimer()
 				return nil
 			}
 		}
-		return nil
 	}
 	snapshot := func(now time.Time) Snapshot {
 		return Snapshot{Status: status, Elapsed: logicalAt(now), NextScheduled: nextScheduled, Sequence: sequence, Failure: failure}
@@ -404,7 +609,10 @@ func (s *Sequencer) run() {
 				return false
 			}
 			status, elapsed, anchor = StatusRunning, 0, req.received
-			armTimer()
+			if err := armTimer(); err != nil {
+				req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+				return false
+			}
 			req.reply <- response{}
 		case requestSubmit:
 			if status != StatusRunning {
@@ -423,14 +631,20 @@ func (s *Sequencer) run() {
 			execution := execute(req.action, target)
 			switch execution.Disposition {
 			case DispositionContinue:
-				armTimer()
+				if err := armTimer(); err != nil {
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
 				req.reply <- response{execution: execution}
 			case DispositionComplete:
 				elapsed, status = target, StatusCompleted
 				stopTimer()
 				req.reply <- response{execution: execution, snapshot: snapshot(req.received)}
 			case DispositionReject:
-				armTimer()
+				if err := armTimer(); err != nil {
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
 				req.reply <- response{execution: execution, err: execution.Err}
 			case DispositionFail:
 				fail(target, fmt.Errorf("participant action %q failed: %w", req.action.ID, execution.Err))
@@ -459,7 +673,10 @@ func (s *Sequencer) run() {
 				return false
 			}
 			status, anchor = StatusRunning, req.received
-			armTimer()
+			if err := armTimer(); err != nil {
+				req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+				return false
+			}
 			req.reply <- response{}
 		case requestSnapshot:
 			req.reply <- response{snapshot: snapshot(req.received)}
@@ -501,7 +718,12 @@ func (s *Sequencer) run() {
 		}
 		var timerC <-chan time.Time
 		if timer != nil {
-			timerC = timer.C()
+			channel, err := clockTimerChannel(timer)
+			if err != nil {
+				fail(elapsed, err)
+			} else {
+				timerC = channel
+			}
 		}
 		select {
 		case <-s.wake:
@@ -516,7 +738,7 @@ func (s *Sequencer) run() {
 			}
 			if status == StatusRunning {
 				_ = processDue(logicalAt(now))
-				armTimer()
+				_ = armTimer()
 			}
 		}
 	}

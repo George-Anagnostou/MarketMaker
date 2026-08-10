@@ -86,6 +86,103 @@ type executionRecorder struct {
 	notify  chan string
 }
 
+type recordingSchedule struct {
+	actions   []ScheduledAction
+	next      int
+	committed []string
+	nextErr   error
+	commitErr error
+}
+
+type panicSchedule struct {
+	action      ScheduledAction
+	panicNext   bool
+	panicCommit bool
+}
+
+func (s *panicSchedule) Next() (ScheduledAction, bool, error) {
+	if s.panicNext {
+		panic("next panic")
+	}
+	return s.action, true, nil
+}
+
+func (s *panicSchedule) Commit(ScheduledAction) error {
+	if s.panicCommit {
+		panic("commit panic")
+	}
+	return nil
+}
+
+type panicTimerClock struct{ *manualClock }
+
+func (panicTimerClock) NewTimer(time.Duration) Timer { panic("timer panic") }
+
+type panicNowClock struct{ *manualClock }
+
+func (panicNowClock) Now() time.Time { panic("now panic") }
+
+type faultyTimer struct {
+	channel   chan time.Time
+	called    chan struct{}
+	panicC    bool
+	panicStop bool
+	nilC      bool
+}
+
+func (t *faultyTimer) C() <-chan time.Time {
+	if t.called != nil {
+		select {
+		case <-t.called:
+		default:
+			close(t.called)
+		}
+	}
+	if t.panicC {
+		panic("channel panic")
+	}
+	if t.nilC {
+		return nil
+	}
+	return t.channel
+}
+
+func (t *faultyTimer) Stop() bool {
+	if t.panicStop {
+		panic("stop panic")
+	}
+	return true
+}
+
+type faultyTimerClock struct {
+	*manualClock
+	timer *faultyTimer
+}
+
+func (c faultyTimerClock) NewTimer(time.Duration) Timer { return c.timer }
+
+func (s *recordingSchedule) Next() (ScheduledAction, bool, error) {
+	if s.nextErr != nil {
+		return ScheduledAction{}, false, s.nextErr
+	}
+	if s.next >= len(s.actions) {
+		return ScheduledAction{}, false, nil
+	}
+	return s.actions[s.next], true, nil
+}
+
+func (s *recordingSchedule) Commit(action ScheduledAction) error {
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	if s.next >= len(s.actions) || action.Action.ID != s.actions[s.next].Action.ID {
+		return errors.New("wrong action")
+	}
+	s.committed = append(s.committed, action.Action.ID)
+	s.next++
+	return nil
+}
+
 func (r *executionRecorder) execute(action Action, elapsed time.Duration) Outcome {
 	r.mu.Lock()
 	r.actions = append(r.actions, action.ID)
@@ -493,5 +590,175 @@ func TestSequencerPrioritizesAdmittedRequestsAndAcknowledgesBeforeShutdown(t *te
 	defer mu.Unlock()
 	if !reflect.DeepEqual(actions, []string{"first", "scheduled", "second"}) || !reflect.DeepEqual(times, []time.Duration{5 * time.Millisecond, 7 * time.Millisecond, 10 * time.Millisecond}) {
 		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+}
+
+func TestSequencerCommitsIncrementalScheduleOnlyAfterSuccess(t *testing.T) {
+	clock := newManualClock()
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("one", time.Millisecond), systemAction("expiry", 2*time.Millisecond)}}
+	sequencer, err := NewWithScheduleAndClock(schedule, func(action Action, _ time.Duration) Outcome {
+		if action.ID == "expiry" {
+			return Outcome{Disposition: DispositionComplete}
+		}
+		return Outcome{Disposition: DispositionContinue}
+	}, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(3 * time.Millisecond)
+	if _, err := sequencer.Submit(context.Background(), participantAction("late")); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("late submit error=%v", err)
+	}
+	if !reflect.DeepEqual(schedule.committed, []string{"one", "expiry"}) || schedule.next != 2 {
+		t.Fatalf("committed=%v next=%d", schedule.committed, schedule.next)
+	}
+
+	failing := &recordingSchedule{actions: []ScheduledAction{systemAction("failure", time.Millisecond)}}
+	failedSequencer, err := NewWithScheduleAndClock(failing, func(Action, time.Duration) Outcome {
+		return Outcome{Disposition: DispositionFail, Err: errors.New("failed")}
+	}, newManualClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failedSequencer.Close()
+	if err := failedSequencer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	failedSequencer.clock.(*manualClock).Advance(time.Millisecond)
+	if _, err := failedSequencer.Submit(context.Background(), participantAction("after")); !errors.Is(err, ErrFailed) {
+		t.Fatalf("failure submit error=%v", err)
+	}
+	if len(failing.committed) != 0 || failing.next != 0 {
+		t.Fatalf("failed action advanced source: committed=%v next=%d", failing.committed, failing.next)
+	}
+}
+
+func TestSequencerFencesIncrementalScheduleErrors(t *testing.T) {
+	clock := newManualClock()
+	nextFailure := errors.New("generator failed")
+	sequencer, err := NewWithScheduleAndClock(&recordingSchedule{nextErr: nextFailure}, func(Action, time.Duration) Outcome {
+		return Outcome{Disposition: DispositionContinue}
+	}, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(context.Background()); !errors.Is(err, ErrFailed) || !errors.Is(err, nextFailure) {
+		t.Fatalf("start error=%v", err)
+	}
+
+	commitFailure := errors.New("cursor commit failed")
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("one", time.Millisecond)}, commitErr: commitFailure}
+	commitSequencer, err := NewWithScheduleAndClock(schedule, func(Action, time.Duration) Outcome {
+		return Outcome{Disposition: DispositionContinue}
+	}, newManualClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer commitSequencer.Close()
+	if err := commitSequencer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	commitSequencer.clock.(*manualClock).Advance(time.Millisecond)
+	if _, err := commitSequencer.Submit(context.Background(), participantAction("after")); !errors.Is(err, ErrFailed) || !errors.Is(err, commitFailure) {
+		t.Fatalf("commit failure error=%v", err)
+	}
+}
+
+func TestSequencerFencesScheduleAndTimerPanicsWithoutStrandingRequests(t *testing.T) {
+	executor := func(Action, time.Duration) Outcome { return Outcome{Disposition: DispositionContinue} }
+	tests := []struct {
+		name     string
+		schedule Schedule
+		clock    Clock
+	}{
+		{name: "next", schedule: &panicSchedule{panicNext: true}, clock: newManualClock()},
+		{name: "timer", schedule: &panicSchedule{action: systemAction("one", time.Millisecond)}, clock: panicTimerClock{newManualClock()}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sequencer, err := NewWithScheduleAndClock(test.schedule, executor, test.clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sequencer.Close()
+			if err := sequencer.Start(t.Context()); !errors.Is(err, ErrFailed) {
+				t.Fatalf("start error=%v", err)
+			}
+		})
+	}
+
+	clock := newManualClock()
+	commit := &panicSchedule{action: systemAction("one", time.Millisecond), panicCommit: true}
+	sequencer, err := NewWithScheduleAndClock(commit, executor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Millisecond)
+	if _, err := sequencer.Submit(t.Context(), participantAction("after")); !errors.Is(err, ErrFailed) {
+		t.Fatalf("commit panic error=%v", err)
+	}
+
+	var typedNil *panicSchedule
+	if _, err := NewWithScheduleAndClock(typedNil, executor, newManualClock()); err == nil {
+		t.Fatal("typed nil schedule accepted")
+	}
+}
+
+func TestSequencerFencesRemainingClockFailures(t *testing.T) {
+	executor := func(Action, time.Duration) Outcome { return Outcome{Disposition: DispositionContinue} }
+	if _, err := NewWithScheduleAndClock(&recordingSchedule{}, executor, panicNowClock{newManualClock()}); err == nil {
+		t.Fatal("panicking clock accepted")
+	}
+
+	for _, test := range []struct {
+		name  string
+		timer *faultyTimer
+	}{
+		{name: "channel panic", timer: &faultyTimer{called: make(chan struct{}), panicC: true}},
+		{name: "nil channel", timer: &faultyTimer{called: make(chan struct{}), nilC: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faultyTimerClock{manualClock: newManualClock(), timer: test.timer}
+			sequencer, err := NewWithScheduleAndClock(&recordingSchedule{actions: []ScheduledAction{systemAction("one", time.Millisecond)}}, executor, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sequencer.Close()
+			if err := sequencer.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-test.timer.called:
+			case <-time.After(time.Second):
+				t.Fatal("timer channel was not inspected")
+			}
+			snapshot, err := sequencer.Snapshot(t.Context())
+			if err != nil || snapshot.Status != StatusFailed || snapshot.Failure == nil {
+				t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+			}
+		})
+	}
+
+	stopTimer := &faultyTimer{channel: make(chan time.Time), panicStop: true}
+	clock := faultyTimerClock{manualClock: newManualClock(), timer: stopTimer}
+	sequencer, err := NewWithScheduleAndClock(&recordingSchedule{actions: []ScheduledAction{systemAction("one", time.Millisecond)}}, executor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sequencer.Submit(t.Context(), participantAction("player")); !errors.Is(err, ErrFailed) {
+		t.Fatalf("stop panic error=%v", err)
 	}
 }
