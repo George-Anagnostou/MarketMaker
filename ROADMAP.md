@@ -76,3 +76,5 @@ Next dependency-light pull requests:
 3. PostgreSQL, authentication, and multi-account API.
 4. WebSocket transport and operational infrastructure.
 5. Bot arena, scenarios, and game mechanics.
+
+The proposed real-time solo mode, its compatibility constraints, and its path toward multiplayer are detailed in [REALTIME_PLAY.md](REALTIME_PLAY.md).
