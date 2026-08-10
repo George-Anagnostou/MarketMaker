@@ -283,7 +283,7 @@ func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConf
 		return err
 	}
 	if config.CarryCadenceMilliseconds == 0 || config.CarryCadenceMilliseconds > config.DurationMilliseconds {
-		return errors.New("carry cadence must fit within the round duration")
+		return errors.New("carry cadence must fit within the session duration")
 	}
 	if !config.QuoteQuantity.Positive() || config.QuoteQuantity > exchangeConfig.MaxOrderQty || config.QuoteQuantity > exchangeConfig.MaxPosition {
 		return errors.New("quote quantity exceeds scenario limits")
@@ -305,7 +305,7 @@ func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConf
 
 func validateCadence(name string, cadence IntervalRange, duration uint64) error {
 	if cadence.MinMilliseconds == 0 || cadence.MinMilliseconds > cadence.MaxMilliseconds || cadence.MaxMilliseconds > duration {
-		return fmt.Errorf("%s cadence must be ordered and fit within the round duration", name)
+		return fmt.Errorf("%s cadence must be ordered and fit within the session duration", name)
 	}
 	return nil
 }

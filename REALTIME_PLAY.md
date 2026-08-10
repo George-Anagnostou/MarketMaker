@@ -12,14 +12,14 @@ The first release is a local, single-player browser game against deterministic s
 
 - Each lesson offers both turn-based and real-time modes.
 - The first vertical slice uses **First Spread**.
-- A real-time round lasts 90 seconds of logical market time.
+- The first solo session represents one compressed trading day lasting 90 seconds of logical market time.
 - The player maintains one live two-sided quote and updates both sides atomically.
 - Quote quantity is fixed by the scenario.
 - The market receives pseudo-randomly timed, scenario-seeded customer orders and mark changes independently of player actions.
 - The player sees the top of book, a compact shallow book, trade tape, mark chart, position, cash, equity, and P&L.
-- Coaching stays out of the live decision loop and appears after the round.
+- Coaching stays out of the live decision loop and appears after the trading day.
 - Explicit pause is available in solo play. A browser disconnect pauses after a short grace period.
-- Multiplayer and bot rounds are future live sessions that never pause.
+- Multiplayer and bot markets are future continuous 24/7 venues that never pause or expire on a solo-session clock.
 
 ## Goals
 
@@ -49,7 +49,7 @@ The lesson catalog exposes supported modes and mode-specific configuration. The 
 
 The browser requires an explicit choice between **Turn-based** and **Real-time** before creating a game. Existing game creation defaults and existing persisted snapshots retain turn-based meaning; mode is never inferred from missing data during replay.
 
-### Round Lifecycle
+### Solo Trading-Day Lifecycle
 
 Real-time sessions use the following authoritative states:
 
@@ -69,11 +69,11 @@ Normal expiry marks open inventory to market; it does not synthesize a liquidati
 
 The player has these mode-specific actions:
 
-- `start_round`: atomically validates the opening two-sided quote and starts the countdown.
+- `start_session`: atomically validates the opening two-sided quote and starts the countdown.
 - `update_quote`: atomically replaces the live bid and ask at scenario-fixed quantity.
-- `pause_round`: freezes solo logical time after all scheduled work due before receipt of the command has been sequenced.
-- `resume_round`: resumes from the exact committed logical time.
-- `quit`: ends the round intentionally.
+- `pause_session`: freezes solo logical time after all scheduled work due before receipt of the command has been sequenced.
+- `resume_session`: resumes from the exact committed logical time.
+- `quit`: ends the solo session intentionally.
 
 The UI uses an explicit **Update quote** button. Draft input has no market effect until submitted. Accepted replacement receives new order IDs and loses queue priority, matching the existing venue rules.
 
@@ -81,7 +81,7 @@ Real-time quote updates use command IDs for idempotency but do not use the turn-
 
 ### Solo Disconnects
 
-The event stream sends heartbeats and represents one browser as the active local controller. If the controller disconnects while the round is running:
+The event stream sends heartbeats and represents one browser as the active local controller. If the controller disconnects while the solo session is running:
 
 1. The server starts a five-second grace period.
 2. Reconnection within the grace period preserves continuous play and backfills missed events.
@@ -99,11 +99,11 @@ Initial event classes are:
 - Customer IOC arrival.
 - Reference-mark movement.
 - Inventory carry charge.
-- Round expiry.
+- Trading-day expiry.
 
 Customer inter-arrival times and order parameters are sampled from independent seeded streams. Mark movement has its own stream and schedule. Informed-flow scenarios may inspect the next scheduled mark direction, preserving the current educational model without coupling mark movement to quote submission.
 
-Pacing is scenario configuration and must be playtested. The First Spread slice should begin with a bounded irregular customer cadence and a slower independent mark cadence, targeting dozens rather than hundreds of decisions or tape events in a 90-second round. Exact intervals are not part of the stable wire contract.
+Pacing is scenario configuration and must be playtested. The First Spread slice should begin with a bounded irregular customer cadence and a slower independent mark cadence, targeting dozens rather than hundreds of decisions or tape events in a 90-second trading day. Exact intervals are not part of the stable wire contract.
 
 The solo book remains shallow:
 
@@ -119,8 +119,8 @@ The solo book remains shallow:
 - Maintenance and insolvency checks run after every fill, mark movement, and carry charge that can alter risk.
 - Storage becomes elapsed-time carry. The scenario defines a rate and deterministic charge cadence, with exact fixed-point rounding rules.
 - The final score remains marked total P&L and the lesson-specific scorecard.
-- Round P&L attribution aggregates execution edge, inventory mark P&L, storage P&L, and informed-flow evidence over the complete event timeline.
-- Post-round analysis may group the timeline into mark intervals for explanation, but these groups are not turns and are not exposed as such.
+- Session P&L attribution aggregates execution edge, inventory mark P&L, storage P&L, and informed-flow evidence over the complete event timeline.
+- Post-session analysis may group the timeline into mark intervals for explanation, but these groups are not turns and are not exposed as such.
 
 ## Engine Architecture
 
@@ -186,7 +186,7 @@ Pause stops logical-time accumulation and disarms the next timer. Resume creates
 
 ### Deterministic Schedule
 
-The scenario snapshot includes immutable real-time schedule parameters and seed domains. Schedule generation should be independently reproducible and versioned. It may be generated ahead for the finite 90-second round or incrementally from replayable state; the chosen representation must satisfy these invariants:
+The scenario snapshot includes immutable real-time schedule parameters and seed domains. Schedule generation should be independently reproducible and versioned. It may be generated ahead for the finite 90-second solo trading day or incrementally from replayable state; the chosen representation must satisfy these invariants:
 
 - Existing scenario catalog edits cannot alter a persisted game.
 - Schedule generation does not depend on Go timer wake-up order.
@@ -255,7 +255,7 @@ The internal subscription interface is transport-neutral. A future WebSocket ada
 
 ### Lesson Selection
 
-Each lesson presents a clear mode choice. Turn-based copy and controls remain unchanged. Real-time selection explains that the market moves independently and the round can be paused only because it is solo practice.
+Each lesson presents a clear mode choice. Turn-based copy and controls remain unchanged. Real-time selection explains that the market moves independently and the session can be paused only because it is solo practice.
 
 ### Preparing And Countdown
 
@@ -274,14 +274,14 @@ The live view prioritizes decisions over instruction:
 - Clear distinction between draft quote and acknowledged live quote.
 - Current mark and a compact mark chart.
 - Honest shallow order-book display with player-order ownership.
-- Recent trade tape with player side, price, and quantity. Informed status remains hidden during play and is revealed only in post-round analysis.
-- Position, cash, equity, total round P&L, and risk proximity.
+- Recent trade tape with player side, price, and quantity. Informed status remains hidden during play and is revealed only in post-session analysis.
+- Position, cash, equity, total session P&L, and risk proximity.
 - Pause and quit controls separated from quote entry.
 - Connection/recovery status that never implies a draft quote was accepted.
 
 Rendering should coalesce visual updates to animation frames while retaining every durable event in the audit. Color cannot be the only signal for side, P&L, connection, or risk state. Keyboard focus, reduced motion, mobile controls, and chart text alternatives are acceptance requirements.
 
-### Post-Round Review
+### Post-Session Review
 
 After completion, replace live controls with:
 
@@ -292,7 +292,7 @@ After completion, replace live controls with:
 - Adverse-selection or informed-flow evidence where applicable.
 - Reflection prompt and replay/play-again actions.
 
-No coaching overlay interrupts the running round.
+No coaching overlay interrupts the running session.
 
 ## Testing Strategy
 
@@ -313,7 +313,7 @@ No coaching overlay interrupts the running round.
 - Expiry, margin breach, insolvency, quit, and storage-failure terminal races.
 - No engine mutation after completion.
 - Immediate risk evaluation after fills, marks, and carry.
-- Exact P&L and balanced-ledger reconciliation over a full round.
+- Exact P&L and balanced-ledger reconciliation over a complete session.
 - Manual-clock tests with no sleeps.
 - Race tests for command submission, stream subscribers, pause, and shutdown.
 
@@ -370,20 +370,21 @@ Exit criterion: a real-time game can be created and recovered in `preparing`, bu
 
 1. Isolate quote replacement, customer arrival, mark movement, carry, risk evaluation, and completion operations.
 2. Retain the existing turn adapter and random-consumption order.
-3. Add real-time internal action types and continuous summaries.
+3. Keep the extracted primitives private until sequencer requirements define their smallest safe action contract.
 4. Prove ledger, matching, risk, rollback, and turn golden tests.
 
-Exit criterion: deterministic primitives are callable independently and all turn-based outputs remain unchanged.
+Exit criterion: deterministic primitives are isolated behind the existing transaction boundary and all turn-based outputs remain unchanged.
 
 ### Phase 3: Deterministic Scheduler And Sequencer
 
-1. Implement versioned finite schedule generation for First Spread.
-2. Add injected production and manual clocks.
-3. Implement the per-game actor, ordering rules, lifecycle transitions, timers, and pause/resume.
-4. Add idempotent external command envelopes and internal system action identity.
-5. Make shutdown restore active solo games as paused.
+1. Define an engine-neutral action executor and implement the single-writer actor before exposing new exchange actions.
+2. Add injected production and manual clocks, ordering rules, timers, pause/resume, and ordered catch-up.
+3. Implement versioned finite schedule generation for First Spread.
+4. Add the minimal quote, customer-arrival, mark, carry, and `time_expired` exchange actions required by the proven sequencer contract.
+5. Add idempotent external command envelopes and internal system action identity.
+6. Make shutdown restore active solo games as paused.
 
-Exit criterion: a headless 90-second First Spread round runs under a manual clock and replays exactly.
+Exit criterion: a headless 90-second First Spread trading day runs under a manual clock and replays exactly.
 
 ### Phase 4: Durable Real-Time Log And Read Models
 
@@ -407,7 +408,7 @@ Exit criterion: an API client can complete, disconnect from, recover, and exactl
 
 1. Add lesson mode selection, preparing flow, opening quote, and countdown.
 2. Add the live quote desk, shallow book, tape, mark chart, account/P&L panel, timer, pause, and connection state.
-3. Add post-round continuous recap and timeline.
+3. Add post-session continuous recap and timeline.
 4. Add browser fixtures, accessibility checks, responsive behavior, and recovery tests.
 
 Exit criterion: First Spread is playable end-to-end in both modes with no turn-based regression.
@@ -435,7 +436,7 @@ Exit criterion: the real-time mode is stable for local solo use and the turn-bas
 The solo design intentionally establishes reusable foundations but does not claim to solve multiplayer. Future work adds:
 
 1. Server-owned accounts, authentication, authorization, bot credentials, and participant ownership.
-2. Unpausable round policy with explicit join, ready, start, disconnect, and forfeit rules.
+2. Continuous-market policy with explicit join, disconnect, reconnect, and participant-bankruptcy rules; the market itself never pauses for one participant.
 3. Arbitrary participant place/cancel/replace commands feeding the same single-writer market sequencer.
 4. Ambient depth emerging from participant orders and optional benchmark makers, not fabricated solo liquidity.
 5. Public market-data and private order/account channels, likely with WebSocket adapters over the same cursor model.
@@ -443,19 +444,19 @@ The solo design intentionally establishes reusable foundations but does not clai
 7. Rate limits, latency profiles, fairness policy, deterministic tie-breaking, anti-cheat controls, and tournament scoring.
 8. Per-instrument sequencers and capacity profiling before multi-instrument arenas.
 
-The multiplayer clock remains wall-paced and never pauses, but every accepted order and autonomous action still receives one authoritative sequence and durable timestamp so completed rounds can be audited and replayed.
+The multiplayer clock remains wall-paced and never pauses. The market runs continuously without a scheduled solo-style expiry; participants and audit windows have finite histories, while every accepted order and autonomous action receives one authoritative sequence and durable timestamp for replay.
 
 ## Acceptance Criteria
 
 - A player can select either mode for First Spread, and later for every lesson.
 - Turn-based seeded outputs and historical logs remain compatible.
-- A running solo round progresses without player input and stops after exactly 90 seconds of logical time.
+- A running solo trading day progresses without player input and ends with `time_expired` after exactly 90 seconds of logical time.
 - Quote replacement is atomic, idempotent, risk-checked, and visibly acknowledged.
 - Pause and disconnect grace freeze logical time without cancelling the player's quote.
 - Restart restores an interrupted solo game as paused at its last committed state.
 - State hydration plus SSE cursor replay has no missing or double-applied event.
 - No client observes an action before it is durably committed.
-- Full-round replay reproduces state, events, ledger, schedule cursor, recap, and terminal reason exactly.
+- Full-session replay reproduces state, events, ledger, schedule cursor, recap, and terminal reason exactly.
 - The live UI remains usable on desktop and mobile and exposes equivalent non-color and text information.
 - Expected solo event rates remain within defined schedule-lateness, fsync-latency, file-size, replay-time, and render budgets.
 
@@ -463,6 +464,6 @@ The multiplayer clock remains wall-paced and never pauses, but every accepted or
 
 - Disconnect grace is five seconds.
 - An acknowledged countdown is irreversible.
-- Informed-customer status is revealed only in post-round analysis.
+- Informed-customer status is revealed only in post-session analysis.
 - Quote updates require the last acknowledged quote revision.
 - Overdue scheduled actions catch up in stable order without being skipped.
