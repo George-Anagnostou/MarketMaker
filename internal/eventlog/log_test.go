@@ -468,6 +468,9 @@ func TestCreateRealTimePreparingMetadata(t *testing.T) {
 	if meta.EffectiveMode() != game.PlayModeRealTime || meta.RealTime == nil || meta.RealTime.Lifecycle != game.LifecyclePreparing || meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.ScheduleVersion != game.ScheduleVersion {
 		t.Fatalf("real-time metadata=%+v", meta)
 	}
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err == nil {
+		t.Fatal("real-time preparing log accepted a record")
+	}
 	meta.RealTime.Lifecycle = "mutated"
 	if log.Meta().RealTime.Lifecycle != game.LifecyclePreparing {
 		t.Fatal("real-time metadata aliases caller")

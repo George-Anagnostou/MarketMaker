@@ -18,6 +18,7 @@ import (
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/game"
 	"market-maker/internal/scenario"
 )
 
@@ -94,10 +95,12 @@ func TestV2ListsServerOwnedScenarios(t *testing.T) {
 	}
 	var body struct {
 		Scenarios []struct {
-			ID         string                  `json:"id"`
-			Turns      int                     `json:"turns"`
-			Tutorial   []scenario.TutorialStep `json:"tutorial"`
-			Reflection string                  `json:"reflection"`
+			ID         string                   `json:"id"`
+			Turns      int                      `json:"turns"`
+			Tutorial   []scenario.TutorialStep  `json:"tutorial"`
+			Reflection string                   `json:"reflection"`
+			Modes      []game.PlayMode          `json:"modes"`
+			RealTime   *scenario.RealTimeConfig `json:"real_time"`
 		} `json:"scenarios"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -105,6 +108,195 @@ func TestV2ListsServerOwnedScenarios(t *testing.T) {
 	}
 	if len(body.Scenarios) != 4 || body.Scenarios[0].ID == "" || body.Scenarios[0].Turns == 0 || len(body.Scenarios[0].Tutorial) != 4 || body.Scenarios[0].Reflection == "" || body.Scenarios[1].ID != "inventory-pressure-v1" || len(body.Scenarios[1].Tutorial) != 5 || body.Scenarios[1].Reflection == "" || body.Scenarios[2].ID != "volatility-shock-v1" || len(body.Scenarios[2].Tutorial) != 5 || body.Scenarios[2].Reflection == "" || body.Scenarios[3].ID != "volatility-shock-v2" || body.Scenarios[3].Turns != 8 || len(body.Scenarios[3].Tutorial) != 5 || body.Scenarios[3].Reflection == "" {
 		t.Fatalf("scenarios=%+v", body.Scenarios)
+	}
+	if !reflect.DeepEqual(body.Scenarios[0].Modes, []game.PlayMode{game.PlayModeTurnBased, game.PlayModeRealTime}) || body.Scenarios[0].RealTime == nil || body.Scenarios[0].RealTime.DurationMilliseconds != 90_000 {
+		t.Fatalf("first real-time scenario=%+v", body.Scenarios[0])
+	}
+	for _, item := range body.Scenarios[1:] {
+		if !reflect.DeepEqual(item.Modes, []game.PlayMode{game.PlayModeTurnBased}) || item.RealTime != nil {
+			t.Fatalf("unexpected real-time scenario=%+v", item)
+		}
+	}
+}
+
+func TestV2CreatesAndRecoversRealTimePreparingGame(t *testing.T) {
+	root := t.TempDir()
+	server := v2Server(root)
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created exchangeCreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || created.Mode != game.PlayModeRealTime || created.RealTime == nil || created.RealTime.Lifecycle != game.LifecyclePreparing || created.State.Version != 0 || created.State.Turn != 0 {
+		t.Fatalf("created status=%d response=%+v", resp.StatusCode, created)
+	}
+	log, records, err := eventlog.Open(root, testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 || log.Meta().EffectiveMode() != game.PlayModeRealTime {
+		t.Fatalf("persisted records=%+v meta=%+v", records, log.Meta())
+	}
+	server.Close()
+
+	reloaded := v2Server(root)
+	defer reloaded.Close()
+	resp, err = http.Get(reloaded.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || state.Mode != game.PlayModeRealTime || state.RealTime == nil || state.RealTime.Lifecycle != game.LifecyclePreparing || state.EventsThrough != 0 {
+		t.Fatalf("recovered status=%d state=%+v", resp.StatusCode, state)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, reloaded.URL+"/api/v2/games/"+testGameID+"/commands", strings.NewReader("not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rejected apiError
+	if err := json.NewDecoder(resp.Body).Decode(&rejected); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || rejected.Error.Code != "command_unavailable_for_mode" {
+		t.Fatalf("command status=%d error=%+v", resp.StatusCode, rejected)
+	}
+	_, records, err = eventlog.Open(root, testGameID)
+	if err != nil || len(records) != 0 {
+		t.Fatalf("rejected command mutated log: records=%+v err=%v", records, err)
+	}
+}
+
+func TestV2ValidatesAndScopesCreateMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		scenarioID string
+		code       string
+	}{
+		{name: "null", mode: "null", scenarioID: "first-spread-v1", code: "invalid_mode"},
+		{name: "empty", mode: `""`, scenarioID: "first-spread-v1", code: "invalid_mode"},
+		{name: "unknown", mode: `"continuous"`, scenarioID: "first-spread-v1", code: "invalid_mode"},
+		{name: "non-string", mode: "1", scenarioID: "first-spread-v1", code: "invalid_mode"},
+		{name: "unsupported", mode: `"real_time"`, scenarioID: "inventory-pressure-v1", code: "unsupported_mode"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := v2Server(t.TempDir())
+			defer server.Close()
+			body := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"` + test.scenarioID + `","mode":` + test.mode + `}`
+			resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var response apiError
+			if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+				resp.Body.Close()
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest || response.Error.Code != test.code {
+				t.Fatalf("status=%d response=%+v", resp.StatusCode, response)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	server := v2Server(root)
+	defer server.Close()
+	defaultBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(defaultBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created exchangeCreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated || created.Mode != game.PlayModeTurnBased || created.RealTime != nil {
+		t.Fatalf("default mode response=%+v", created)
+	}
+	explicitBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"turn_based"}`
+	resp, err = http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(explicitBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("explicit turn-based retry status=%d", resp.StatusCode)
+	}
+	realTimeBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err = http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(realTimeBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflict apiError
+	if err := json.NewDecoder(resp.Body).Decode(&conflict); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || conflict.Error.Code != "idempotency_key_reused" {
+		t.Fatalf("mode conflict status=%d error=%+v", resp.StatusCode, conflict)
+	}
+}
+
+func TestRealTimeCreateRetryUsesPersistedModeAndScenario(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || !created || entry.mode != game.PlayModeRealTime {
+		t.Fatalf("create entry=%+v created=%v err=%v", entry, created, err)
+	}
+	service.lookupScenario = func(string) (scenario.Definition, bool) { return scenario.Definition{}, false }
+	entry, created, err = service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || created || entry.mode != game.PlayModeRealTime {
+		t.Fatalf("in-memory retry entry=%+v created=%v err=%v", entry, created, err)
+	}
+
+	reloaded := newExchangeService(root)
+	reloaded.lookupScenario = func(string) (scenario.Definition, bool) { return scenario.Definition{}, false }
+	entry, created, err = reloaded.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || created || entry.mode != game.PlayModeRealTime || entry.realTime == nil || entry.realTime.Lifecycle != game.LifecyclePreparing {
+		t.Fatalf("persisted retry entry=%+v created=%v err=%v", entry, created, err)
+	}
+}
+
+func TestRealTimePreparingRecoveryRejectsCommandRecords(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || !created {
+		t.Fatalf("create created=%v err=%v", created, err)
+	}
+	if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.SchemaVersion, Version: 1, Command: exchange.Command{ID: testQuoteID, Type: exchange.CommandQuit}}); err == nil {
+		t.Fatal("preparing log accepted command record")
+	}
+	if _, err := rebuildExchangeEntry(entry.log, []eventlog.Record{{}}); err == nil || !strings.Contains(err.Error(), "contains command records") {
+		t.Fatalf("rebuild error=%v", err)
+	}
+	_, records, err := eventlog.Open(root, testGameID)
+	if err != nil || len(records) != 0 {
+		t.Fatalf("rejected append changed records=%+v err=%v", records, err)
 	}
 }
 

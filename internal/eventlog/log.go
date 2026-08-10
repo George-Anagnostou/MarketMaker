@@ -329,6 +329,9 @@ func (l *Log) Append(record Record) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.meta.EffectiveMode() == game.PlayModeRealTime {
+		return Record{}, errors.New("real-time preparing log does not accept records")
+	}
 	if (record.Schema != SchemaVersion && record.Schema != l.meta.Schema) || record.Command.ID == "" || record.Version != l.nextVersion {
 		return Record{}, errors.New("invalid event record")
 	}

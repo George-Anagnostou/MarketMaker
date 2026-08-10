@@ -22,6 +22,7 @@ import (
 	"market-maker/internal/eventlog"
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/game"
 	"market-maker/internal/scenario"
 )
 
@@ -49,6 +50,8 @@ type exchangeEntry struct {
 	scenario       *scenario.Snapshot
 	coaching       *scenario.Coaching
 	recap          *scenario.Recap
+	mode           game.PlayMode
+	realTime       *realTimeState
 	storageFailed  bool
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
@@ -61,9 +64,24 @@ func newExchangeService(root string) *exchangeService {
 func syncEventLog(log *eventlog.Log) error { return log.Sync() }
 
 type createExchangeRequest struct {
-	GameID     string `json:"game_id"`
-	CommandID  string `json:"command_id"`
-	ScenarioID string `json:"scenario_id"`
+	GameID     string          `json:"game_id"`
+	CommandID  string          `json:"command_id"`
+	ScenarioID string          `json:"scenario_id"`
+	Mode       json.RawMessage `json:"mode"`
+}
+
+func (req createExchangeRequest) playMode() (game.PlayMode, error) {
+	if len(req.Mode) == 0 {
+		return game.PlayModeTurnBased, nil
+	}
+	var mode game.PlayMode
+	if bytes.Equal(bytes.TrimSpace(req.Mode), []byte("null")) || json.Unmarshal(req.Mode, &mode) != nil {
+		return "", errors.New("mode must be a play-mode string")
+	}
+	if err := mode.Validate(); err != nil {
+		return "", err
+	}
+	return mode, nil
 }
 
 type exchangeCommandRequest struct {
@@ -117,6 +135,8 @@ type exchangeResponse struct {
 	Scenario *scenario.Snapshot `json:"scenario,omitempty"`
 	Coaching *scenario.Coaching `json:"coaching,omitempty"`
 	Recap    *scenario.Recap    `json:"recap,omitempty"`
+	Mode     game.PlayMode      `json:"mode"`
+	RealTime *realTimeState     `json:"real_time,omitempty"`
 }
 
 type exchangeStateResponse struct {
@@ -129,6 +149,12 @@ type exchangeStateResponse struct {
 	Scenario       *scenario.Snapshot `json:"scenario,omitempty"`
 	Coaching       *scenario.Coaching `json:"coaching,omitempty"`
 	Recap          *scenario.Recap    `json:"recap,omitempty"`
+	Mode           game.PlayMode      `json:"mode"`
+	RealTime       *realTimeState     `json:"real_time,omitempty"`
+}
+
+type realTimeState struct {
+	Lifecycle game.LifecycleState `json:"lifecycle"`
 }
 
 type latestTurn struct {
@@ -145,6 +171,8 @@ type exchangeCreateResponse struct {
 	Scenario *scenario.Snapshot `json:"scenario,omitempty"`
 	Coaching *scenario.Coaching `json:"coaching,omitempty"`
 	Recap    *scenario.Recap    `json:"recap,omitempty"`
+	Mode     game.PlayMode      `json:"mode"`
+	RealTime *realTimeState     `json:"real_time,omitempty"`
 }
 
 type apiError struct {
@@ -171,14 +199,23 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id and command_id must be UUIDs")
 		return
 	}
+	mode, err := req.playMode()
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_mode", err.Error())
+		return
+	}
 	req.GameID, req.CommandID = strings.ToLower(req.GameID), strings.ToLower(req.CommandID)
-	entry, created, err := s.createOrLoad(req.GameID, req.CommandID, req.ScenarioID)
+	entry, created, err := s.createOrLoadMode(req.GameID, req.CommandID, req.ScenarioID, mode)
 	if errors.Is(err, errUnknownScenario) {
 		writeAPIError(w, http.StatusBadRequest, "unknown_scenario", "scenario_id is not in the server catalog")
 		return
 	}
 	if errors.Is(err, errCreateConflict) {
 		writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "game id or create command id is already associated with a different create request")
+		return
+	}
+	if errors.Is(err, errUnsupportedMode) {
+		writeAPIError(w, http.StatusBadRequest, "unsupported_mode", "scenario does not support the requested play mode")
 		return
 	}
 	if err != nil {
@@ -194,7 +231,7 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := entry.engine.State()
-	snapshot, coaching, recap := entry.scenario, entry.coaching, entry.recap
+	snapshot, coaching, recap, mode, realTime := entry.scenario, entry.coaching, entry.recap, entry.mode, entry.realTime
 	if !created {
 		initial, err := exchange.New(entry.log.Meta().Config)
 		if err != nil {
@@ -212,7 +249,7 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Location", "/api/v2/games/"+req.GameID)
 	}
-	writeJSON(w, status, exchangeCreateResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: snapshot, Coaching: coaching, Recap: recap})
+	writeJSON(w, status, exchangeCreateResponse{GameID: req.GameID, Version: state.Version, State: state, Command: commandResponse{ID: req.CommandID, Type: "create_game", Replayed: !created}, Scenario: snapshot, Coaching: coaching, Recap: recap, Mode: mode, RealTime: realTime})
 	if created {
 		outcome = "accepted"
 	} else {
@@ -285,14 +322,26 @@ func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, 
 	}
 	state := entry.engine.State()
 	startingEquity, eventsThrough := entry.startingEquity, entry.eventsThrough
-	latest, snapshot, coaching, recap := entry.latestTurn, entry.scenario, entry.coaching, entry.recap
+	latest, snapshot, coaching, recap, mode, realTime := entry.latestTurn, entry.scenario, entry.coaching, entry.recap, entry.mode, entry.realTime
 	entry.mu.Unlock()
-	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, StartingEquity: startingEquity, EventsThrough: eventsThrough, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap})
+	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, StartingEquity: startingEquity, EventsThrough: eventsThrough, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap, Mode: mode, RealTime: realTime})
 }
 
 func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
 	commandType, outcome := "unknown", "rejected"
 	defer func() { s.metrics.observeCommand(commandType, outcome) }()
+	entry.mu.Lock()
+	mode, storageFailed := entry.mode, entry.storageFailed
+	entry.mu.Unlock()
+	if storageFailed {
+		outcome = "storage_failure"
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+		return
+	}
+	if mode == game.PlayModeRealTime {
+		writeAPIError(w, http.StatusConflict, "command_unavailable_for_mode", "real-time commands are not available yet")
+		return
+	}
 	data, err := readJSONRequest(w, r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -338,7 +387,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 			writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "command id has a different payload")
 			return
 		}
-		response := exchangeResult(id, prior.Result, command, true, entry.scenario, prior.Coaching, prior.Recap)
+		response := exchangeResult(id, prior.Result, command, true, entry.scenario, prior.Coaching, prior.Recap, entry.mode, entry.realTime)
 		entry.mu.Unlock()
 		writeJSON(w, http.StatusOK, response)
 		outcome = "replayed"
@@ -406,7 +455,7 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 	}
 	entry.coaching, entry.recap = record.Coaching, record.Recap
-	response := exchangeResult(id, record.Result, command, false, entry.scenario, entry.coaching, entry.recap)
+	response := exchangeResult(id, record.Result, command, false, entry.scenario, entry.coaching, entry.recap, entry.mode, entry.realTime)
 	entry.mu.Unlock()
 	writeJSON(w, http.StatusOK, response)
 	outcome = "accepted"
@@ -487,8 +536,8 @@ func canonicalUintQuery(query url.Values, name string) (uint64, bool, error) {
 	return parsed, true, nil
 }
 
-func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool, snapshot *scenario.Snapshot, coaching *scenario.Coaching, recap *scenario.Recap) exchangeResponse {
-	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}, Scenario: snapshot, Coaching: coaching, Recap: recap}
+func exchangeResult(id string, result exchange.Result, command exchange.Command, replayed bool, snapshot *scenario.Snapshot, coaching *scenario.Coaching, recap *scenario.Recap, mode game.PlayMode, realTime *realTimeState) exchangeResponse {
+	return exchangeResponse{GameID: id, Version: result.State.Version, State: result.State, Summary: result.Summary, Events: result.Events, Command: commandResponse{ID: command.ID, Type: command.Type, Replayed: replayed}, Scenario: snapshot, Coaching: coaching, Recap: recap, Mode: mode, RealTime: realTime}
 }
 
 func priorResults(commands map[string]eventlog.Record) []exchange.Result {
@@ -507,22 +556,27 @@ func priorResults(commands map[string]eventlog.Record) []exchange.Result {
 var (
 	errCreateConflict  = errors.New("create command conflicts with existing game")
 	errUnknownScenario = errors.New("scenario is not in the server catalog")
+	errUnsupportedMode = errors.New("scenario does not support play mode")
 )
 
 func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (*exchangeEntry, bool, error) {
+	return s.createOrLoadMode(id, createCommandID, scenarioID, game.PlayModeTurnBased)
+}
+
+func (s *exchangeService) createOrLoadMode(id, createCommandID, scenarioID string, mode game.PlayMode) (*exchangeEntry, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.checkCreateCommandScope(id, createCommandID, scenarioID); err != nil {
+	if err := s.checkCreateCommandScope(id, createCommandID, scenarioID, mode); err != nil {
 		return nil, false, err
 	}
 	if entry := s.entries[id]; entry != nil {
-		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
+		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID, mode) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, nil
 	}
 	if entry, err := s.loadLocked(id); err == nil {
-		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
+		if !matchesCreate(entry.log.Meta(), createCommandID, scenarioID, mode) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, nil
@@ -533,16 +587,19 @@ func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (
 	if !ok {
 		return nil, false, errUnknownScenario
 	}
+	if mode == game.PlayModeRealTime && definition.RealTime == nil {
+		return nil, false, errUnsupportedMode
+	}
 	cfg := definition.Config
 	engine, err := exchange.New(cfg)
 	if err != nil {
 		return nil, false, err
 	}
 	snapshot := definition.Snapshot()
-	log, err := eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, &snapshot)
+	log, err := eventlog.CreateWithMode(s.root, id, localPrincipal, createCommandID, cfg, &snapshot, mode)
 	if errors.Is(err, os.ErrExist) {
 		entry, loadErr := s.loadLocked(id)
-		if loadErr == nil && !matchesCreate(entry.log.Meta(), createCommandID, scenarioID) {
+		if loadErr == nil && !matchesCreate(entry.log.Meta(), createCommandID, scenarioID, mode) {
 			return nil, false, errCreateConflict
 		}
 		return entry, false, loadErr
@@ -550,12 +607,12 @@ func (s *exchangeService) createOrLoad(id, createCommandID, scenarioID string) (
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, syncLog: s.syncLog, metrics: s.metrics}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, mode: mode, realTime: realTimeStateFromMeta(log.Meta()), syncLog: s.syncLog, metrics: s.metrics}
 	s.entries[id] = entry
 	return entry, true, nil
 }
 
-func (s *exchangeService) checkCreateCommandScope(id, createCommandID, scenarioID string) error {
+func (s *exchangeService) checkCreateCommandScope(id, createCommandID, scenarioID string, mode game.PlayMode) error {
 	entries, err := os.ReadDir(s.root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -574,15 +631,15 @@ func (s *exchangeService) checkCreateCommandScope(id, createCommandID, scenarioI
 		if meta.CreateCommandID != createCommandID {
 			continue
 		}
-		if meta.GameID != id || meta.Scenario == nil || meta.Scenario.ID != scenarioID {
+		if meta.GameID != id || meta.Scenario == nil || meta.Scenario.ID != scenarioID || meta.EffectiveMode() != mode {
 			return errCreateConflict
 		}
 	}
 	return nil
 }
 
-func matchesCreate(meta eventlog.Meta, createCommandID, scenarioID string) bool {
-	return meta.CreateCommandID == createCommandID && meta.Scenario != nil && meta.Scenario.ID == scenarioID
+func matchesCreate(meta eventlog.Meta, createCommandID, scenarioID string, mode game.PlayMode) bool {
+	return meta.CreateCommandID == createCommandID && meta.Scenario != nil && meta.Scenario.ID == scenarioID && meta.EffectiveMode() == mode
 }
 
 func (s *exchangeService) load(id string) (*exchangeEntry, error) {
@@ -661,12 +718,18 @@ func (entry *exchangeEntry) recover() (err error) {
 	entry.scenario = rebuilt.scenario
 	entry.coaching = rebuilt.coaching
 	entry.recap = rebuilt.recap
+	entry.mode = rebuilt.mode
+	entry.realTime = rebuilt.realTime
 	entry.storageFailed = false
 	return nil
 }
 
 func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchangeEntry, error) {
 	meta := log.Meta()
+	mode := meta.EffectiveMode()
+	if mode == game.PlayModeRealTime && len(records) != 0 {
+		return nil, errors.New("real-time preparing game contains command records")
+	}
 	engine, commands, err := replayRecords(meta.Config, records)
 	if err != nil {
 		return nil, err
@@ -675,7 +738,7 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	if err != nil {
 		return nil, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario}
+	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario, mode: mode, realTime: realTimeStateFromMeta(meta)}
 	for _, record := range records {
 		entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 		if record.Command.Type == exchange.CommandSubmitQuote {
@@ -689,6 +752,13 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 		}
 	}
 	return entry, nil
+}
+
+func realTimeStateFromMeta(meta eventlog.Meta) *realTimeState {
+	if meta.RealTime == nil {
+		return nil
+	}
+	return &realTimeState{Lifecycle: meta.RealTime.Lifecycle}
 }
 
 func checkedStartingEquity(cfg exchange.Config) (fixed.Money, error) {
