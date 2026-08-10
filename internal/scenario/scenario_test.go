@@ -1,6 +1,9 @@
 package scenario
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"math"
 	"reflect"
 	"strings"
@@ -9,6 +12,51 @@ import (
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
 )
+
+func TestTurnBasedScenarioGoldenResults(t *testing.T) {
+	want := map[string]string{
+		"first-spread-v1":       "e9bbe6e31cad7af6cd41f8626e38217e98c04d82489f17e954203a46d6c76a02",
+		"inventory-pressure-v1": "511582a87427e491ef2a11e27eaec5bfabb3d1226b0bb203b316eb8fbee6ad33",
+		"volatility-shock-v1":   "819ce8080733583826e83ddc4523b45ffcf06c1f09b0867f498ef7b26e418d8b",
+		"volatility-shock-v2":   "e06f2ca8fe2b8db9d89a384e281d7428d8f075422b4c43395f63e4548024b68d",
+	}
+	for _, snapshot := range List() {
+		definition, ok := Get(snapshot.ID)
+		if !ok {
+			t.Fatalf("missing scenario %q", snapshot.ID)
+		}
+		engine, err := exchange.New(definition.Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := make([]exchange.Result, 0, definition.Config.NumTurns)
+		for !engine.State().IsOver {
+			mark := engine.State().Mark
+			bid, err := fixed.ScalePrice(mark, 9_950, 10_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ask, err := fixed.ScalePrice(mark, 10_050, 10_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := engine.SubmitQuote(bid, ask)
+			if err != nil {
+				t.Fatal(err)
+			}
+			results = append(results, result)
+		}
+		encoded, err := json.Marshal(results)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(encoded)
+		got := hex.EncodeToString(digest[:])
+		if got != want[snapshot.ID] {
+			t.Errorf("%s golden digest = %s, want %s", snapshot.ID, got, want[snapshot.ID])
+		}
+	}
+}
 
 func TestCatalogIsValidAndStable(t *testing.T) {
 	if err := ValidateCatalog(); err != nil {
