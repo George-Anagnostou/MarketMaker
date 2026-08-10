@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/game"
 	"market-maker/internal/scenario"
 	"os"
 	"path/filepath"
@@ -75,7 +76,7 @@ func TestAppendAndOpen(t *testing.T) {
 	}
 }
 
-func TestNewLogsUseSchema3AndV3ChecksumDomains(t *testing.T) {
+func TestNewLogsUseSchema4AndV4ChecksumDomains(t *testing.T) {
 	root := t.TempDir()
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), nil)
 	if err != nil {
@@ -93,10 +94,10 @@ func TestNewLogsUseSchema3AndV3ChecksumDomains(t *testing.T) {
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.Schema != 3 || SchemaVersion != 3 {
+	if meta.Schema != 4 || SchemaVersion != 4 || meta.Mode != game.PlayModeTurnBased || meta.RealTime != nil {
 		t.Fatalf("metadata schema=%d current=%d", meta.Schema, SchemaVersion)
 	}
-	if got := independentMetadataChecksum(t, meta, "market-maker/eventlog/meta/v3\x00"); got != meta.Checksum {
+	if got := independentMetadataChecksum(t, meta, "market-maker/eventlog/meta/v4\x00"); got != meta.Checksum {
 		t.Fatalf("metadata checksum=%q want=%q", meta.Checksum, got)
 	}
 
@@ -108,10 +109,10 @@ func TestNewLogsUseSchema3AndV3ChecksumDomains(t *testing.T) {
 	if err := json.Unmarshal(recordData, &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.Schema != 3 || record.MetadataChecksum != meta.Checksum {
-		t.Fatalf("record is not schema 3 metadata-bound: %+v", record)
+	if record.Schema != 4 || record.MetadataChecksum != meta.Checksum {
+		t.Fatalf("record is not schema 4 metadata-bound: %+v", record)
 	}
-	if got := independentRecordChecksum(t, record, "market-maker/eventlog/record/v3\x00"); got != record.Checksum {
+	if got := independentRecordChecksum(t, record, "market-maker/eventlog/record/v4\x00"); got != record.Checksum {
 		t.Fatalf("record checksum=%q want=%q", record.Checksum, got)
 	}
 }
@@ -192,13 +193,54 @@ func TestOpenAppendAndReopenSchema2WithFrozenDomains(t *testing.T) {
 	}
 }
 
+func TestOpenAppendAndReopenSchema3WithFrozenDomains(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "game-1")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := Meta{Schema: schema3, GameID: "game-1", OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Config: testConfig(t)}
+	meta.Checksum = independentMetadataChecksum(t, meta, "market-maker/eventlog/meta/v3\x00")
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), append(metaData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := Record{Schema: schema3, Version: 1, MetadataChecksum: meta.Checksum, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}
+	first.Checksum = independentRecordChecksum(t, first, "market-maker/eventlog/record/v3\x00")
+	firstData, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), append(firstData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	log, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 1 || log.Meta().EffectiveMode() != game.PlayModeTurnBased {
+		t.Fatalf("open schema 3: records=%+v err=%v", records, err)
+	}
+	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 2, Command: exchange.Command{ID: "c-2", Type: exchange.CommandQuit}}); err != nil {
+		t.Fatal(err)
+	}
+	_, records, err = Open(root, "game-1")
+	if err != nil || len(records) != 2 || records[1].Schema != schema3 {
+		t.Fatalf("reopen schema 3: records=%+v err=%v", records, err)
+	}
+	if got := independentRecordChecksum(t, records[1], "market-maker/eventlog/record/v3\x00"); got != records[1].Checksum {
+		t.Fatalf("schema 3 checksum=%q want=%q", records[1].Checksum, got)
+	}
+}
+
 func TestOpenRejectsUnknownSchema(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "game-1")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	metaData, err := json.Marshal(Meta{Schema: 4, GameID: "game-1", OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Now().UTC(), Config: testConfig(t)})
+	metaData, err := json.Marshal(Meta{Schema: 5, GameID: "game-1", OwnerID: "local", CreateCommandID: "create-1", CreatedAt: time.Now().UTC(), Config: testConfig(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,19 +432,105 @@ func TestOpenRejectsTamperedRecord(t *testing.T) {
 
 func TestScenarioMetadataIsCopied(t *testing.T) {
 	root := t.TempDir()
-	snapshot := &scenario.Snapshot{ID: "lesson", Tutorial: []scenario.TutorialStep{{Title: "Original", Body: "Original body"}}}
+	snapshot := &scenario.Snapshot{ID: "lesson", Tutorial: []scenario.TutorialStep{{Title: "Original", Body: "Original body"}}, Modes: []game.PlayMode{game.PlayModeTurnBased}, RealTime: &scenario.RealTimeConfig{DurationMilliseconds: 90_000}}
 	log, err := Create(root, "game-1", "local", "create-1", testConfig(t), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot.Tutorial[0].Title = "Mutated input"
+	snapshot.Modes[0] = game.PlayModeRealTime
+	snapshot.RealTime.DurationMilliseconds = 1
 	meta := log.Meta()
-	if meta.Scenario.Tutorial[0].Title != "Original" {
+	if meta.Scenario.Tutorial[0].Title != "Original" || meta.Scenario.Modes[0] != game.PlayModeTurnBased || meta.Scenario.RealTime.DurationMilliseconds != 90_000 {
 		t.Fatalf("stored scenario=%+v", meta.Scenario)
 	}
 	meta.Scenario.Tutorial[0].Title = "Mutated output"
-	if got := log.Meta().Scenario.Tutorial[0].Title; got != "Original" {
-		t.Fatalf("metadata mutation leaked as %q", got)
+	meta.Scenario.Modes[0] = game.PlayModeRealTime
+	meta.Scenario.RealTime.DurationMilliseconds = 1
+	got := log.Meta().Scenario
+	if got.Tutorial[0].Title != "Original" || got.Modes[0] != game.PlayModeTurnBased || got.RealTime.DurationMilliseconds != 90_000 {
+		t.Fatalf("metadata mutation leaked: %+v", got)
+	}
+}
+
+func TestCreateRealTimePreparingMetadata(t *testing.T) {
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	snapshot := definition.Snapshot()
+	root := t.TempDir()
+	log, err := CreateWithMode(root, "game-1", "local", "create-1", definition.Config, &snapshot, game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := log.Meta()
+	if meta.EffectiveMode() != game.PlayModeRealTime || meta.RealTime == nil || meta.RealTime.Lifecycle != game.LifecyclePreparing || meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.ScheduleVersion != game.ScheduleVersion {
+		t.Fatalf("real-time metadata=%+v", meta)
+	}
+	meta.RealTime.Lifecycle = "mutated"
+	if log.Meta().RealTime.Lifecycle != game.LifecyclePreparing {
+		t.Fatal("real-time metadata aliases caller")
+	}
+	reopened, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 0 || reopened.Meta().EffectiveMode() != game.PlayModeRealTime {
+		t.Fatalf("reopen real-time records=%+v err=%v", records, err)
+	}
+}
+
+func TestMetadataModeValidation(t *testing.T) {
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	snapshot := definition.Snapshot()
+	validRealTime := Meta{
+		Schema:   SchemaVersion,
+		Config:   definition.Config,
+		Scenario: &snapshot,
+		Mode:     game.PlayModeRealTime,
+		RealTime: &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, ScheduleVersion: game.ScheduleVersion},
+	}
+	if err := validateMeta(validRealTime); err != nil {
+		t.Fatalf("valid real-time metadata rejected: %v", err)
+	}
+	tests := map[string]func(*Meta){
+		"missing mode":            func(meta *Meta) { meta.Mode = "" },
+		"missing lifecycle":       func(meta *Meta) { meta.RealTime = nil },
+		"missing scenario":        func(meta *Meta) { meta.Scenario = nil },
+		"missing scenario config": func(meta *Meta) { meta.Scenario.RealTime = nil },
+		"lifecycle version":       func(meta *Meta) { meta.RealTime.LifecycleVersion++ },
+		"lifecycle state":         func(meta *Meta) { meta.RealTime.Lifecycle = "running" },
+		"schedule version":        func(meta *Meta) { meta.RealTime.ScheduleVersion++ },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			meta := validRealTime
+			scenarioCopy := *validRealTime.Scenario
+			realTimeConfig := *validRealTime.Scenario.RealTime
+			scenarioCopy.RealTime = &realTimeConfig
+			meta.Scenario = &scenarioCopy
+			realTimeMeta := *validRealTime.RealTime
+			meta.RealTime = &realTimeMeta
+			mutate(&meta)
+			if err := validateMeta(meta); err == nil {
+				t.Fatal("invalid metadata accepted")
+			}
+		})
+	}
+	turnBased := validRealTime
+	turnBased.Mode = game.PlayModeTurnBased
+	turnBased.RealTime = nil
+	if err := validateMeta(turnBased); err != nil {
+		t.Fatalf("valid turn-based metadata rejected: %v", err)
+	}
+	turnBased.RealTime = validRealTime.RealTime
+	if err := validateMeta(turnBased); err == nil {
+		t.Fatal("turn-based metadata accepted real-time lifecycle")
+	}
+	historical := Meta{Schema: schema3, Mode: game.PlayModeTurnBased}
+	if err := validateMeta(historical); err == nil {
+		t.Fatal("historical schema accepted mode field")
 	}
 }
 
@@ -946,7 +1074,7 @@ func TestOpenAcceptsHistoricalCreateCommandIDCollision(t *testing.T) {
 
 func TestCreateEnforcesMetadataWriteLimit(t *testing.T) {
 	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 678901234, time.UTC)
-	base := Meta{Schema: SchemaVersion, GameID: "game-1", OwnerID: "", CreateCommandID: "create-1", CreatedAt: createdAt, Config: testConfig(t)}
+	base := Meta{Schema: SchemaVersion, GameID: "game-1", OwnerID: "", CreateCommandID: "create-1", CreatedAt: createdAt, Config: testConfig(t), Mode: game.PlayModeTurnBased}
 	checksum, err := metadataChecksum(base)
 	if err != nil {
 		t.Fatal(err)

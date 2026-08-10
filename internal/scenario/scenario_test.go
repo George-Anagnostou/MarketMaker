@@ -199,12 +199,12 @@ func TestRealTimeConfigValidation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			config := valid
 			mutate(&config)
-			if err := validateRealTimeConfig(definition.Config, &config); err == nil {
+			if err := ValidateRealTimeConfig(definition.Config, &config); err == nil {
 				t.Fatal("invalid real-time config accepted")
 			}
 		})
 	}
-	if err := validateRealTimeConfig(definition.Config, nil); err != nil {
+	if err := ValidateRealTimeConfig(definition.Config, nil); err != nil {
 		t.Fatalf("nil real-time config rejected: %v", err)
 	}
 }

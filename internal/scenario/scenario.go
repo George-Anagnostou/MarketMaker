@@ -253,14 +253,14 @@ func ValidateCatalog() error {
 		if err := definition.Config.Validate(); err != nil {
 			return fmt.Errorf("scenario %s: %w", definition.ID, err)
 		}
-		if err := validateRealTimeConfig(definition.Config, definition.RealTime); err != nil {
+		if err := ValidateRealTimeConfig(definition.Config, definition.RealTime); err != nil {
 			return fmt.Errorf("scenario %s real-time config: %w", definition.ID, err)
 		}
 	}
 	return nil
 }
 
-func validateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConfig) error {
+func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConfig) error {
 	if config == nil {
 		return nil
 	}

@@ -16,19 +16,27 @@ import (
 	"time"
 
 	"market-maker/internal/exchange"
+	"market-maker/internal/game"
 	"market-maker/internal/scenario"
 )
 
 const (
-	// SchemaVersion is used for newly created logs. Schemas 1 and 2 remain
+	// SchemaVersion is used for newly created logs. Schemas 1 through 3 remain
 	// readable and appendable so existing games retain their wire formats.
 	schema1       = 1
 	schema2       = 2
-	SchemaVersion = 3
+	schema3       = 3
+	SchemaVersion = 4
 
 	maxMetadataBytes = 1 << 20
 	maxEventsBytes   = 64 << 20
 )
+
+type RealTimeMeta struct {
+	LifecycleVersion uint32              `json:"lifecycle_version"`
+	Lifecycle        game.LifecycleState `json:"lifecycle"`
+	ScheduleVersion  uint32              `json:"schedule_version"`
+}
 
 type Meta struct {
 	Schema          int                `json:"schema"`
@@ -38,7 +46,16 @@ type Meta struct {
 	CreatedAt       time.Time          `json:"created_at"`
 	Config          exchange.Config    `json:"config"`
 	Scenario        *scenario.Snapshot `json:"scenario,omitempty"`
+	Mode            game.PlayMode      `json:"mode,omitempty"`
+	RealTime        *RealTimeMeta      `json:"real_time,omitempty"`
 	Checksum        string             `json:"checksum,omitempty"`
+}
+
+func (m Meta) EffectiveMode() game.PlayMode {
+	if m.Schema <= schema3 {
+		return game.PlayModeTurnBased
+	}
+	return m.Mode
 }
 
 type Record struct {
@@ -65,10 +82,18 @@ type Log struct {
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
-	return createAt(root, gameID, ownerID, createCommandID, cfg, snapshot, time.Now().UTC())
+	return CreateWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased)
+}
+
+func CreateWithMode(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, mode game.PlayMode) (*Log, error) {
+	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, mode, time.Now().UTC())
 }
 
 func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, createdAt time.Time) (*Log, error) {
+	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased, createdAt)
+}
+
+func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, mode game.PlayMode, createdAt time.Time) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -95,7 +120,13 @@ func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config
 		}
 	}()
 
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot)}
+	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot), Mode: mode}
+	if mode == game.PlayModeRealTime {
+		meta.RealTime = &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, ScheduleVersion: game.ScheduleVersion}
+	}
+	if err := validateMeta(meta); err != nil {
+		return nil, err
+	}
 	checksum, err := metadataChecksum(meta)
 	if err != nil {
 		return nil, err
@@ -201,7 +232,7 @@ func ReadMeta(root, gameID string) (Meta, error) {
 	}
 	switch meta.Schema {
 	case schema1:
-	case schema2, SchemaVersion:
+	case schema2, schema3, SchemaVersion:
 		checksum, err := metadataChecksum(meta)
 		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
 			return Meta{}, errors.New("invalid game metadata checksum")
@@ -210,13 +241,18 @@ func ReadMeta(root, gameID string) (Meta, error) {
 	if err := meta.Config.Validate(); err != nil {
 		return Meta{}, fmt.Errorf("invalid stored config: %w", err)
 	}
+	if err := validateMeta(meta); err != nil {
+		return Meta{}, fmt.Errorf("invalid stored metadata: %w", err)
+	}
 	meta.Scenario = cloneSnapshot(meta.Scenario)
+	meta.RealTime = cloneRealTimeMeta(meta.RealTime)
 	return meta, nil
 }
 
 func (l *Log) Meta() Meta {
 	meta := l.meta
 	meta.Scenario = cloneSnapshot(meta.Scenario)
+	meta.RealTime = cloneRealTimeMeta(meta.RealTime)
 	return meta
 }
 
@@ -226,7 +262,67 @@ func cloneSnapshot(snapshot *scenario.Snapshot) *scenario.Snapshot {
 	}
 	copy := *snapshot
 	copy.Tutorial = append([]scenario.TutorialStep(nil), snapshot.Tutorial...)
+	copy.Modes = append([]game.PlayMode(nil), snapshot.Modes...)
+	if snapshot.RealTime != nil {
+		realTime := *snapshot.RealTime
+		copy.RealTime = &realTime
+	}
 	return &copy
+}
+
+func cloneRealTimeMeta(meta *RealTimeMeta) *RealTimeMeta {
+	if meta == nil {
+		return nil
+	}
+	copy := *meta
+	return &copy
+}
+
+func validateMeta(meta Meta) error {
+	if meta.Schema <= schema3 {
+		if meta.Mode != "" || meta.RealTime != nil || meta.Scenario != nil && (len(meta.Scenario.Modes) != 0 || meta.Scenario.RealTime != nil) {
+			return errors.New("historical schema contains real-time metadata")
+		}
+		return nil
+	}
+	if meta.Schema != SchemaVersion {
+		return errors.New("unsupported game metadata schema")
+	}
+	if err := meta.Mode.Validate(); err != nil {
+		return err
+	}
+	switch meta.Mode {
+	case game.PlayModeTurnBased:
+		if meta.RealTime != nil {
+			return errors.New("turn-based game contains real-time lifecycle")
+		}
+	case game.PlayModeRealTime:
+		if meta.RealTime == nil || meta.Scenario == nil || meta.Scenario.RealTime == nil {
+			return errors.New("real-time game is missing scenario or lifecycle metadata")
+		}
+		if !snapshotSupportsMode(meta.Scenario, game.PlayModeRealTime) {
+			return errors.New("scenario does not support real-time mode")
+		}
+		if meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.ScheduleVersion != game.ScheduleVersion || meta.Scenario.RealTime.ScheduleVersion != meta.RealTime.ScheduleVersion {
+			return errors.New("unsupported real-time lifecycle or schedule version")
+		}
+		if err := meta.RealTime.Lifecycle.Validate(); err != nil {
+			return err
+		}
+		if err := scenario.ValidateRealTimeConfig(meta.Config, meta.Scenario.RealTime); err != nil {
+			return fmt.Errorf("invalid real-time scenario config: %w", err)
+		}
+	}
+	return nil
+}
+
+func snapshotSupportsMode(snapshot *scenario.Snapshot, mode game.PlayMode) bool {
+	for _, supported := range snapshot.Modes {
+		if supported == mode {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Log) Append(record Record) (Record, error) {
@@ -256,7 +352,7 @@ func (l *Log) Append(record Record) (Record, error) {
 	switch record.Schema {
 	case schema1:
 		record.MetadataChecksum = ""
-	case schema2, SchemaVersion:
+	case schema2, schema3, SchemaVersion:
 		record.MetadataChecksum = l.meta.Checksum
 	default:
 		return Record{}, errors.New("invalid event record")
@@ -536,7 +632,7 @@ func validateRecord(record Record, schema int, expectedMetadataChecksum string, 
 	}
 	switch schema {
 	case schema1:
-	case schema2, SchemaVersion:
+	case schema2, schema3, SchemaVersion:
 		if record.MetadataChecksum != expectedMetadataChecksum {
 			return errors.New("record is bound to different metadata")
 		}
@@ -729,8 +825,11 @@ func recordChecksum(record Record) (string, error) {
 	case schema2:
 		input = append([]byte("market-maker/eventlog/record/v2\x00"), input...)
 		input = append(input, record.MetadataChecksum...)
-	case SchemaVersion:
+	case schema3:
 		input = append([]byte("market-maker/eventlog/record/v3\x00"), input...)
+		input = append(input, record.MetadataChecksum...)
+	case SchemaVersion:
+		input = append([]byte("market-maker/eventlog/record/v4\x00"), input...)
 		input = append(input, record.MetadataChecksum...)
 	default:
 		return "", errors.New("unsupported event record schema")
@@ -749,8 +848,10 @@ func metadataChecksum(meta Meta) (string, error) {
 	switch meta.Schema {
 	case schema2:
 		domain = []byte("market-maker/eventlog/meta/v2\x00")
-	case SchemaVersion:
+	case schema3:
 		domain = []byte("market-maker/eventlog/meta/v3\x00")
+	case SchemaVersion:
+		domain = []byte("market-maker/eventlog/meta/v4\x00")
 	default:
 		return "", errors.New("unsupported game metadata schema")
 	}
@@ -760,7 +861,7 @@ func metadataChecksum(meta Meta) (string, error) {
 
 func supportedSchema(schema int) bool {
 	switch schema {
-	case schema1, schema2, SchemaVersion:
+	case schema1, schema2, schema3, SchemaVersion:
 		return true
 	default:
 		return false

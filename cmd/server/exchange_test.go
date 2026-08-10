@@ -831,7 +831,7 @@ func TestV2AdverseSelectionLatestTurnPersistsAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if metaLog.Meta().Schema != eventlog.SchemaVersion || eventlog.SchemaVersion != 3 || len(records) != 2 || metaLog.Meta().Config.SimulationVersion != exchange.SimulationVersionAdverseSelection {
+	if metaLog.Meta().Schema != eventlog.SchemaVersion || eventlog.SchemaVersion != 4 || len(records) != 2 || metaLog.Meta().Config.SimulationVersion != exchange.SimulationVersionAdverseSelection {
 		t.Fatalf("persisted schema/config/records changed: meta=%+v records=%d", metaLog.Meta(), len(records))
 	}
 
@@ -1270,6 +1270,8 @@ func TestSchema1TerminalResponseUsesDurableProjectedRecord(t *testing.T) {
 	}
 	snapshot := definition.Snapshot()
 	snapshot.Turns = 1
+	snapshot.Modes = nil
+	snapshot.RealTime = nil
 	dir := filepath.Join(root, testGameID)
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
