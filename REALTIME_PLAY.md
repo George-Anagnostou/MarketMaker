@@ -58,7 +58,7 @@ preparing -> countdown -> running <-> paused -> completed
 ```
 
 - **Preparing:** The player edits an opening bid and ask. No market time passes.
-- **Countdown:** A start command validates and stages the opening quote, then begins a three-second ready countdown. No customer flow or mark movement occurs during the countdown.
+- **Countdown:** A start command validates and stages the opening quote, then begins a three-second ready countdown. No customer flow or mark movement occurs during the countdown. Once acknowledged, the countdown is irreversible.
 - **Running:** The opening quote becomes live at logical time zero. The 90-second logical clock, scheduled customer flow, mark movement, carry charges, and risk evaluation begin.
 - **Paused:** Logical time and all scheduled market activity freeze. Resting orders and account state remain unchanged. Resuming retains the quote.
 - **Completed:** New quote commands are rejected. Resting player orders are cancelled, final equity is marked at the final reference price, and the recap is generated.
@@ -77,13 +77,13 @@ The player has these mode-specific actions:
 
 The UI uses an explicit **Update quote** button. Draft input has no market effect until submitted. Accepted replacement receives new order IDs and loses queue priority, matching the existing venue rules.
 
-Real-time quote updates use command IDs for idempotency but do not use the turn-based global `expected_version` precondition. Autonomous market events advance state too often for that contract to be usable. The sequencer defines authoritative order, and an optional quote revision can reject updates based on a stale player quote without conflicting on unrelated market activity.
+Real-time quote updates use command IDs for idempotency but do not use the turn-based global `expected_version` precondition. Autonomous market events advance state too often for that contract to be usable. Each update must include the last acknowledged player quote revision so a stale browser tab cannot overwrite a newer quote without conflicting on unrelated market activity.
 
 ### Solo Disconnects
 
 The event stream sends heartbeats and represents one browser as the active local controller. If the controller disconnects while the round is running:
 
-1. The server starts a configurable grace period; the initial proposal is three seconds.
+1. The server starts a five-second grace period.
 2. Reconnection within the grace period preserves continuous play and backfills missed events.
 3. Grace expiry enqueues a durable system pause at the authoritative elapsed time.
 4. Reconnection hydrates canonical state and requires an explicit resume.
@@ -180,6 +180,8 @@ Ordering rules are explicit:
 
 This makes network arrival arbitrary while preserving one authoritative total order. Future multiplayer participants feed the same sequencer; they do not mutate the book concurrently.
 
+If processing falls behind wall time, the sequencer executes every overdue scheduled action in stable order until logical time catches up. It does not skip actions, reorder them, or pause solely because of schedule lateness. Lateness is measured and exposed operationally; storage or replay-integrity failures still fence the game. Stream consumers may receive a burst and must coalesce rendering without dropping durable audit events.
+
 Pause stops logical-time accumulation and disarms the next timer. Resume creates a new wall-to-logical-time anchor. Server restart restores the last committed elapsed time and leaves an interrupted solo game paused rather than counting process downtime as market time.
 
 ### Deterministic Schedule
@@ -272,7 +274,7 @@ The live view prioritizes decisions over instruction:
 - Clear distinction between draft quote and acknowledged live quote.
 - Current mark and a compact mark chart.
 - Honest shallow order-book display with player-order ownership.
-- Recent trade tape with player side, price, quantity, and informed status when the lesson reveals it.
+- Recent trade tape with player side, price, and quantity. Informed status remains hidden during play and is revealed only in post-round analysis.
 - Position, cash, equity, total round P&L, and risk proximity.
 - Pause and quit controls separated from quote entry.
 - Connection/recovery status that never implies a draft quote was accepted.
@@ -457,10 +459,10 @@ The multiplayer clock remains wall-paced and never pauses, but every accepted or
 - The live UI remains usable on desktop and mobile and exposes equivalent non-color and text information.
 - Expected solo event rates remain within defined schedule-lateness, fsync-latency, file-size, replay-time, and render budgets.
 
-## Open Review Decisions
+## Resolved Review Policies
 
-1. Is three seconds the correct disconnect grace period, or should it be longer to tolerate brief browser/network stalls?
-2. Should countdown cancellation return to `preparing`, or should countdown be irreversible once acknowledged?
-3. Should the live UI reveal informed-customer status immediately in Informed Flow, or only in the post-round audit?
-4. Should quote updates accept an optional expected quote revision to prevent stale-tab replacement, or should last sequenced update always win in local solo play?
-5. What schedule-lateness budget is acceptable before the server pauses/fences a round rather than trying to catch up?
+- Disconnect grace is five seconds.
+- An acknowledged countdown is irreversible.
+- Informed-customer status is revealed only in post-round analysis.
+- Quote updates require the last acknowledged quote revision.
+- Overdue scheduled actions catch up in stable order without being skipped.
