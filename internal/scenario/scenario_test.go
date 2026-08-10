@@ -75,7 +75,7 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	}
 	wantRealTime := &RealTimeConfig{
 		Revision:                    "1",
-		ScheduleVersion:             game.ScheduleVersion,
+		GeneratorVersion:            game.GeneratorVersion,
 		DurationMilliseconds:        90_000,
 		CountdownMilliseconds:       3_000,
 		DisconnectGraceMilliseconds: 5_000,
@@ -84,7 +84,6 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 		MarkCadence:                 IntervalRange{MinMilliseconds: 5_000, MaxMilliseconds: 8_000},
 		CarryCadenceMilliseconds:    10_000,
 		CarryPerUnit:                fixed.Price(10_000),
-		Seed:                        101,
 		CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
 		MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
 	}
@@ -179,11 +178,11 @@ func TestRealTimeConfigValidation(t *testing.T) {
 	}
 	valid := *definition.RealTime
 	tests := map[string]func(*RealTimeConfig){
-		"revision":         func(config *RealTimeConfig) { config.Revision = "" },
-		"schedule version": func(config *RealTimeConfig) { config.ScheduleVersion++ },
-		"duration":         func(config *RealTimeConfig) { config.DurationMilliseconds = 0 },
-		"countdown":        func(config *RealTimeConfig) { config.CountdownMilliseconds = 0 },
-		"disconnect grace": func(config *RealTimeConfig) { config.DisconnectGraceMilliseconds = 0 },
+		"revision":          func(config *RealTimeConfig) { config.Revision = "" },
+		"generator version": func(config *RealTimeConfig) { config.GeneratorVersion++ },
+		"duration":          func(config *RealTimeConfig) { config.DurationMilliseconds = 0 },
+		"countdown":         func(config *RealTimeConfig) { config.CountdownMilliseconds = 0 },
+		"disconnect grace":  func(config *RealTimeConfig) { config.DisconnectGraceMilliseconds = 0 },
 		"customer cadence": func(config *RealTimeConfig) {
 			config.CustomerCadence.MinMilliseconds = config.CustomerCadence.MaxMilliseconds + 1
 		},
@@ -191,7 +190,6 @@ func TestRealTimeConfigValidation(t *testing.T) {
 		"carry cadence":     func(config *RealTimeConfig) { config.CarryCadenceMilliseconds = 0 },
 		"quote quantity":    func(config *RealTimeConfig) { config.QuoteQuantity = definition.Config.MaxOrderQty + 1 },
 		"negative carry":    func(config *RealTimeConfig) { config.CarryPerUnit = -1 },
-		"seed":              func(config *RealTimeConfig) { config.Seed = 0 },
 		"customer domain":   func(config *RealTimeConfig) { config.CustomerSeedDomain = "" },
 		"duplicate domains": func(config *RealTimeConfig) { config.CustomerSeedDomain = config.MarkSeedDomain },
 	}

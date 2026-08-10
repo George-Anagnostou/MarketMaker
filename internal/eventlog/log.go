@@ -35,7 +35,8 @@ const (
 type RealTimeMeta struct {
 	LifecycleVersion uint32              `json:"lifecycle_version"`
 	Lifecycle        game.LifecycleState `json:"lifecycle"`
-	ScheduleVersion  uint32              `json:"schedule_version"`
+	GeneratorVersion uint32              `json:"generator_version"`
+	Seed             uint64              `json:"seed"`
 }
 
 type Meta struct {
@@ -82,18 +83,18 @@ type Log struct {
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
-	return CreateWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased)
+	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased, 0, time.Now().UTC())
 }
 
-func CreateWithMode(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, mode game.PlayMode) (*Log, error) {
-	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, mode, time.Now().UTC())
+func CreateRealTime(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, seed uint64) (*Log, error) {
+	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeRealTime, seed, time.Now().UTC())
 }
 
 func createAt(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, createdAt time.Time) (*Log, error) {
-	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased, createdAt)
+	return createAtWithMode(root, gameID, ownerID, createCommandID, cfg, snapshot, game.PlayModeTurnBased, 0, createdAt)
 }
 
-func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, mode game.PlayMode, createdAt time.Time) (*Log, error) {
+func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot, mode game.PlayMode, seed uint64, createdAt time.Time) (*Log, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -122,7 +123,7 @@ func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchang
 
 	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot), Mode: mode}
 	if mode == game.PlayModeRealTime {
-		meta.RealTime = &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, ScheduleVersion: game.ScheduleVersion}
+		meta.RealTime = &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, GeneratorVersion: game.GeneratorVersion, Seed: seed}
 	}
 	if err := validateMeta(meta); err != nil {
 		return nil, err
@@ -303,8 +304,8 @@ func validateMeta(meta Meta) error {
 		if !snapshotSupportsMode(meta.Scenario, game.PlayModeRealTime) {
 			return errors.New("scenario does not support real-time mode")
 		}
-		if meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.ScheduleVersion != game.ScheduleVersion || meta.Scenario.RealTime.ScheduleVersion != meta.RealTime.ScheduleVersion {
-			return errors.New("unsupported real-time lifecycle or schedule version")
+		if meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.GeneratorVersion != game.GeneratorVersion || meta.Scenario.RealTime.GeneratorVersion != meta.RealTime.GeneratorVersion || meta.RealTime.Seed == 0 {
+			return errors.New("unsupported real-time lifecycle, generator version, or seed")
 		}
 		if err := meta.RealTime.Lifecycle.Validate(); err != nil {
 			return err

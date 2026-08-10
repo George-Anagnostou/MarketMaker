@@ -15,7 +15,7 @@ The first release is a local, single-player browser game against deterministic s
 - The first solo session represents one compressed trading day lasting 90 seconds of logical market time.
 - The player maintains one live two-sided quote and updates both sides atomically.
 - Quote quantity is fixed by the scenario.
-- The market receives pseudo-randomly timed, scenario-seeded customer orders and mark changes independently of player actions.
+- Each game receives a private persisted seed. Versioned generators use it to produce pseudo-randomly timed customer orders and mark changes independently of player actions.
 - The player sees the top of book, a compact shallow book, trade tape, mark chart, position, cash, equity, and P&L.
 - Coaching stays out of the live decision loop and appears after the trading day.
 - Explicit pause is available in solo play. A browser disconnect pauses after a short grace period.
@@ -186,7 +186,7 @@ Pause stops logical-time accumulation and disarms the next timer. Resume creates
 
 ### Deterministic Schedule
 
-The scenario snapshot includes immutable real-time schedule parameters and seed domains. Schedule generation should be independently reproducible and versioned. It may be generated ahead for the finite 90-second solo trading day or incrementally from replayable state; the chosen representation must satisfy these invariants:
+The scenario snapshot includes immutable real-time generator parameters and seed domains. Each game persists a fresh private seed. A versioned incremental generator produces the next event at runtime from replayable cursor state and must satisfy these invariants:
 
 - Existing scenario catalog edits cannot alter a persisted game.
 - Schedule generation does not depend on Go timer wake-up order.
@@ -195,7 +195,7 @@ The scenario snapshot includes immutable real-time schedule parameters and seed 
 - Informed-flow classification and the next mark direction remain reproducible.
 - A replay compares complete action results, not only final state.
 
-Pre-generating the finite exogenous schedule into private game metadata is the preferred first implementation because it is auditable, restart-safe, bounded, and easy to test. Parameters can be stored as relative basis-point moves, sides, quantities, and slippage so execution still resolves against authoritative state at the scheduled time.
+The generator maintains independent customer and mark streams plus deterministic carry and expiry events. Candidate events are ordered by logical timestamp and then monotonic generation sequence. Generator state advances only after the selected system action commits successfully. Solo generation stops before the trading-day expiry boundary; a future continuous market can keep generating from the same versioned state indefinitely.
 
 ### Persistence
 
@@ -205,7 +205,7 @@ Persisted creation metadata includes:
 
 - Explicit play mode.
 - Lifecycle and schedule versions.
-- Real-time scenario snapshot and complete private schedule or equivalent reproducible schedule state.
+- Real-time scenario snapshot, private per-game seed, generator version, and replayable cursor state.
 - Duration, countdown, grace period, quote quantity, carry cadence, and seed-domain configuration.
 
 The command log records player commands and autonomous system actions in the exact committed order, including logical elapsed time, source, result, events, and ledger entries. System action IDs use a separate canonical namespace from client UUID idempotency keys.
@@ -379,7 +379,7 @@ Exit criterion: deterministic primitives are isolated behind the existing transa
 
 1. Define an engine-neutral action executor and implement the single-writer actor before exposing new exchange actions.
 2. Add injected production and manual clocks, ordering rules, timers, pause/resume, and ordered catch-up.
-3. Implement versioned finite schedule generation for First Spread.
+3. Implement versioned incremental event generation for First Spread with a private per-game seed.
 4. Add the minimal quote, customer-arrival, mark, carry, and `time_expired` exchange actions required by the proven sequencer contract.
 5. Add idempotent external command envelopes and internal system action identity.
 6. Make shutdown restore active solo games as paused.

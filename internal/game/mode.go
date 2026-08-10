@@ -28,7 +28,7 @@ const (
 
 const (
 	LifecycleVersion uint32 = 1
-	ScheduleVersion  uint32 = 1
+	GeneratorVersion uint32 = 1
 )
 
 func (s LifecycleState) Validate() error {

@@ -460,12 +460,12 @@ func TestCreateRealTimePreparingMetadata(t *testing.T) {
 	}
 	snapshot := definition.Snapshot()
 	root := t.TempDir()
-	log, err := CreateWithMode(root, "game-1", "local", "create-1", definition.Config, &snapshot, game.PlayModeRealTime)
+	log, err := CreateRealTime(root, "game-1", "local", "create-1", definition.Config, &snapshot, 42)
 	if err != nil {
 		t.Fatal(err)
 	}
 	meta := log.Meta()
-	if meta.EffectiveMode() != game.PlayModeRealTime || meta.RealTime == nil || meta.RealTime.Lifecycle != game.LifecyclePreparing || meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.ScheduleVersion != game.ScheduleVersion {
+	if meta.EffectiveMode() != game.PlayModeRealTime || meta.RealTime == nil || meta.RealTime.Lifecycle != game.LifecyclePreparing || meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.GeneratorVersion != game.GeneratorVersion || meta.RealTime.Seed != 42 {
 		t.Fatalf("real-time metadata=%+v", meta)
 	}
 	if _, err := log.Append(Record{Schema: SchemaVersion, Version: 1, Command: exchange.Command{ID: "c-1", Type: exchange.CommandQuit}}); err == nil {
@@ -492,7 +492,7 @@ func TestMetadataModeValidation(t *testing.T) {
 		Config:   definition.Config,
 		Scenario: &snapshot,
 		Mode:     game.PlayModeRealTime,
-		RealTime: &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, ScheduleVersion: game.ScheduleVersion},
+		RealTime: &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, GeneratorVersion: game.GeneratorVersion, Seed: 42},
 	}
 	if err := validateMeta(validRealTime); err != nil {
 		t.Fatalf("valid real-time metadata rejected: %v", err)
@@ -504,7 +504,8 @@ func TestMetadataModeValidation(t *testing.T) {
 		"missing scenario config": func(meta *Meta) { meta.Scenario.RealTime = nil },
 		"lifecycle version":       func(meta *Meta) { meta.RealTime.LifecycleVersion++ },
 		"lifecycle state":         func(meta *Meta) { meta.RealTime.Lifecycle = "running" },
-		"schedule version":        func(meta *Meta) { meta.RealTime.ScheduleVersion++ },
+		"generator version":       func(meta *Meta) { meta.RealTime.GeneratorVersion++ },
+		"seed":                    func(meta *Meta) { meta.RealTime.Seed = 0 },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

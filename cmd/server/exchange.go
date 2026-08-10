@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +37,7 @@ type exchangeService struct {
 	root           string
 	entries        map[string]*exchangeEntry
 	lookupScenario func(string) (scenario.Definition, bool)
+	newSeed        func() (uint64, error)
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
 }
@@ -58,10 +61,22 @@ type exchangeEntry struct {
 }
 
 func newExchangeService(root string) *exchangeService {
-	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get, syncLog: syncEventLog}
+	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get, newSeed: randomSeed, syncLog: syncEventLog}
 }
 
 func syncEventLog(log *eventlog.Log) error { return log.Sync() }
+
+func randomSeed() (uint64, error) {
+	var bytes [8]byte
+	for {
+		if _, err := rand.Read(bytes[:]); err != nil {
+			return 0, err
+		}
+		if seed := binary.LittleEndian.Uint64(bytes[:]); seed != 0 {
+			return seed, nil
+		}
+	}
+}
 
 type createExchangeRequest struct {
 	GameID     string          `json:"game_id"`
@@ -596,7 +611,16 @@ func (s *exchangeService) createOrLoadMode(id, createCommandID, scenarioID strin
 		return nil, false, err
 	}
 	snapshot := definition.Snapshot()
-	log, err := eventlog.CreateWithMode(s.root, id, localPrincipal, createCommandID, cfg, &snapshot, mode)
+	var log *eventlog.Log
+	if mode == game.PlayModeRealTime {
+		seed, seedErr := s.newSeed()
+		if seedErr != nil {
+			return nil, false, seedErr
+		}
+		log, err = eventlog.CreateRealTime(s.root, id, localPrincipal, createCommandID, cfg, &snapshot, seed)
+	} else {
+		log, err = eventlog.Create(s.root, id, localPrincipal, createCommandID, cfg, &snapshot)
+	}
 	if errors.Is(err, os.ErrExist) {
 		entry, loadErr := s.loadLocked(id)
 		if loadErr == nil && !matchesCreate(entry.log.Meta(), createCommandID, scenarioID, mode) {

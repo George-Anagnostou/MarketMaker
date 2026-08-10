@@ -140,7 +140,7 @@ func TestV2CreatesAndRecoversRealTimePreparingGame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 0 || log.Meta().EffectiveMode() != game.PlayModeRealTime {
+	if len(records) != 0 || log.Meta().EffectiveMode() != game.PlayModeRealTime || log.Meta().RealTime.Seed == 0 {
 		t.Fatalf("persisted records=%+v meta=%+v", records, log.Meta())
 	}
 	server.Close()
@@ -263,13 +263,18 @@ func TestV2ValidatesAndScopesCreateMode(t *testing.T) {
 func TestRealTimeCreateRetryUsesPersistedModeAndScenario(t *testing.T) {
 	root := t.TempDir()
 	service := newExchangeService(root)
+	seedCalls := 0
+	service.newSeed = func() (uint64, error) {
+		seedCalls++
+		return 99, nil
+	}
 	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
-	if err != nil || !created || entry.mode != game.PlayModeRealTime {
+	if err != nil || !created || entry.mode != game.PlayModeRealTime || entry.log.Meta().RealTime.Seed != 99 || seedCalls != 1 {
 		t.Fatalf("create entry=%+v created=%v err=%v", entry, created, err)
 	}
 	service.lookupScenario = func(string) (scenario.Definition, bool) { return scenario.Definition{}, false }
 	entry, created, err = service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
-	if err != nil || created || entry.mode != game.PlayModeRealTime {
+	if err != nil || created || entry.mode != game.PlayModeRealTime || seedCalls != 1 {
 		t.Fatalf("in-memory retry entry=%+v created=%v err=%v", entry, created, err)
 	}
 

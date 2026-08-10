@@ -36,7 +36,7 @@ type IntervalRange struct {
 
 type RealTimeConfig struct {
 	Revision                    string        `json:"revision"`
-	ScheduleVersion             uint32        `json:"schedule_version"`
+	GeneratorVersion            uint32        `json:"generator_version"`
 	DurationMilliseconds        uint64        `json:"duration_milliseconds"`
 	CountdownMilliseconds       uint64        `json:"countdown_milliseconds"`
 	DisconnectGraceMilliseconds uint64        `json:"disconnect_grace_milliseconds"`
@@ -45,7 +45,6 @@ type RealTimeConfig struct {
 	MarkCadence                 IntervalRange `json:"mark_cadence"`
 	CarryCadenceMilliseconds    uint64        `json:"carry_cadence_milliseconds"`
 	CarryPerUnit                fixed.Price   `json:"carry_per_unit"`
-	Seed                        uint64        `json:"seed"`
 	CustomerSeedDomain          string        `json:"customer_seed_domain"`
 	MarkSeedDomain              string        `json:"mark_seed_domain"`
 }
@@ -112,7 +111,7 @@ var catalog = []Definition{
 		Config:        config(8, 101, -25, 25, 5, 10),
 		RealTime: &RealTimeConfig{
 			Revision:                    "1",
-			ScheduleVersion:             game.ScheduleVersion,
+			GeneratorVersion:            game.GeneratorVersion,
 			DurationMilliseconds:        90_000,
 			CountdownMilliseconds:       3_000,
 			DisconnectGraceMilliseconds: 5_000,
@@ -121,7 +120,6 @@ var catalog = []Definition{
 			MarkCadence:                 IntervalRange{MinMilliseconds: 5_000, MaxMilliseconds: 8_000},
 			CarryCadenceMilliseconds:    10_000,
 			CarryPerUnit:                fixed.Price(10_000),
-			Seed:                        101,
 			CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
 			MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
 		},
@@ -264,8 +262,8 @@ func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConf
 	if config == nil {
 		return nil
 	}
-	if config.Revision == "" || config.ScheduleVersion != game.ScheduleVersion {
-		return errors.New("unsupported revision or schedule version")
+	if config.Revision == "" || config.GeneratorVersion != game.GeneratorVersion {
+		return errors.New("unsupported revision or generator version")
 	}
 	if config.DurationMilliseconds == 0 || config.DurationMilliseconds > 24*60*60*1_000 {
 		return errors.New("duration must be between one millisecond and 24 hours")
@@ -293,9 +291,6 @@ func ValidateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConf
 	}
 	if _, err := fixed.Notional(config.CarryPerUnit, exchangeConfig.MaxPosition); err != nil {
 		return errors.New("carry and position exceed supported range")
-	}
-	if config.Seed == 0 {
-		return errors.New("seed must be non-zero")
 	}
 	if config.CustomerSeedDomain == "" || config.MarkSeedDomain == "" || config.CustomerSeedDomain == config.MarkSeedDomain {
 		return errors.New("customer and mark seed domains must be distinct")
