@@ -8,6 +8,7 @@ import (
 
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/game"
 )
 
 type Definition struct {
@@ -20,6 +21,7 @@ type Definition struct {
 	Reflection    string
 	ScorecardKind string
 	Config        exchange.Config
+	RealTime      *RealTimeConfig
 }
 
 type TutorialStep struct {
@@ -27,18 +29,41 @@ type TutorialStep struct {
 	Body  string `json:"body"`
 }
 
+type IntervalRange struct {
+	MinMilliseconds uint64 `json:"min_milliseconds"`
+	MaxMilliseconds uint64 `json:"max_milliseconds"`
+}
+
+type RealTimeConfig struct {
+	Revision                    string        `json:"revision"`
+	ScheduleVersion             uint32        `json:"schedule_version"`
+	DurationMilliseconds        uint64        `json:"duration_milliseconds"`
+	CountdownMilliseconds       uint64        `json:"countdown_milliseconds"`
+	DisconnectGraceMilliseconds uint64        `json:"disconnect_grace_milliseconds"`
+	QuoteQuantity               fixed.Qty     `json:"quote_quantity"`
+	CustomerCadence             IntervalRange `json:"customer_cadence"`
+	MarkCadence                 IntervalRange `json:"mark_cadence"`
+	CarryCadenceMilliseconds    uint64        `json:"carry_cadence_milliseconds"`
+	CarryPerUnit                fixed.Price   `json:"carry_per_unit"`
+	Seed                        uint64        `json:"seed"`
+	CustomerSeedDomain          string        `json:"customer_seed_domain"`
+	MarkSeedDomain              string        `json:"mark_seed_domain"`
+}
+
 // Snapshot is persisted with every game so its lesson cannot change when the
 // in-code catalog evolves.
 type Snapshot struct {
-	ID            string         `json:"id"`
-	Revision      string         `json:"revision"`
-	Title         string         `json:"title"`
-	Briefing      string         `json:"briefing"`
-	Objective     string         `json:"objective"`
-	Tutorial      []TutorialStep `json:"tutorial,omitempty"`
-	Reflection    string         `json:"reflection,omitempty"`
-	ScorecardKind string         `json:"scorecard_kind,omitempty"`
-	Turns         int            `json:"turns"`
+	ID            string          `json:"id"`
+	Revision      string          `json:"revision"`
+	Title         string          `json:"title"`
+	Briefing      string          `json:"briefing"`
+	Objective     string          `json:"objective"`
+	Tutorial      []TutorialStep  `json:"tutorial,omitempty"`
+	Reflection    string          `json:"reflection,omitempty"`
+	ScorecardKind string          `json:"scorecard_kind,omitempty"`
+	Turns         int             `json:"turns"`
+	Modes         []game.PlayMode `json:"modes,omitempty"`
+	RealTime      *RealTimeConfig `json:"real_time,omitempty"`
 }
 
 type Coaching struct {
@@ -85,6 +110,21 @@ var catalog = []Definition{
 		Reflection:    "Before moving on, be able to explain why an order filled or expired, whether you are long or short, and what one quote change you made to manage that risk.",
 		ScorecardKind: "matched_volume",
 		Config:        config(8, 101, -25, 25, 5, 10),
+		RealTime: &RealTimeConfig{
+			Revision:                    "1",
+			ScheduleVersion:             game.ScheduleVersion,
+			DurationMilliseconds:        90_000,
+			CountdownMilliseconds:       3_000,
+			DisconnectGraceMilliseconds: 5_000,
+			QuoteQuantity:               fixed.Qty(100_000),
+			CustomerCadence:             IntervalRange{MinMilliseconds: 1_500, MaxMilliseconds: 3_000},
+			MarkCadence:                 IntervalRange{MinMilliseconds: 5_000, MaxMilliseconds: 8_000},
+			CarryCadenceMilliseconds:    10_000,
+			CarryPerUnit:                fixed.Price(10_000),
+			Seed:                        101,
+			CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
+			MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
+		},
 	},
 	{
 		ID: "inventory-pressure-v1", Revision: "2", Title: "Inventory Pressure",
@@ -162,6 +202,7 @@ func Get(id string) (Definition, bool) {
 	for _, definition := range catalog {
 		if definition.ID == id {
 			definition.Tutorial = cloneTutorial(definition.Tutorial)
+			definition.RealTime = cloneRealTimeConfig(definition.RealTime)
 			return definition, true
 		}
 	}
@@ -169,11 +210,23 @@ func Get(id string) (Definition, bool) {
 }
 
 func (d Definition) Snapshot() Snapshot {
-	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: cloneTutorial(d.Tutorial), Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns}
+	modes := []game.PlayMode{game.PlayModeTurnBased}
+	if d.RealTime != nil {
+		modes = append(modes, game.PlayModeRealTime)
+	}
+	return Snapshot{ID: d.ID, Revision: d.Revision, Title: d.Title, Briefing: d.Briefing, Objective: d.Objective, Tutorial: cloneTutorial(d.Tutorial), Reflection: d.Reflection, ScorecardKind: d.ScorecardKind, Turns: d.Config.NumTurns, Modes: modes, RealTime: cloneRealTimeConfig(d.RealTime)}
 }
 
 func cloneTutorial(tutorial []TutorialStep) []TutorialStep {
 	return append([]TutorialStep(nil), tutorial...)
+}
+
+func cloneRealTimeConfig(config *RealTimeConfig) *RealTimeConfig {
+	if config == nil {
+		return nil
+	}
+	copy := *config
+	return &copy
 }
 
 func ValidateCatalog() error {
@@ -200,6 +253,59 @@ func ValidateCatalog() error {
 		if err := definition.Config.Validate(); err != nil {
 			return fmt.Errorf("scenario %s: %w", definition.ID, err)
 		}
+		if err := validateRealTimeConfig(definition.Config, definition.RealTime); err != nil {
+			return fmt.Errorf("scenario %s real-time config: %w", definition.ID, err)
+		}
+	}
+	return nil
+}
+
+func validateRealTimeConfig(exchangeConfig exchange.Config, config *RealTimeConfig) error {
+	if config == nil {
+		return nil
+	}
+	if config.Revision == "" || config.ScheduleVersion != game.ScheduleVersion {
+		return errors.New("unsupported revision or schedule version")
+	}
+	if config.DurationMilliseconds == 0 || config.DurationMilliseconds > 24*60*60*1_000 {
+		return errors.New("duration must be between one millisecond and 24 hours")
+	}
+	if config.CountdownMilliseconds == 0 || config.CountdownMilliseconds > 60_000 {
+		return errors.New("countdown must be between one millisecond and one minute")
+	}
+	if config.DisconnectGraceMilliseconds == 0 || config.DisconnectGraceMilliseconds > 60_000 {
+		return errors.New("disconnect grace must be between one millisecond and one minute")
+	}
+	if err := validateCadence("customer", config.CustomerCadence, config.DurationMilliseconds); err != nil {
+		return err
+	}
+	if err := validateCadence("mark", config.MarkCadence, config.DurationMilliseconds); err != nil {
+		return err
+	}
+	if config.CarryCadenceMilliseconds == 0 || config.CarryCadenceMilliseconds > config.DurationMilliseconds {
+		return errors.New("carry cadence must fit within the round duration")
+	}
+	if !config.QuoteQuantity.Positive() || config.QuoteQuantity > exchangeConfig.MaxOrderQty || config.QuoteQuantity > exchangeConfig.MaxPosition {
+		return errors.New("quote quantity exceeds scenario limits")
+	}
+	if config.CarryPerUnit < 0 {
+		return errors.New("carry per unit must be non-negative")
+	}
+	if _, err := fixed.Notional(config.CarryPerUnit, exchangeConfig.MaxPosition); err != nil {
+		return errors.New("carry and position exceed supported range")
+	}
+	if config.Seed == 0 {
+		return errors.New("seed must be non-zero")
+	}
+	if config.CustomerSeedDomain == "" || config.MarkSeedDomain == "" || config.CustomerSeedDomain == config.MarkSeedDomain {
+		return errors.New("customer and mark seed domains must be distinct")
+	}
+	return nil
+}
+
+func validateCadence(name string, cadence IntervalRange, duration uint64) error {
+	if cadence.MinMilliseconds == 0 || cadence.MinMilliseconds > cadence.MaxMilliseconds || cadence.MaxMilliseconds > duration {
+		return fmt.Errorf("%s cadence must be ordered and fit within the round duration", name)
 	}
 	return nil
 }
