@@ -36,6 +36,7 @@ type EndReason string
 const (
 	NotOver       EndReason = ""
 	TurnsComplete EndReason = "turns_complete"
+	TimeExpired   EndReason = "time_expired"
 	MarginBreach  EndReason = "margin_breach"
 	Insolvent     EndReason = "insolvent"
 	PlayerQuit    EndReason = "player_quit"
@@ -216,6 +217,7 @@ type Summary struct {
 	NetFillCash          fixed.Money     `json:"net_fill_cash"`
 	StorageCost          fixed.Money     `json:"storage_cost"`
 	TurnPnL              fixed.Money     `json:"turn_pnl"`
+	ActionPnL            fixed.Money     `json:"action_pnl,omitempty"`
 	BuyVolume            fixed.Qty       `json:"buy_volume"`
 	SellVolume           fixed.Qty       `json:"sell_volume"`
 	PnLAttribution       *PnLAttribution `json:"pnl_attribution,omitempty"`
@@ -584,6 +586,227 @@ func (e *Engine) replaceLimit(accountID string, oldOrderID uint64, side Side, pr
 
 func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
 	return e.transact(func(candidate *Engine) (Result, error) { return candidate.submitQuote(bid, ask) })
+}
+
+// UpdateQuote atomically replaces the player's two-sided real-time quote.
+// Time and autonomous market activity are owned by the caller's sequencer.
+func (e *Engine) UpdateQuote(bid, ask fixed.Price, quantity fixed.Qty) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if !quantity.Positive() || quantity > candidate.cfg.MaxOrderQty {
+			return Result{State: candidate.State()}, errors.New("quote quantity exceeds configured limits")
+		}
+		if err := candidate.validatePlayerQuote(bid, ask, quantity); err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		attribution := &PnLAttribution{}
+		summary := Summary{PnLAttribution: attribution}
+		events, err := candidate.replacePlayerQuote(bid, ask, quantity, func(trade Trade) error {
+			if err := addExecutionEdge(attribution, trade, candidate.mark); err != nil {
+				return err
+			}
+			return addPlayerTrade(&summary, trade)
+		})
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		summary.ActionPnL, err = fixed.SubMoney(after, before)
+		if err != nil || summary.ActionPnL != attribution.ExecutionEdge {
+			return Result{State: candidate.State()}, errors.New("quote action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: summary, Events: events}, nil
+	})
+}
+
+type CustomerArrival struct {
+	Side         Side
+	Quantity     fixed.Qty
+	SlippageBps  int64
+	Informed     bool
+	InformedMark fixed.Price
+}
+
+// ApplyCustomerArrival executes one scheduled IOC customer order.
+func (e *Engine) ApplyCustomerArrival(arrival CustomerArrival) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if arrival.Side != Buy && arrival.Side != Sell || !arrival.Quantity.Positive() || arrival.Quantity > candidate.cfg.MaxOrderQty || arrival.SlippageBps < 0 || arrival.SlippageBps > candidate.cfg.MaxFlowSlippageBps || arrival.Informed && !arrival.InformedMark.Positive() || !arrival.Informed && arrival.InformedMark != 0 {
+			return Result{State: candidate.State()}, errors.New("invalid customer arrival")
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		attribution := &PnLAttribution{}
+		summary := Summary{OrdersReceived: 1, PnLAttribution: attribution}
+		playerFilled := false
+		informedTrades := make([]Trade, 0)
+		events, err := candidate.executeCustomerArrival(customerArrival{side: arrival.Side, quantity: arrival.Quantity, slippageBps: arrival.SlippageBps, informed: arrival.Informed}, func(trade Trade) error {
+			if err := addFlowTrade(&summary, trade); err != nil {
+				return err
+			}
+			if err := addExecutionEdge(attribution, trade, candidate.mark); err != nil {
+				return err
+			}
+			if arrival.Informed && isPlayerTrade(trade) {
+				playerFilled = true
+				summary.InformedUnitsTraded, err = fixed.AddQty(summary.InformedUnitsTraded, trade.Quantity)
+				if err != nil {
+					return err
+				}
+				informedTrades = append(informedTrades, trade)
+			}
+			return nil
+		})
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		if arrival.Informed {
+			summary.InformedOrders = 1
+			if playerFilled {
+				summary.InformedOrdersFilled = 1
+			}
+		}
+		for _, trade := range informedTrades {
+			pnl, err := playerFillPnL(trade, arrival.InformedMark)
+			if err != nil {
+				return Result{State: candidate.State()}, err
+			}
+			summary.InformedFlowPnL, err = fixed.AddMoney(summary.InformedFlowPnL, pnl)
+			if err != nil {
+				return Result{State: candidate.State()}, err
+			}
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		summary.ActionPnL, err = fixed.SubMoney(after, before)
+		if err != nil || summary.ActionPnL != attribution.ExecutionEdge {
+			return Result{State: candidate.State()}, errors.New("customer action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: summary, Events: events}, nil
+	})
+}
+
+// ApplyMarkMove applies one scheduled reference-price move.
+func (e *Engine) ApplyMarkMove(moveBps int64) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if moveBps < candidate.cfg.MinMoveBps || moveBps > candidate.cfg.MaxMoveBps {
+			return Result{State: candidate.State()}, errors.New("mark move exceeds configured limits")
+		}
+		previous := candidate.mark
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		next, err := fixed.ScalePrice(previous, 10_000+moveBps, 10_000)
+		if err != nil || !next.Positive() {
+			return Result{State: candidate.State()}, errors.New("mark movement produced invalid price")
+		}
+		attribution := &PnLAttribution{}
+		attribution.InventoryMarkPnL, err = markPnL(candidate.accounts[PlayerAccount].Position, previous, next)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events := []Event{candidate.applyMark(next, true)}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		delta, err := fixed.SubMoney(after, before)
+		if err != nil || delta != attribution.InventoryMarkPnL {
+			return Result{State: candidate.State()}, errors.New("mark action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: Summary{ActionPnL: attribution.InventoryMarkPnL, PnLAttribution: attribution}, Events: events}, nil
+	})
+}
+
+// ApplyCarry charges one scheduled inventory-carry interval.
+func (e *Engine) ApplyCarry(rate fixed.Price) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if rate < 0 {
+			return Result{State: candidate.State()}, errors.New("carry rate must be non-negative")
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		storage, events, err := candidate.chargeStorage(PlayerAccount, rate)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		storagePnL, err := fixed.NegMoney(storage)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		delta, err := fixed.SubMoney(after, before)
+		if err != nil || delta != storagePnL {
+			return Result{State: candidate.State()}, errors.New("carry action P&L does not reconcile")
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		attribution := &PnLAttribution{StoragePnL: storagePnL}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: Summary{StorageCost: storage, ActionPnL: storagePnL, PnLAttribution: attribution}, Events: events}, nil
+	})
+}
+
+// ExpireTradingDay cancels the live player quote and marks the solo session at
+// the current reference price without synthesizing a liquidation trade.
+func (e *Engine) ExpireTradingDay() (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		events := candidate.cancelAccountOrders(PlayerAccount)
+		if err := candidate.reconcileReservations(); err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, candidate.endSession(TimeExpired))
+		candidate.version++
+		return Result{State: candidate.State(), Events: events}, nil
+	})
 }
 
 func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
@@ -1056,7 +1279,7 @@ func (e *Engine) advance(events *[]Event) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
-	*events = append(*events, e.applyTurnMark(nextMark, false))
+	*events = append(*events, e.applyMark(nextMark, false))
 	if terminal := e.evaluatePlayerMaintenance(); terminal != nil {
 		*events = append(*events, *terminal)
 	} else if terminal := e.completeTurnsIfDue(); terminal != nil {
@@ -1115,7 +1338,7 @@ func (e *Engine) advanceV2(events *[]Event, openingMark fixed.Price, attribution
 	s.StorageCost = storage
 	*events = append(*events, storageEvents...)
 	e.turn++
-	*events = append(*events, e.applyTurnMark(nextMark, true))
+	*events = append(*events, e.applyMark(nextMark, true))
 
 	attribution.InventoryMarkPnL, err = markPnL(player.Position, openingMark, e.mark)
 	if err != nil {
@@ -1163,7 +1386,7 @@ func (e *Engine) nextLegacyMark() (fixed.Price, error) {
 	return nextMark, nil
 }
 
-func (e *Engine) applyTurnMark(nextMark fixed.Price, includePreviousMark bool) Event {
+func (e *Engine) applyMark(nextMark fixed.Price, includePreviousMark bool) Event {
 	previous := e.mark
 	e.mark = nextMark
 	event := Event{Type: "mark_updated", Mark: e.mark, Message: fmt.Sprintf("previous=%s", previous)}
@@ -1174,16 +1397,37 @@ func (e *Engine) applyTurnMark(nextMark fixed.Price, includePreviousMark bool) E
 }
 
 func (e *Engine) evaluatePlayerMaintenance() *Event {
-	if e.accountWithinLimits(PlayerAccount, true) {
+	reason, breached := e.playerMaintenanceReason()
+	if !breached {
 		return nil
+	}
+	event := e.endSession(reason)
+	return &event
+}
+
+func (e *Engine) playerMaintenanceReason() (EndReason, bool) {
+	if e.accountWithinLimits(PlayerAccount, true) {
+		return NotOver, false
 	}
 	reason := MarginBreach
 	equity, _ := e.equity(e.accounts[PlayerAccount])
 	if equity <= 0 {
 		reason = Insolvent
 	}
-	event := e.endSession(reason)
-	return &event
+	return reason, true
+}
+
+func (e *Engine) endRealTimeOnMaintenanceBreach() ([]Event, error) {
+	reason, breached := e.playerMaintenanceReason()
+	if !breached {
+		return nil, nil
+	}
+	events := e.cancelAccountOrders(PlayerAccount)
+	if err := e.reconcileReservations(); err != nil {
+		return nil, err
+	}
+	events = append(events, e.endSession(reason))
+	return events, nil
 }
 
 func (e *Engine) completeTurnsIfDue() *Event {
@@ -1259,6 +1503,27 @@ func addFlowTrade(summary *Summary, trade Trade) error {
 		}
 	}
 	return nil
+}
+
+func addPlayerTrade(summary *Summary, trade Trade) error {
+	if !isPlayerTrade(trade) {
+		return nil
+	}
+	var err error
+	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	notional, err := fixed.Notional(trade.Price, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	if trade.BuyerID == PlayerAccount {
+		summary.NetFillCash, err = fixed.SubMoney(summary.NetFillCash, notional)
+	} else {
+		summary.NetFillCash, err = fixed.AddMoney(summary.NetFillCash, notional)
+	}
+	return err
 }
 
 func addLegacyFlowTrade(summary *Summary, trade Trade) error {
