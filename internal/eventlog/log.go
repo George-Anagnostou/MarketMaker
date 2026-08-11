@@ -17,16 +17,18 @@ import (
 
 	"market-maker/internal/exchange"
 	"market-maker/internal/game"
+	"market-maker/internal/realtime"
 	"market-maker/internal/scenario"
 )
 
 const (
 	// SchemaVersion is used for newly created logs. Schemas 1 through 3 remain
 	// readable and appendable so existing games retain their wire formats.
-	schema1       = 1
-	schema2       = 2
-	schema3       = 3
-	SchemaVersion = 4
+	schema1               = 1
+	schema2               = 2
+	schema3               = 3
+	SchemaVersion         = 4
+	RealTimeSchemaVersion = 5
 
 	maxMetadataBytes = 1 << 20
 	maxEventsBytes   = 64 << 20
@@ -60,16 +62,26 @@ func (m Meta) EffectiveMode() game.PlayMode {
 }
 
 type Record struct {
-	Schema           int                `json:"schema"`
-	Version          uint64             `json:"version"`
-	PreviousChecksum string             `json:"previous_checksum,omitempty"`
-	Checksum         string             `json:"checksum"`
-	MetadataChecksum string             `json:"metadata_checksum,omitempty"`
-	Command          exchange.Command   `json:"command"`
-	Result           exchange.Result    `json:"result"`
-	Coaching         *scenario.Coaching `json:"coaching,omitempty"`
-	Recap            *scenario.Recap    `json:"recap,omitempty"`
+	Schema             int                     `json:"schema"`
+	Version            uint64                  `json:"version"`
+	PreviousChecksum   string                  `json:"previous_checksum,omitempty"`
+	Checksum           string                  `json:"checksum"`
+	MetadataChecksum   string                  `json:"metadata_checksum,omitempty"`
+	Command            exchange.Command        `json:"command"`
+	Action             *realtime.DurableAction `json:"action,omitempty"`
+	ElapsedNanoseconds int64                   `json:"elapsed_nanoseconds,omitempty"`
+	Result             exchange.Result         `json:"result"`
+	Rejection          *ActionRejection        `json:"rejection,omitempty"`
+	Coaching           *scenario.Coaching      `json:"coaching,omitempty"`
+	Recap              *scenario.Recap         `json:"recap,omitempty"`
 }
+
+type ActionRejection struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+const RejectionCodeCommandRejected = "command_rejected"
 
 type Log struct {
 	dir          string
@@ -121,7 +133,11 @@ func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchang
 		}
 	}()
 
-	meta := Meta{Schema: SchemaVersion, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot), Mode: mode}
+	schema := SchemaVersion
+	if mode == game.PlayModeRealTime {
+		schema = RealTimeSchemaVersion
+	}
+	meta := Meta{Schema: schema, GameID: gameID, OwnerID: ownerID, CreateCommandID: createCommandID, CreatedAt: createdAt, Config: cfg, Scenario: cloneSnapshot(snapshot), Mode: mode}
 	if mode == game.PlayModeRealTime {
 		meta.RealTime = &RealTimeMeta{LifecycleVersion: game.LifecycleVersion, Lifecycle: game.LifecyclePreparing, GeneratorVersion: game.GeneratorVersion, Seed: seed}
 	}
@@ -191,7 +207,7 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	records, eventsInfo, eventsSize, err := loadRecords(f, meta.Schema, meta.Checksum)
+	records, eventsInfo, eventsSize, err := loadRecords(f, meta.Schema, meta.Checksum, meta.CreateCommandID)
 	if err != nil {
 		return nil, nil, closeFile(f, err)
 	}
@@ -211,7 +227,7 @@ func Open(root, gameID string) (*Log, []Record, error) {
 		log.lastChecksum = records[len(records)-1].Checksum
 	}
 	for _, record := range records {
-		log.commandIDs[record.Command.ID] = struct{}{}
+		log.commandIDs[recordID(record)] = struct{}{}
 	}
 	return log, records, nil
 }
@@ -233,7 +249,7 @@ func ReadMeta(root, gameID string) (Meta, error) {
 	}
 	switch meta.Schema {
 	case schema1:
-	case schema2, schema3, SchemaVersion:
+	case schema2, schema3, SchemaVersion, RealTimeSchemaVersion:
 		checksum, err := metadataChecksum(meta)
 		if err != nil || meta.Checksum == "" || meta.Checksum != checksum {
 			return Meta{}, errors.New("invalid game metadata checksum")
@@ -286,7 +302,7 @@ func validateMeta(meta Meta) error {
 		}
 		return nil
 	}
-	if meta.Schema != SchemaVersion {
+	if meta.Schema != SchemaVersion && meta.Schema != RealTimeSchemaVersion {
 		return errors.New("unsupported game metadata schema")
 	}
 	if err := meta.Mode.Validate(); err != nil {
@@ -294,11 +310,11 @@ func validateMeta(meta Meta) error {
 	}
 	switch meta.Mode {
 	case game.PlayModeTurnBased:
-		if meta.RealTime != nil {
+		if meta.Schema != SchemaVersion || meta.RealTime != nil {
 			return errors.New("turn-based game contains real-time lifecycle")
 		}
 	case game.PlayModeRealTime:
-		if meta.RealTime == nil || meta.Scenario == nil || meta.Scenario.RealTime == nil {
+		if meta.Schema != RealTimeSchemaVersion || meta.RealTime == nil || meta.Scenario == nil || meta.Scenario.RealTime == nil {
 			return errors.New("real-time game is missing scenario or lifecycle metadata")
 		}
 		if !snapshotSupportsMode(meta.Scenario, game.PlayModeRealTime) {
@@ -330,13 +346,11 @@ func (l *Log) Append(record Record) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.meta.EffectiveMode() == game.PlayModeRealTime {
-		return Record{}, errors.New("real-time preparing log does not accept records")
-	}
-	if (record.Schema != SchemaVersion && record.Schema != l.meta.Schema) || record.Command.ID == "" || record.Version != l.nextVersion {
+	id, err := validateRecordInput(record, l.meta, l.nextVersion)
+	if err != nil {
 		return Record{}, errors.New("invalid event record")
 	}
-	if _, exists := l.commandIDs[record.Command.ID]; exists {
+	if _, exists := l.commandIDs[id]; exists {
 		return Record{}, errors.New("duplicate event command id")
 	}
 	record.Schema = l.meta.Schema
@@ -356,7 +370,7 @@ func (l *Log) Append(record Record) (Record, error) {
 	switch record.Schema {
 	case schema1:
 		record.MetadataChecksum = ""
-	case schema2, schema3, SchemaVersion:
+	case schema2, schema3, SchemaVersion, RealTimeSchemaVersion:
 		record.MetadataChecksum = l.meta.Checksum
 	default:
 		return Record{}, errors.New("invalid event record")
@@ -394,9 +408,41 @@ func (l *Log) Append(record Record) (Record, error) {
 		return Record{}, errors.Join(operationErr, wrapCloseError("event log", closeErr))
 	}
 	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
-	l.commandIDs[record.Command.ID] = struct{}{}
+	l.commandIDs[id] = struct{}{}
 	l.eventsSize = newSize
 	return record, nil
+}
+
+func validateRecordInput(record Record, meta Meta, version uint64) (string, error) {
+	if record.Version != version || record.Schema != meta.Schema && record.Schema != SchemaVersion && record.Schema != RealTimeSchemaVersion {
+		return "", errors.New("invalid record version or schema")
+	}
+	if meta.EffectiveMode() == game.PlayModeRealTime {
+		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < 0 {
+			return "", errors.New("invalid real-time record")
+		}
+		action, err := record.Action.Decode()
+		if err != nil {
+			return "", err
+		}
+		if record.Rejection != nil {
+			if action.Source != realtime.SourceParticipant || record.Rejection.Code != RejectionCodeCommandRejected || record.Rejection.Message == "" {
+				return "", errors.New("invalid durable rejection")
+			}
+		}
+		return action.ID, nil
+	}
+	if record.Command.ID == "" || record.Action != nil || record.ElapsedNanoseconds != 0 || record.Rejection != nil {
+		return "", errors.New("invalid turn-based record")
+	}
+	return record.Command.ID, nil
+}
+
+func recordID(record Record) string {
+	if record.Action != nil {
+		return record.Action.ID
+	}
+	return record.Command.ID
 }
 
 func (l *Log) Path() string { return l.dir }
@@ -483,14 +529,14 @@ func (l *Log) Recover() ([]Record, error) {
 		l.lastChecksum = records[len(records)-1].Checksum
 	}
 	for _, record := range records {
-		l.commandIDs[record.Command.ID] = struct{}{}
+		l.commandIDs[recordID(record)] = struct{}{}
 	}
 	l.eventsInfo = finalInfo
 	l.eventsSize = finalSize
 	return records, nil
 }
 
-func loadRecords(f *os.File, schema int, expectedMetadataChecksum string) ([]Record, os.FileInfo, int64, error) {
+func loadRecords(f *os.File, schema int, expectedMetadataChecksum, createCommandID string) ([]Record, os.FileInfo, int64, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, nil, 0, err
@@ -509,7 +555,7 @@ func loadRecords(f *os.File, schema int, expectedMetadataChecksum string) ([]Rec
 		}
 		data = data[:size]
 	}
-	records, err := parseRecords(data, schema, expectedMetadataChecksum)
+	records, err := parseRecords(data, schema, expectedMetadataChecksum, createCommandID)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -523,11 +569,14 @@ func loadRecords(f *os.File, schema int, expectedMetadataChecksum string) ([]Rec
 	return records, finalInfo, finalInfo.Size(), nil
 }
 
-func parseRecords(data []byte, schema int, expectedMetadataChecksum string) ([]Record, error) {
+func parseRecords(data []byte, schema int, expectedMetadataChecksum, createCommandID string) ([]Record, error) {
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
 	previousChecksum := ""
 	commandIDs := make(map[string]struct{})
+	if schema == RealTimeSchemaVersion {
+		commandIDs[createCommandID] = struct{}{}
+	}
 	for i, line := range lines {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
@@ -542,7 +591,7 @@ func parseRecords(data []byte, schema int, expectedMetadataChecksum string) ([]R
 		}
 		records = append(records, record)
 		previousChecksum = record.Checksum
-		commandIDs[record.Command.ID] = struct{}{}
+		commandIDs[recordID(record)] = struct{}{}
 	}
 	return records, nil
 }
@@ -555,7 +604,7 @@ func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
 	if len(prefix) > 0 && prefix[len(prefix)-1] != '\n' {
 		return nil, 0, errors.New("acknowledged event log boundary is not newline-terminated")
 	}
-	records, err := parseRecords(prefix, l.meta.Schema, l.meta.Checksum)
+	records, err := parseRecords(prefix, l.meta.Schema, l.meta.Checksum, l.meta.CreateCommandID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("validate acknowledged event log prefix: %w", err)
 	}
@@ -589,7 +638,7 @@ func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
 			break
 		}
 		records = append(records, record)
-		commandIDs[record.Command.ID] = struct{}{}
+		commandIDs[recordID(record)] = struct{}{}
 		previousChecksum = record.Checksum
 		nextVersion++
 		offset = lineEnd + 1
@@ -617,7 +666,7 @@ func (l *Log) matchesAcknowledgedRecords(records []Record) bool {
 	commandIDs := make(map[string]struct{}, len(records)+1)
 	commandIDs[l.meta.CreateCommandID] = struct{}{}
 	for _, record := range records {
-		commandIDs[record.Command.ID] = struct{}{}
+		commandIDs[recordID(record)] = struct{}{}
 	}
 	if len(commandIDs) != len(l.commandIDs) {
 		return false
@@ -631,19 +680,31 @@ func (l *Log) matchesAcknowledgedRecords(records []Record) bool {
 }
 
 func validateRecord(record Record, schema int, expectedMetadataChecksum string, version uint64, previousChecksum string, commandIDs map[string]struct{}) error {
-	if record.Schema != schema || record.Version != version || record.Command.ID == "" || record.PreviousChecksum != previousChecksum {
+	id := recordID(record)
+	if record.Schema != schema || record.Version != version || id == "" || record.PreviousChecksum != previousChecksum {
 		return errors.New("invalid event record")
+	}
+	if schema == RealTimeSchemaVersion {
+		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < 0 {
+			return errors.New("invalid real-time event record")
+		}
+		action, err := record.Action.Decode()
+		if err != nil || record.Rejection != nil && (action.Source != realtime.SourceParticipant || record.Rejection.Code != RejectionCodeCommandRejected || record.Rejection.Message == "") {
+			return errors.New("invalid real-time action or rejection")
+		}
+	} else if record.Action != nil || record.Rejection != nil || record.ElapsedNanoseconds != 0 || record.Command.ID == "" {
+		return errors.New("invalid turn-based event record")
 	}
 	switch schema {
 	case schema1:
-	case schema2, schema3, SchemaVersion:
+	case schema2, schema3, SchemaVersion, RealTimeSchemaVersion:
 		if record.MetadataChecksum != expectedMetadataChecksum {
 			return errors.New("record is bound to different metadata")
 		}
 	default:
 		return fmt.Errorf("unsupported event record schema %d", schema)
 	}
-	if _, exists := commandIDs[record.Command.ID]; exists {
+	if _, exists := commandIDs[id]; exists {
 		return errors.New("duplicate event command id")
 	}
 	checksum, err := recordChecksum(record)
@@ -835,6 +896,9 @@ func recordChecksum(record Record) (string, error) {
 	case SchemaVersion:
 		input = append([]byte("market-maker/eventlog/record/v4\x00"), input...)
 		input = append(input, record.MetadataChecksum...)
+	case RealTimeSchemaVersion:
+		input = append([]byte("market-maker/eventlog/record/v5\x00"), input...)
+		input = append(input, record.MetadataChecksum...)
 	default:
 		return "", errors.New("unsupported event record schema")
 	}
@@ -856,6 +920,8 @@ func metadataChecksum(meta Meta) (string, error) {
 		domain = []byte("market-maker/eventlog/meta/v3\x00")
 	case SchemaVersion:
 		domain = []byte("market-maker/eventlog/meta/v4\x00")
+	case RealTimeSchemaVersion:
+		domain = []byte("market-maker/eventlog/meta/v5\x00")
 	default:
 		return "", errors.New("unsupported game metadata schema")
 	}
@@ -865,7 +931,7 @@ func metadataChecksum(meta Meta) (string, error) {
 
 func supportedSchema(schema int) bool {
 	switch schema {
-	case schema1, schema2, schema3, SchemaVersion:
+	case schema1, schema2, schema3, SchemaVersion, RealTimeSchemaVersion:
 		return true
 	default:
 		return false

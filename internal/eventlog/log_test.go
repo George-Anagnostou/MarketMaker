@@ -9,6 +9,7 @@ import (
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
 	"market-maker/internal/game"
+	"market-maker/internal/realtime"
 	"market-maker/internal/scenario"
 	"os"
 	"path/filepath"
@@ -481,6 +482,114 @@ func TestCreateRealTimePreparingMetadata(t *testing.T) {
 	}
 }
 
+func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	snapshot := definition.Snapshot()
+	root := t.TempDir()
+	log, err := CreateRealTime(root, "game-1", "local", "create-1", definition.Config, &snapshot, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quote, err := realtime.EncodeAction(realtime.Action{ID: "quote-1", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &quote, ElapsedNanoseconds: int64(time.Second), Result: exchange.Result{State: exchange.State{Version: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark, err := realtime.EncodeAction(realtime.Action{ID: "mark-1", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &mark, ElapsedNanoseconds: int64(2 * time.Second), Result: exchange.Result{State: exchange.State{Version: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	rejectedAction, err := realtime.EncodeAction(realtime.Action{ID: "quote-2", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "101"), Ask: price(t, "99")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &rejectedAction, ElapsedNanoseconds: int64(3 * time.Second), Result: exchange.Result{State: exchange.State{Version: 2}}, Rejection: &ActionRejection{Code: "command_rejected", Message: "crossed quote"}}); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Schema != RealTimeSchemaVersion || accepted.MetadataChecksum != log.Meta().Checksum {
+		t.Fatalf("accepted=%+v", accepted)
+	}
+	reopened, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 3 || reopened.Meta().Schema != RealTimeSchemaVersion || records[2].Rejection == nil || records[2].Result.State.Version != 2 {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+	if _, err := reopened.Append(Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &rejectedAction, ElapsedNanoseconds: int64(4 * time.Second), Rejection: &ActionRejection{Code: "again", Message: "again"}}); err == nil {
+		t.Fatal("duplicate rejected action id accepted")
+	}
+	if got := independentMetadataChecksum(t, log.Meta(), "market-maker/eventlog/meta/v5\x00"); got != log.Meta().Checksum {
+		t.Fatalf("metadata checksum=%q want=%q", log.Meta().Checksum, got)
+	}
+	if got := independentRecordChecksum(t, records[0], "market-maker/eventlog/record/v5\x00"); got != records[0].Checksum {
+		t.Fatalf("record checksum=%q want=%q", records[0].Checksum, got)
+	}
+}
+
+func TestRealTimeRecordValidation(t *testing.T) {
+	definition, _ := scenario.Get("first-spread-v1")
+	snapshot := definition.Snapshot()
+	newLog := func(t *testing.T) *Log {
+		log, err := CreateRealTime(t.TempDir(), "game-1", "local", "create-1", definition.Config, &snapshot, 42)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return log
+	}
+	system, _ := realtime.EncodeAction(realtime.Action{ID: "system", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}})
+	participant, _ := realtime.EncodeAction(realtime.Action{ID: "participant", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	tests := map[string]Record{
+		"missing action":     {Schema: RealTimeSchemaVersion, Version: 1},
+		"negative elapsed":   {Schema: RealTimeSchemaVersion, Version: 1, Action: &system, ElapsedNanoseconds: -1},
+		"system rejection":   {Schema: RealTimeSchemaVersion, Version: 1, Action: &system, Rejection: &ActionRejection{Code: "bad", Message: "bad"}},
+		"empty rejection":    {Schema: RealTimeSchemaVersion, Version: 1, Action: &participant, Rejection: &ActionRejection{}},
+		"command and action": {Schema: RealTimeSchemaVersion, Version: 1, Action: &participant, Command: exchange.Command{ID: "command"}},
+	}
+	for name, record := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := newLog(t).Append(record); err == nil {
+				t.Fatal("invalid record accepted")
+			}
+		})
+	}
+}
+
+func TestOpenRejectsRealTimeActionUsingCreateCommandID(t *testing.T) {
+	definition, _ := scenario.Get("first-spread-v1")
+	snapshot := definition.Snapshot()
+	root := t.TempDir()
+	log, err := CreateRealTime(root, "game-1", "local", "create-1", definition.Config, &snapshot, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := realtime.EncodeAction(realtime.Action{ID: "create-1", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := Record{Schema: RealTimeSchemaVersion, Version: 1, MetadataChecksum: log.Meta().Checksum, Action: &action, Result: exchange.Result{State: exchange.State{Version: 1}}}
+	record.Checksum, err = recordChecksum(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(log.Path(), "events.jsonl"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(root, "game-1"); err == nil {
+		t.Fatal("cold open accepted action using create command id")
+	}
+}
+
 func TestMetadataModeValidation(t *testing.T) {
 	definition, ok := scenario.Get("first-spread-v1")
 	if !ok {
@@ -488,7 +597,7 @@ func TestMetadataModeValidation(t *testing.T) {
 	}
 	snapshot := definition.Snapshot()
 	validRealTime := Meta{
-		Schema:   SchemaVersion,
+		Schema:   RealTimeSchemaVersion,
 		Config:   definition.Config,
 		Scenario: &snapshot,
 		Mode:     game.PlayModeRealTime,
@@ -523,6 +632,7 @@ func TestMetadataModeValidation(t *testing.T) {
 		})
 	}
 	turnBased := validRealTime
+	turnBased.Schema = SchemaVersion
 	turnBased.Mode = game.PlayModeTurnBased
 	turnBased.RealTime = nil
 	if err := validateMeta(turnBased); err != nil {

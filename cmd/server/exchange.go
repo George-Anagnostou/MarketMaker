@@ -25,6 +25,7 @@ import (
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
 	"market-maker/internal/game"
+	"market-maker/internal/realtime"
 	"market-maker/internal/scenario"
 )
 
@@ -55,6 +56,8 @@ type exchangeEntry struct {
 	recap          *scenario.Recap
 	mode           game.PlayMode
 	realTime       *realTimeState
+	generator      *realtime.Generator
+	realtimeExec   *realtime.ExchangeExecutor
 	storageFailed  bool
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
@@ -536,6 +539,74 @@ func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "next_after": nextAfter, "has_more": hasMore})
 }
 
+func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapsed time.Duration) realtime.Outcome {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.storageFailed {
+		return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("game storage is unavailable")}
+	}
+	if action.Source == realtime.SourceParticipant {
+		if action.ID == entry.log.Meta().CreateCommandID {
+			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New("action id is reserved by game creation")}
+		}
+		if strings.HasPrefix(action.ID, realtime.SystemActionIDPrefix) {
+			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New("action id uses the reserved system namespace")}
+		}
+	}
+	durable, err := realtime.EncodeAction(action)
+	if err != nil {
+		return realtime.Outcome{Disposition: realtime.DispositionFail, Err: err}
+	}
+	if prior, ok := entry.commands[action.ID]; ok {
+		if prior.Action == nil || !reflect.DeepEqual(*prior.Action, durable) {
+			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New("action id has a different payload")}
+		}
+		if prior.Rejection != nil {
+			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New(prior.Rejection.Message)}
+		}
+		disposition := realtime.DispositionContinue
+		if prior.Result.State.IsOver {
+			disposition = realtime.DispositionComplete
+		}
+		return realtime.Outcome{Result: prior.Result, Disposition: disposition}
+	}
+	outcome := entry.realtimeExec.Execute(action, elapsed)
+	if outcome.Disposition == realtime.DispositionFail {
+		return outcome
+	}
+	record := eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: uint64(len(entry.commands) + 1), Action: &durable, ElapsedNanoseconds: int64(elapsed)}
+	if outcome.Disposition == realtime.DispositionReject {
+		record.Result = exchange.Result{State: entry.engine.State()}
+		record.Rejection = &eventlog.ActionRejection{Code: eventlog.RejectionCodeCommandRejected, Message: outcome.Err.Error()}
+	} else {
+		result, ok := outcome.Result.(exchange.Result)
+		if !ok {
+			return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("exchange executor returned an invalid result")}
+		}
+		for index := range result.Events {
+			result.Events[index].CommandID = action.ID
+		}
+		record.Result = result
+		outcome.Result = result
+	}
+	appendStarted := time.Now()
+	record, err = entry.log.Append(record)
+	appendOutcome := "success"
+	if err != nil {
+		appendOutcome = "failure"
+	}
+	entry.metrics.observeEventLogAppend(appendOutcome, time.Since(appendStarted))
+	if err != nil {
+		if recoverErr := entry.recover(); recoverErr != nil {
+			entry.storageFailed = true
+		}
+		return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("real-time action was not committed")}
+	}
+	entry.commands[action.ID] = record
+	entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
+	return outcome
+}
+
 func canonicalUintQuery(query url.Values, name string) (uint64, bool, error) {
 	values, present := query[name]
 	if !present {
@@ -632,6 +703,12 @@ func (s *exchangeService) createOrLoadMode(id, createCommandID, scenarioID strin
 		return nil, false, err
 	}
 	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, mode: mode, realTime: realTimeStateFromMeta(log.Meta()), syncLog: s.syncLog, metrics: s.metrics}
+	if mode == game.PlayModeRealTime {
+		entry.generator, entry.realtimeExec, err = newRealtimeRuntime(log.Meta(), engine)
+		if err != nil {
+			return nil, false, err
+		}
+	}
 	s.entries[id] = entry
 	return entry, true, nil
 }
@@ -744,6 +821,8 @@ func (entry *exchangeEntry) recover() (err error) {
 	entry.recap = rebuilt.recap
 	entry.mode = rebuilt.mode
 	entry.realTime = rebuilt.realTime
+	entry.generator = rebuilt.generator
+	entry.realtimeExec = rebuilt.realtimeExec
 	entry.storageFailed = false
 	return nil
 }
@@ -751,10 +830,16 @@ func (entry *exchangeEntry) recover() (err error) {
 func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchangeEntry, error) {
 	meta := log.Meta()
 	mode := meta.EffectiveMode()
-	if mode == game.PlayModeRealTime && len(records) != 0 {
-		return nil, errors.New("real-time preparing game contains command records")
+	var engine *exchange.Engine
+	var commands map[string]eventlog.Record
+	var generator *realtime.Generator
+	var realtimeExec *realtime.ExchangeExecutor
+	var err error
+	if mode == game.PlayModeRealTime {
+		engine, generator, realtimeExec, commands, err = replayRealTimeRecords(meta, records)
+	} else {
+		engine, commands, err = replayRecords(meta.Config, records)
 	}
-	engine, commands, err := replayRecords(meta.Config, records)
 	if err != nil {
 		return nil, err
 	}
@@ -762,7 +847,7 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	if err != nil {
 		return nil, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario, mode: mode, realTime: realTimeStateFromMeta(meta)}
+	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario, mode: mode, realTime: realTimeStateFromMeta(meta), generator: generator, realtimeExec: realtimeExec}
 	for _, record := range records {
 		entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 		if record.Command.Type == exchange.CommandSubmitQuote {
@@ -822,6 +907,91 @@ func replayRecords(cfg exchange.Config, records []eventlog.Record) (*exchange.En
 		commands[record.Command.ID] = record
 	}
 	return engine, commands, nil
+}
+
+func newRealtimeRuntime(meta eventlog.Meta, engine *exchange.Engine) (*realtime.Generator, *realtime.ExchangeExecutor, error) {
+	if meta.RealTime == nil || meta.Scenario == nil || meta.Scenario.RealTime == nil {
+		return nil, nil, errors.New("real-time metadata is incomplete")
+	}
+	config := meta.Scenario.RealTime
+	generator, err := realtime.NewGenerator(realtime.GeneratorConfig{
+		Version:            config.GeneratorVersion,
+		Seed:               meta.RealTime.Seed,
+		Duration:           time.Duration(config.DurationMilliseconds) * time.Millisecond,
+		CustomerCadence:    realtime.Interval{Minimum: time.Duration(config.CustomerCadence.MinMilliseconds) * time.Millisecond, Maximum: time.Duration(config.CustomerCadence.MaxMilliseconds) * time.Millisecond},
+		MarkCadence:        realtime.Interval{Minimum: time.Duration(config.MarkCadence.MinMilliseconds) * time.Millisecond, Maximum: time.Duration(config.MarkCadence.MaxMilliseconds) * time.Millisecond},
+		CarryCadence:       time.Duration(config.CarryCadenceMilliseconds) * time.Millisecond,
+		MaxOrderQuantity:   meta.Config.MaxOrderQty,
+		MaxFlowSlippageBps: meta.Config.MaxFlowSlippageBps,
+		MinMoveBps:         meta.Config.MinMoveBps,
+		MaxMoveBps:         meta.Config.MaxMoveBps,
+		CustomerDomain:     config.CustomerSeedDomain,
+		MarkDomain:         config.MarkSeedDomain,
+		InformedDomain:     config.InformedSeedDomain,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	executor, err := realtime.NewExchangeExecutor(engine, realtime.ExchangeExecutorConfig{QuoteQuantity: config.QuoteQuantity, CarryPerUnit: config.CarryPerUnit, InformedFlowBps: meta.Config.InformedFlowBps})
+	if err != nil {
+		return nil, nil, err
+	}
+	return generator, executor, nil
+}
+
+func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exchange.Engine, *realtime.Generator, *realtime.ExchangeExecutor, map[string]eventlog.Record, error) {
+	engine, err := exchange.New(meta.Config)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	generator, executor, err := newRealtimeRuntime(meta, engine)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	actions := make(map[string]eventlog.Record, len(records))
+	lastElapsed := time.Duration(0)
+	for _, record := range records {
+		action, err := record.Action.Decode()
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("decode real-time action at record %d: %w", record.Version, err)
+		}
+		elapsed := time.Duration(record.ElapsedNanoseconds)
+		if elapsed < lastElapsed {
+			return nil, nil, nil, nil, fmt.Errorf("real-time action moved backward at record %d", record.Version)
+		}
+		var scheduled realtime.ScheduledAction
+		if action.Source == realtime.SourceSystem {
+			var ok bool
+			scheduled, ok, err = generator.Next()
+			if err != nil || !ok || scheduled.Due != elapsed || !reflect.DeepEqual(scheduled.Action, action) {
+				return nil, nil, nil, nil, fmt.Errorf("system action does not match generator at record %d", record.Version)
+			}
+		} else if next, ok, nextErr := generator.Next(); nextErr != nil || ok && next.Due <= elapsed {
+			return nil, nil, nil, nil, fmt.Errorf("participant action bypassed due system work at record %d", record.Version)
+		}
+		outcome := executor.Execute(action, elapsed)
+		if record.Rejection != nil {
+			if record.Rejection.Code != eventlog.RejectionCodeCommandRejected || outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || outcome.Err.Error() != record.Rejection.Message || !durableResultsEqual(record.Result, exchange.Result{State: engine.State()}) {
+				return nil, nil, nil, nil, fmt.Errorf("rejected action mismatch at record %d", record.Version)
+			}
+		} else {
+			result, ok := outcome.Result.(exchange.Result)
+			for index := range result.Events {
+				result.Events[index].CommandID = action.ID
+			}
+			if !ok || outcome.Err != nil || outcome.Disposition != realtime.DispositionContinue && outcome.Disposition != realtime.DispositionComplete || !durableResultsEqual(result, record.Result) {
+				return nil, nil, nil, nil, fmt.Errorf("accepted action mismatch at record %d", record.Version)
+			}
+			if action.Source == realtime.SourceSystem {
+				if err := generator.Commit(scheduled); err != nil {
+					return nil, nil, nil, nil, fmt.Errorf("advance generator at record %d: %w", record.Version, err)
+				}
+			}
+		}
+		actions[action.ID] = record
+		lastElapsed = elapsed
+	}
+	return engine, generator, executor, actions, nil
 }
 
 func durableResultsEqual(left, right exchange.Result) bool {

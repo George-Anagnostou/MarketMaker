@@ -250,7 +250,7 @@ func (g *Generator) drawInterval(stream *deterministicStream, interval Interval)
 
 func (g *Generator) addCandidate(due time.Duration, kind string, payload any) {
 	g.generated++
-	g.candidates[kind] = &generatorCandidate{due: due, sequence: g.generated, kind: kind, payload: payload, actionID: fmt.Sprintf("system/%s/%d", kind, g.generated)}
+	g.candidates[kind] = &generatorCandidate{due: due, sequence: g.generated, kind: kind, payload: payload, actionID: fmt.Sprintf("%s%s/%d", SystemActionIDPrefix, kind, g.generated)}
 }
 
 type GeneratorSnapshot struct {

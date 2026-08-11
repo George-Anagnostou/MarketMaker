@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,8 +15,9 @@ import (
 type Source string
 
 const (
-	SourceSystem      Source = "system"
-	SourceParticipant Source = "participant"
+	SourceSystem         Source = "system"
+	SourceParticipant    Source = "participant"
+	SystemActionIDPrefix        = "system/"
 )
 
 type Action struct {
@@ -421,6 +423,9 @@ func validateAction(action Action, source Source) error {
 	}
 	if action.Source != source {
 		return fmt.Errorf("action source must be %q", source)
+	}
+	if source == SourceParticipant && strings.HasPrefix(action.ID, SystemActionIDPrefix) {
+		return errors.New("participant action id uses the reserved system namespace")
 	}
 	return nil
 }

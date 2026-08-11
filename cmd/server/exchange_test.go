@@ -19,6 +19,7 @@ import (
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
 	"market-maker/internal/game"
+	"market-maker/internal/realtime"
 	"market-maker/internal/scenario"
 )
 
@@ -286,7 +287,7 @@ func TestRealTimeCreateRetryUsesPersistedModeAndScenario(t *testing.T) {
 	}
 }
 
-func TestRealTimePreparingRecoveryRejectsCommandRecords(t *testing.T) {
+func TestRealTimeLogRejectsTurnBasedCommandRecords(t *testing.T) {
 	root := t.TempDir()
 	service := newExchangeService(root)
 	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
@@ -296,12 +297,180 @@ func TestRealTimePreparingRecoveryRejectsCommandRecords(t *testing.T) {
 	if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.SchemaVersion, Version: 1, Command: exchange.Command{ID: testQuoteID, Type: exchange.CommandQuit}}); err == nil {
 		t.Fatal("preparing log accepted command record")
 	}
-	if _, err := rebuildExchangeEntry(entry.log, []eventlog.Record{{}}); err == nil || !strings.Contains(err.Error(), "contains command records") {
-		t.Fatalf("rebuild error=%v", err)
-	}
 	_, records, err := eventlog.Open(root, testGameID)
 	if err != nil || len(records) != 0 {
 		t.Fatalf("rejected append changed records=%+v err=%v", records, err)
+	}
+}
+
+func TestRealTimeActionsAndRejectionsReplayExactly(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || !created {
+		t.Fatalf("create created=%v err=%v", created, err)
+	}
+	appendAction := func(t *testing.T, version uint64, elapsed time.Duration, action realtime.Action, result exchange.Result, rejection *eventlog.ActionRejection) {
+		t.Helper()
+		for index := range result.Events {
+			result.Events[index].CommandID = action.ID
+		}
+		durable, err := realtime.EncodeAction(action)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: version, Action: &durable, ElapsedNanoseconds: int64(elapsed), Result: result, Rejection: rejection}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	quoteOutcome := entry.realtimeExec.Execute(quote, 0)
+	quoteResult := quoteOutcome.Result.(exchange.Result)
+	appendAction(t, 1, 0, quote, quoteResult, nil)
+	rejected := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000)}}
+	rejectedOutcome := entry.realtimeExec.Execute(rejected, 0)
+	if rejectedOutcome.Disposition != realtime.DispositionReject {
+		t.Fatalf("rejected outcome=%+v", rejectedOutcome)
+	}
+	appendAction(t, 2, 0, rejected, exchange.Result{State: entry.engine.State()}, &eventlog.ActionRejection{Code: "command_rejected", Message: rejectedOutcome.Err.Error()})
+	system, ok, err := entry.generator.Next()
+	if err != nil || !ok {
+		t.Fatalf("system=%+v ok=%v err=%v", system, ok, err)
+	}
+	systemOutcome := entry.realtimeExec.Execute(system.Action, system.Due)
+	systemResult := systemOutcome.Result.(exchange.Result)
+	appendAction(t, 3, system.Due, system.Action, systemResult, nil)
+	if err := entry.generator.Commit(system); err != nil {
+		t.Fatal(err)
+	}
+	wantNext, _, err := entry.generator.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log, records, err := eventlog.Open(root, testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := rebuildExchangeEntry(log, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNext, _, err := rebuilt.generator.Next()
+	if err != nil || !reflect.DeepEqual(rebuilt.engine.State(), entry.engine.State()) || !reflect.DeepEqual(gotNext, wantNext) || len(rebuilt.commands) != 3 {
+		t.Fatalf("rebuilt state=%+v next=%+v commands=%d err=%v", rebuilt.engine.State(), gotNext, len(rebuilt.commands), err)
+	}
+}
+
+func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialState := entry.engine.State()
+	for _, id := range []string{testCreateID, "system/customer_arrival/1"} {
+		reserved := realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+		outcome := entry.executeRealTimeAction(reserved, 0)
+		if outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || !reflect.DeepEqual(entry.engine.State(), initialState) {
+			t.Fatalf("reserved action id %q outcome=%+v state=%+v", id, outcome, entry.engine.State())
+		}
+	}
+	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	accepted := entry.executeRealTimeAction(quote, 0)
+	if accepted.Disposition != realtime.DispositionContinue || accepted.Err != nil {
+		t.Fatalf("accepted=%+v", accepted)
+	}
+	rejectedAction := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000)}}
+	rejected := entry.executeRealTimeAction(rejectedAction, time.Millisecond)
+	if rejected.Disposition != realtime.DispositionReject || rejected.Err == nil {
+		t.Fatalf("rejected=%+v", rejected)
+	}
+	if replayed := entry.executeRealTimeAction(rejectedAction, 2*time.Millisecond); replayed.Disposition != realtime.DispositionReject || replayed.Err == nil || replayed.Err.Error() != rejected.Err.Error() {
+		t.Fatalf("replayed rejection=%+v", replayed)
+	}
+	conflict := rejectedAction
+	conflict.Payload = realtime.UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000)}
+	if outcome := entry.executeRealTimeAction(conflict, 2*time.Millisecond); outcome.Disposition != realtime.DispositionReject || !strings.Contains(outcome.Err.Error(), "different payload") {
+		t.Fatalf("conflict=%+v", outcome)
+	}
+	_, records, err := eventlog.Open(root, testGameID)
+	if err != nil || len(records) != 2 || records[1].Rejection == nil {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+
+	reloaded := newExchangeService(root)
+	rebuilt, err := reloaded.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome := rebuilt.executeRealTimeAction(quote, time.Second); outcome.Disposition != realtime.DispositionContinue || !reflect.DeepEqual(outcome.Result, accepted.Result) {
+		t.Fatalf("replayed acceptance=%+v", outcome)
+	}
+	if outcome := rebuilt.executeRealTimeAction(rejectedAction, time.Second); outcome.Disposition != realtime.DispositionReject || outcome.Err.Error() != rejected.Err.Error() {
+		t.Fatalf("replayed rejection after restart=%+v", outcome)
+	}
+}
+
+func TestRealTimeRecoveryRetainsSystemActionAndTruncatesPartialSuffix(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, ok, err := entry.generator.Next()
+	if err != nil || !ok {
+		t.Fatalf("next scheduled action=%+v ok=%v err=%v", scheduled, ok, err)
+	}
+	outcome := entry.realtimeExec.Execute(scheduled.Action, scheduled.Due)
+	result, ok := outcome.Result.(exchange.Result)
+	if !ok || outcome.Disposition == realtime.DispositionFail || outcome.Disposition == realtime.DispositionReject {
+		t.Fatalf("system outcome=%+v", outcome)
+	}
+	for index := range result.Events {
+		result.Events[index].CommandID = scheduled.Action.ID
+	}
+	durable, err := realtime.EncodeAction(scheduled.Action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: 1, Action: &durable, ElapsedNanoseconds: int64(scheduled.Due), Result: result}); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(entry.log.Path(), "events.jsonl")
+	acknowledged, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`{"schema":5`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := entry.recover(); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := entry.generator.Next()
+	if err != nil || !ok || next.Action.ID == scheduled.Action.ID || entry.generator.Snapshot().Committed != 1 || len(entry.commands) != 1 {
+		t.Fatalf("recovered next=%+v ok=%v snapshot=%+v commands=%d err=%v", next, ok, entry.generator.Snapshot(), len(entry.commands), err)
+	}
+	data, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, acknowledged) {
+		t.Fatal("partial suffix was not truncated exactly")
 	}
 }
 
