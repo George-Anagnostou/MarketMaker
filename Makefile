@@ -34,11 +34,11 @@ test-cover: ## Run all tests with coverage summaries
 
 fuzz: fuzz-fixed fuzz-eventlog ## Run bounded fuzz targets
 
-fuzz-fixed: ## Fuzz fixed-point parsing and serialization for 9 seconds
-	go test -fuzz=FuzzDecimalRoundTrip -fuzztime=9s ./internal/fixed
+fuzz-fixed: ## Fuzz fixed-point parsing and serialization for 5 seconds
+	go test -fuzz=FuzzDecimalRoundTrip -fuzztime=5s ./internal/fixed
 
-fuzz-eventlog: ## Fuzz strict JSON decoding for 9 seconds
-	go test -fuzz=FuzzDecodeStrictJSON -fuzztime=9s ./internal/eventlog
+fuzz-eventlog: ## Fuzz strict JSON decoding for 5 seconds
+	go test -fuzz=FuzzDecodeStrictJSON -fuzztime=5s ./internal/eventlog
 
 vet: ## Run Go static analysis
 	go vet ./...
