@@ -66,6 +66,7 @@ type exchangeEntry struct {
 	realtimeExec   *realtime.ExchangeExecutor
 	replay         realTimeReplaySummary
 	sequencer      *realtime.Sequencer
+	runtimeVersion uint64
 	newSequencer   func(realtime.Config) (*realtime.Sequencer, error)
 	storageFailed  bool
 	syncLog        func(*eventlog.Log) error
@@ -349,7 +350,12 @@ func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, 
 	}
 	state := entry.engine.State()
 	startingEquity, eventsThrough := entry.startingEquity, entry.eventsThrough
-	latest, snapshot, coaching, recap, mode, realTime := entry.latestTurn, entry.scenario, entry.coaching, entry.recap, entry.mode, entry.realTime
+	latest, snapshot, coaching, recap, mode := entry.latestTurn, entry.scenario, entry.coaching, entry.recap, entry.mode
+	var realTime *realTimeState
+	if entry.realTime != nil {
+		copy := *entry.realTime
+		realTime = &copy
+	}
 	entry.mu.Unlock()
 	writeJSON(w, http.StatusOK, exchangeStateResponse{GameID: id, Version: state.Version, StartingEquity: startingEquity, EventsThrough: eventsThrough, State: state, LatestTurn: latest, Scenario: snapshot, Coaching: coaching, Recap: recap, Mode: mode, RealTime: realTime})
 }
@@ -656,7 +662,7 @@ func replayRealTimeRecord(action realtime.Action, durable realtime.DurableAction
 	} else if record.Rejection != nil {
 		execution.Disposition = realtime.DispositionReject
 		execution.Err = errors.New(record.Rejection.Message)
-	} else if record.Lifecycle == game.LifecycleCompleted && action.Kind != realtime.ActionStartSession && action.Kind != realtime.ActionCountdownComplete && action.Kind != realtime.ActionPauseSession && action.Kind != realtime.ActionResumeSession {
+	} else if record.Lifecycle == game.LifecycleCompleted {
 		execution.Disposition = realtime.DispositionComplete
 	}
 	return execution
@@ -713,6 +719,7 @@ func (entry *exchangeEntry) ensureRealTimeSequencer() (*realtime.Sequencer, erro
 	}
 	countdown := time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond
 	generator := entry.generator
+	runtimeVersion := entry.runtimeVersion
 	entry.mu.Unlock()
 
 	sequencer, err := factory(realtime.Config{
@@ -730,6 +737,18 @@ func (entry *exchangeEntry) ensureRealTimeSequencer() (*realtime.Sequencer, erro
 		return nil, err
 	}
 	entry.mu.Lock()
+	if entry.generator != generator || entry.runtimeVersion != runtimeVersion || entry.storageFailed {
+		entry.mu.Unlock()
+		_, _ = sequencer.Shutdown(context.Background())
+		return nil, errors.New("real-time runtime changed during sequencer construction")
+	}
+	if entry.sequencer != nil {
+		sequencerToClose := sequencer
+		existing := entry.sequencer
+		entry.mu.Unlock()
+		_, _ = sequencerToClose.Shutdown(context.Background())
+		return existing, nil
+	}
 	entry.sequencer = sequencer
 	entry.mu.Unlock()
 	return sequencer, nil
@@ -1032,6 +1051,9 @@ func (entry *exchangeEntry) recover() (err error) {
 		}
 	}()
 	log := entry.log
+	if entry.mode == game.PlayModeRealTime && entry.sequencer != nil {
+		return errors.New("cannot recover a real-time game with an active sequencer")
+	}
 	records, err := log.Recover()
 	if err != nil {
 		return err
@@ -1057,6 +1079,7 @@ func (entry *exchangeEntry) recover() (err error) {
 	entry.generator = rebuilt.generator
 	entry.realtimeExec = rebuilt.realtimeExec
 	entry.replay = rebuilt.replay
+	entry.runtimeVersion++
 	entry.storageFailed = false
 	return nil
 }

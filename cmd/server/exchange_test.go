@@ -598,6 +598,24 @@ func TestRealTimeCompletedReplaySurvivesRestart(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(replayed, start) || restartCalls != 1 || observed.Checkpoint.Status != realtime.StatusCompleted || observed.Checkpoint.NextScheduled != loaded.replay.GeneratorCommitted {
 		t.Fatalf("replay=%+v start=%+v calls=%d checkpoint=%+v summary=%+v err=%v", replayed, start, restartCalls, observed.Checkpoint, loaded.replay, err)
 	}
+	var expiry eventlog.Record
+	for _, record := range loaded.commands {
+		if record.Action != nil && record.Action.Kind == realtime.ActionTimeExpired {
+			expiry = record
+			break
+		}
+	}
+	if expiry.Action == nil {
+		t.Fatal("completed game has no durable expiry action")
+	}
+	action, err := expiry.Action.Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedExpiry, found := loaded.replayRealTimeAction(action)
+	if !found || replayedExpiry.Disposition != realtime.DispositionComplete || replayedExpiry.Sequence != expiry.Version || replayedExpiry.Elapsed != time.Duration(expiry.ElapsedNanoseconds) {
+		t.Fatalf("expiry retry=%+v found=%v record=%+v", replayedExpiry, found, expiry)
+	}
 }
 
 func TestV2ValidatesAndScopesCreateMode(t *testing.T) {
