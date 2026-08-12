@@ -89,6 +89,7 @@ type executionRecorder struct {
 type recordingSchedule struct {
 	actions   []ScheduledAction
 	next      int
+	nextCalls int
 	committed []string
 	nextErr   error
 	commitErr error
@@ -162,6 +163,7 @@ type faultyTimerClock struct {
 func (c faultyTimerClock) NewTimer(time.Duration) Timer { return c.timer }
 
 func (s *recordingSchedule) Next() (ScheduledAction, bool, error) {
+	s.nextCalls++
 	if s.nextErr != nil {
 		return ScheduledAction{}, false, s.nextErr
 	}
@@ -214,6 +216,26 @@ func systemAction(id string, due time.Duration) ScheduledAction {
 
 func participantAction(id string) Action {
 	return Action{ID: id, Kind: "quote", Source: SourceParticipant}
+}
+
+func startAction(id string) Action {
+	return Action{ID: id, Kind: ActionStartSession, Source: SourceParticipant, Payload: StartSessionPayload{}}
+}
+
+func pauseAction(id string, source Source) Action {
+	reason := PauseReasonPlayer
+	if source == SourceSystem {
+		reason = PauseReasonShutdown
+	}
+	return Action{ID: id, Kind: ActionPauseSession, Source: source, Payload: PauseSessionPayload{Reason: reason}}
+}
+
+func resumeAction(id string) Action {
+	return Action{ID: id, Kind: ActionResumeSession, Source: SourceParticipant}
+}
+
+func countdownAction(start Action) Action {
+	return Action{ID: "system/countdown/" + start.ID, Kind: ActionCountdownComplete, Source: SourceSystem}
 }
 
 func TestSequencerOrdersDueActionsBeforeParticipantAtSameTime(t *testing.T) {
@@ -760,5 +782,512 @@ func TestSequencerFencesRemainingClockFailures(t *testing.T) {
 	}
 	if _, err := sequencer.Submit(t.Context(), participantAction("player")); !errors.Is(err, ErrFailed) {
 		t.Fatalf("stop panic error=%v", err)
+	}
+}
+
+func TestSequencerDurableStartCountsDownBeforeLoadingMarketSchedule(t *testing.T) {
+	clock := newManualClock()
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("market", 5*time.Millisecond)}}
+	recorder := &executionRecorder{notify: make(chan string, 3)}
+	sequencer, err := NewConfigured(Config{
+		Schedule: schedule, Executor: recorder.execute, Clock: clock,
+		Countdown: 10 * time.Millisecond, CountdownAction: countdownAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+
+	execution, err := sequencer.StartAction(t.Context(), startAction("start"))
+	if err != nil || execution.Sequence != 1 || execution.Elapsed != 0 {
+		t.Fatalf("start execution=%+v err=%v", execution, err)
+	}
+	if action := <-recorder.notify; action != "start" {
+		t.Fatalf("first action=%q", action)
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusCountdown || snapshot.Elapsed != 0 || snapshot.Sequence != 1 || schedule.nextCalls != 0 {
+		t.Fatalf("countdown snapshot=%+v next calls=%d err=%v", snapshot, schedule.nextCalls, err)
+	}
+
+	clock.Advance(10 * time.Millisecond)
+	if action := <-recorder.notify; action != "system/countdown/start" {
+		t.Fatalf("countdown action=%q", action)
+	}
+	snapshot, err = sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusRunning || snapshot.Elapsed != 0 || snapshot.Sequence != 2 || schedule.nextCalls != 1 {
+		t.Fatalf("running snapshot=%+v next calls=%d err=%v", snapshot, schedule.nextCalls, err)
+	}
+
+	clock.Advance(5 * time.Millisecond)
+	if action := <-recorder.notify; action != "market" {
+		t.Fatalf("market action=%q", action)
+	}
+	snapshot, err = sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.NextScheduled != 1 || snapshot.Sequence != 3 {
+		t.Fatalf("market snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerDurablePauseDuringCountdownDoesNotCompleteCountdown(t *testing.T) {
+	clock := newManualClock()
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("market", time.Millisecond)}}
+	recorder := &executionRecorder{}
+	sequencer, err := NewConfigured(Config{
+		Schedule: schedule, Executor: recorder.execute, Clock: clock,
+		Countdown: time.Second, CountdownAction: countdownAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := sequencer.PauseAction(t.Context(), pauseAction("system/pause", SourceSystem))
+	if err != nil || execution.Sequence != 2 || execution.Elapsed != 0 {
+		t.Fatalf("pause execution=%+v err=%v", execution, err)
+	}
+	clock.Advance(time.Hour)
+	snapshot, err := sequencer.Snapshot(t.Context())
+	actions, times := recorder.snapshot()
+	if err != nil || snapshot.Status != StatusPaused || snapshot.Elapsed != 0 || snapshot.Sequence != 2 || schedule.nextCalls != 0 {
+		t.Fatalf("paused snapshot=%+v next calls=%d err=%v", snapshot, schedule.nextCalls, err)
+	}
+	if !reflect.DeepEqual(actions, []string{"start", "system/pause"}) || !reflect.DeepEqual(times, []time.Duration{0, 0}) {
+		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+}
+
+func TestSequencerDurablePauseProcessesDueWorkBeforeTransition(t *testing.T) {
+	clock := newManualClock()
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("due", 5*time.Millisecond)}}
+	recorder := &executionRecorder{notify: make(chan string, 4)}
+	sequencer, err := NewConfigured(Config{
+		Schedule: schedule, Executor: recorder.execute, Clock: clock,
+		Countdown: time.Millisecond, CountdownAction: countdownAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	<-recorder.notify
+	clock.Advance(time.Millisecond)
+	if action := <-recorder.notify; action != "system/countdown/start" {
+		t.Fatalf("countdown action=%q", action)
+	}
+	clock.Advance(10 * time.Millisecond)
+	execution, err := sequencer.PauseAction(t.Context(), pauseAction("pause", SourceParticipant))
+	if err != nil || execution.Sequence != 4 || execution.Elapsed != 10*time.Millisecond {
+		t.Fatalf("pause execution=%+v err=%v", execution, err)
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	actions, times := recorder.snapshot()
+	if err != nil || snapshot.Status != StatusPaused || snapshot.Elapsed != 10*time.Millisecond || snapshot.NextScheduled != 1 {
+		t.Fatalf("paused snapshot=%+v err=%v", snapshot, err)
+	}
+	if !reflect.DeepEqual(actions, []string{"start", "system/countdown/start", "due", "pause"}) || !reflect.DeepEqual(times, []time.Duration{0, 0, 5 * time.Millisecond, 10 * time.Millisecond}) {
+		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+}
+
+func TestSequencerDurableResumeFromPausedCheckpoint(t *testing.T) {
+	clock := newManualClock()
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("next", 10*time.Millisecond)}, next: 0}
+	recorder := &executionRecorder{notify: make(chan string, 2)}
+	sequencer, err := NewConfigured(Config{
+		Schedule: schedule, Executor: recorder.execute, Clock: clock,
+		Checkpoint: Checkpoint{Status: StatusPaused, Elapsed: 7 * time.Millisecond, NextScheduled: 2, Sequence: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	execution, err := sequencer.ResumeAction(t.Context(), resumeAction("resume"))
+	if err != nil || execution.Sequence != 5 || execution.Elapsed != 7*time.Millisecond {
+		t.Fatalf("resume execution=%+v err=%v", execution, err)
+	}
+	if action := <-recorder.notify; action != "resume" {
+		t.Fatalf("resume action=%q", action)
+	}
+	clock.Advance(3 * time.Millisecond)
+	if action := <-recorder.notify; action != "next" {
+		t.Fatalf("scheduled action=%q", action)
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusRunning || snapshot.NextScheduled != 3 || snapshot.Sequence != 6 {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerReplayPrecedesLifecycleStateAndDoesNotMutateCheckpoint(t *testing.T) {
+	conflict := errors.New("action id payload conflict")
+	canonicalStart := startAction("start-retry")
+	replayed := map[string]Execution{
+		"completed-retry": {Sequence: 4, Elapsed: 900 * time.Millisecond, Action: participantAction("completed-retry"), Result: "durable", Disposition: DispositionComplete},
+		"pause-retry":     {Sequence: 2, Elapsed: 800 * time.Millisecond, Action: pauseAction("pause-retry", SourceParticipant), Result: "paused", Disposition: DispositionContinue},
+		"start-retry":     {Sequence: 1, Elapsed: 0, Action: canonicalStart, Disposition: DispositionReject, Err: conflict},
+	}
+	lookup := func(action Action) (Execution, bool) {
+		execution, ok := replayed[action.ID]
+		return execution, ok
+	}
+	executor := func(Action, time.Duration) Outcome {
+		t.Fatal("replayed action reached executor")
+		return Outcome{}
+	}
+
+	completed, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Executor: executor, ReplayLookup: lookup, Clock: newManualClock(),
+		Checkpoint: Checkpoint{Status: StatusCompleted, Elapsed: time.Second, NextScheduled: 2, Sequence: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer completed.Close()
+	execution, err := completed.Submit(t.Context(), participantAction("completed-retry"))
+	if err != nil || execution.Result != "durable" || execution.Sequence != 4 || execution.Elapsed != 900*time.Millisecond {
+		t.Fatalf("completed replay=%+v err=%v", execution, err)
+	}
+	snapshot, err := completed.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusCompleted || snapshot.Sequence != 5 || snapshot.NextScheduled != 2 {
+		t.Fatalf("completed snapshot=%+v err=%v", snapshot, err)
+	}
+	changedStart := canonicalStart
+	changedStart.Payload = StartSessionPayload{Bid: 1}
+	execution, err = completed.StartAction(t.Context(), changedStart)
+	if !errors.Is(err, conflict) || !reflect.DeepEqual(execution.Action, canonicalStart) || execution.Sequence != 1 || execution.Elapsed != 0 {
+		t.Fatalf("conflict replay=%+v err=%v", execution, err)
+	}
+
+	paused, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Executor: executor, ReplayLookup: lookup, Clock: newManualClock(),
+		Checkpoint: Checkpoint{Status: StatusPaused, Elapsed: time.Second, Sequence: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer paused.Close()
+	execution, err = paused.PauseAction(t.Context(), pauseAction("pause-retry", SourceParticipant))
+	if err != nil || execution.Result != "paused" || execution.Sequence != 2 || execution.Elapsed != 800*time.Millisecond {
+		t.Fatalf("pause replay=%+v err=%v", execution, err)
+	}
+	snapshot, err = paused.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusPaused || snapshot.Sequence != 3 {
+		t.Fatalf("paused snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerRejectsInvalidConfiguredState(t *testing.T) {
+	valid := Config{Schedule: &recordingSchedule{}, Executor: func(Action, time.Duration) Outcome {
+		return Outcome{Disposition: DispositionContinue}
+	}, Clock: newManualClock()}
+	tests := []Config{
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Countdown: -1},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Countdown: time.Second},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, DurableLifecycle: true},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, DurableLifecycle: true, Countdown: time.Second, CountdownAction: countdownAction},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusRunning}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusCountdown}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusFailed}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusClosed}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusCompleted}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusPreparing, Sequence: 1}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusPaused, Elapsed: -1}},
+		{Schedule: valid.Schedule, Executor: valid.Executor, Clock: valid.Clock, Checkpoint: Checkpoint{Status: StatusPaused, NextScheduled: 2, Sequence: 1}},
+	}
+	for i, config := range tests {
+		if sequencer, err := NewConfigured(config); err == nil {
+			sequencer.Close()
+			t.Fatalf("invalid config %d accepted", i)
+		}
+	}
+}
+
+func TestSequencerCountdownExecutorFailureFences(t *testing.T) {
+	clock := newManualClock()
+	called := make(chan string, 2)
+	failure := errors.New("countdown persistence failed")
+	executor := func(action Action, _ time.Duration) Outcome {
+		called <- action.ID
+		if action.Kind == ActionCountdownComplete {
+			return Outcome{Disposition: DispositionFail, Err: failure}
+		}
+		return Outcome{Disposition: DispositionContinue}
+	}
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Executor: executor, Clock: clock,
+		Countdown: time.Second, CountdownAction: countdownAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	<-called
+	clock.Advance(time.Second)
+	<-called
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusFailed || snapshot.Elapsed != 0 || snapshot.Sequence != 2 || !errors.Is(snapshot.Failure, failure) {
+		t.Fatalf("failed snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerPauseAtCountdownDeadlineCompletesCountdownFirst(t *testing.T) {
+	clock := newManualClock()
+	recorder := &executionRecorder{notify: make(chan string, 3)}
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Executor: recorder.execute, Clock: clock,
+		Countdown: 10 * time.Millisecond, CountdownAction: countdownAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	<-recorder.notify
+	clock.Advance(10 * time.Millisecond)
+	execution, err := sequencer.PauseAction(t.Context(), pauseAction("pause", SourceParticipant))
+	if err != nil || execution.Sequence != 3 || execution.Elapsed != 0 {
+		t.Fatalf("pause execution=%+v err=%v", execution, err)
+	}
+	actions, times := recorder.snapshot()
+	if !reflect.DeepEqual(actions, []string{"start", "system/countdown/start", "pause"}) || !reflect.DeepEqual(times, []time.Duration{0, 0, 0}) {
+		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusPaused || snapshot.Elapsed != 0 || snapshot.Sequence != 3 {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerSubmitAtOrAfterCountdownDeadlineCompletesCountdownFirst(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		advance time.Duration
+	}{
+		{name: "exactly deadline", advance: 10 * time.Millisecond},
+		{name: "after deadline", advance: 15 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock()
+			recorder := &executionRecorder{}
+			sequencer, err := NewConfigured(Config{
+				Schedule: &recordingSchedule{}, Executor: recorder.execute, Clock: clock,
+				Countdown: 10 * time.Millisecond, CountdownAction: countdownAction,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sequencer.Close()
+			if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+				t.Fatal(err)
+			}
+
+			clock.Advance(test.advance)
+			execution, err := sequencer.Submit(t.Context(), participantAction("participant"))
+			if err != nil || execution.Sequence != 3 || execution.Elapsed != 0 {
+				t.Fatalf("submit execution=%+v err=%v", execution, err)
+			}
+			actions, times := recorder.snapshot()
+			if !reflect.DeepEqual(actions, []string{"start", "system/countdown/start", "participant"}) || !reflect.DeepEqual(times, []time.Duration{0, 0, 0}) {
+				t.Fatalf("actions=%v times=%v", actions, times)
+			}
+			snapshot, err := sequencer.Snapshot(t.Context())
+			if err != nil || snapshot.Status != StatusRunning || snapshot.Elapsed != 0 || snapshot.Sequence != 3 {
+				t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+			}
+		})
+	}
+}
+
+func TestSequencerSubmitAtCountdownDeadlineFencesCountdownFailure(t *testing.T) {
+	clock := newManualClock()
+	failure := errors.New("countdown failed")
+	recorder := &executionRecorder{}
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: clock,
+		Countdown: 10 * time.Millisecond, CountdownAction: countdownAction,
+		Executor: func(action Action, elapsed time.Duration) Outcome {
+			recorder.mu.Lock()
+			recorder.actions = append(recorder.actions, action.ID)
+			recorder.times = append(recorder.times, elapsed)
+			recorder.mu.Unlock()
+			if action.Kind == ActionCountdownComplete {
+				return Outcome{Disposition: DispositionFail, Err: failure}
+			}
+			return Outcome{Disposition: DispositionContinue}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Millisecond)
+	if _, err := sequencer.Submit(t.Context(), participantAction("participant")); !errors.Is(err, ErrFailed) || !errors.Is(err, failure) {
+		t.Fatalf("submit error=%v", err)
+	}
+	actions, times := recorder.snapshot()
+	if !reflect.DeepEqual(actions, []string{"start", "system/countdown/start"}) || !reflect.DeepEqual(times, []time.Duration{0, 0}) {
+		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusFailed || snapshot.Elapsed != 0 || snapshot.Sequence != 2 {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerDurableLifecycleRejectsInvalidExecutorDisposition(t *testing.T) {
+	rejection := errors.New("unexpected rejection")
+
+	pauseClock := newManualClock()
+	pauseSequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: pauseClock,
+		Countdown: time.Second, CountdownAction: countdownAction,
+		Executor: func(action Action, _ time.Duration) Outcome {
+			if action.Kind == ActionPauseSession {
+				return Outcome{Disposition: DispositionReject, Err: rejection}
+			}
+			return Outcome{Disposition: DispositionContinue}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pauseSequencer.Close()
+	if _, err := pauseSequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pauseSequencer.PauseAction(t.Context(), pauseAction("pause", SourceParticipant)); !errors.Is(err, ErrFailed) || !errors.Is(err, rejection) {
+		t.Fatalf("pause error=%v", err)
+	}
+	snapshot, err := pauseSequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusFailed || snapshot.Sequence != 2 {
+		t.Fatalf("pause snapshot=%+v err=%v", snapshot, err)
+	}
+
+	resumeSequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: newManualClock(),
+		Checkpoint: Checkpoint{Status: StatusPaused, Sequence: 2},
+		Executor: func(Action, time.Duration) Outcome {
+			return Outcome{Disposition: DispositionReject, Err: rejection}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeSequencer.Close()
+	if _, err := resumeSequencer.ResumeAction(t.Context(), resumeAction("resume")); !errors.Is(err, ErrFailed) || !errors.Is(err, rejection) {
+		t.Fatalf("resume error=%v", err)
+	}
+	snapshot, err = resumeSequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusFailed || snapshot.Sequence != 3 {
+		t.Fatalf("resume snapshot=%+v err=%v", snapshot, err)
+	}
+}
+
+func TestSequencerValidatesDurableLifecyclePayloadsAndConfiguration(t *testing.T) {
+	executorCalls := 0
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: newManualClock(),
+		Executor: func(Action, time.Duration) Outcome {
+			executorCalls++
+			return Outcome{Disposition: DispositionContinue}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	invalid := []func() error{
+		func() error {
+			_, err := sequencer.StartAction(t.Context(), Action{ID: "start", Kind: ActionStartSession, Source: SourceParticipant})
+			return err
+		},
+		func() error {
+			_, err := sequencer.PauseAction(t.Context(), Action{ID: "pause", Kind: ActionPauseSession, Source: SourceParticipant, Payload: PauseSessionPayload{Reason: PauseReasonShutdown}})
+			return err
+		},
+		func() error {
+			_, err := sequencer.PauseAction(t.Context(), Action{ID: "system/pause", Kind: ActionPauseSession, Source: SourceSystem, Payload: PauseSessionPayload{Reason: PauseReasonPlayer}})
+			return err
+		},
+		func() error {
+			_, err := sequencer.ResumeAction(t.Context(), Action{ID: "resume", Kind: ActionResumeSession, Source: SourceParticipant, Payload: struct{}{}})
+			return err
+		},
+	}
+	for i, call := range invalid {
+		if err := call(); err == nil {
+			t.Fatalf("invalid lifecycle action %d accepted", i)
+		}
+	}
+	if _, err := sequencer.StartAction(t.Context(), startAction("valid")); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("zero-countdown start error=%v", err)
+	}
+	if executorCalls != 0 {
+		t.Fatalf("executor calls=%d", executorCalls)
+	}
+}
+
+func TestSequencerDurableLifecycleDisablesInMemoryControls(t *testing.T) {
+	lookup := func(Action) (Execution, bool) { return Execution{}, false }
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Executor: (&executionRecorder{}).execute, Clock: newManualClock(),
+		Countdown: time.Second, CountdownAction: countdownAction, ReplayLookup: lookup, DurableLifecycle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sequencer.Start(t.Context()); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("in-memory start error=%v", err)
+	}
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sequencer.PauseAction(t.Context(), pauseAction("pause", SourceParticipant)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sequencer.Resume(t.Context()); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("in-memory resume error=%v", err)
+	}
+	if _, err := sequencer.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSequencerCountdownFactoryRequiresPayloadFreeAction(t *testing.T) {
+	clock := newManualClock()
+	factoryCalled := make(chan struct{}, 1)
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: clock, Countdown: time.Second,
+		Executor: func(Action, time.Duration) Outcome { return Outcome{Disposition: DispositionContinue} },
+		CountdownAction: func(start Action) Action {
+			factoryCalled <- struct{}{}
+			return Action{ID: "system/countdown/" + start.ID, Kind: ActionCountdownComplete, Source: SourceSystem, Payload: struct{}{}}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if _, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	<-factoryCalled
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err != nil || snapshot.Status != StatusFailed || snapshot.Sequence != 1 {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
 	}
 }

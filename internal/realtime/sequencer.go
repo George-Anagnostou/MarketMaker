@@ -77,6 +77,7 @@ type Status string
 
 const (
 	StatusPreparing Status = "preparing"
+	StatusCountdown Status = "countdown"
 	StatusRunning   Status = "running"
 	StatusPaused    Status = "paused"
 	StatusCompleted Status = "completed"
@@ -93,11 +94,41 @@ var (
 type Snapshot struct {
 	Status        Status
 	Elapsed       time.Duration
-	NextScheduled int
+	NextScheduled uint64
 	Sequence      uint64
 	Failure       error
 }
 
+// Checkpoint restores a non-active lifecycle state. Schedule must already be
+// replay-advanced through NextScheduled. Countdown is intentionally not
+// restorable: pausing during countdown freezes at zero and resume starts
+// market time directly.
+type Checkpoint struct {
+	Status        Status
+	Elapsed       time.Duration
+	NextScheduled uint64
+	Sequence      uint64
+}
+
+// ReplayLookup runs on the sequencer goroutine and must not call back into its
+// Sequencer. The returned Execution is the authoritative original execution.
+type ReplayLookup func(Action) (Execution, bool)
+
+type Config struct {
+	Schedule     Schedule
+	Executor     Executor
+	ReplayLookup ReplayLookup
+	Clock        Clock
+	Countdown    time.Duration
+	// CountdownAction runs on the sequencer goroutine and must not call back
+	// into its Sequencer.
+	CountdownAction func(Action) Action
+	Checkpoint      Checkpoint
+	// DurableLifecycle disables the in-memory Start, Pause, and Resume controls.
+	DurableLifecycle bool
+}
+
+// Clock must be monotonic for the lifetime of a Sequencer.
 type Clock interface {
 	Now() time.Time
 	NewTimer(time.Duration) Timer
@@ -125,9 +156,12 @@ type requestKind uint8
 
 const (
 	requestStart requestKind = iota
+	requestStartAction
 	requestSubmit
 	requestPause
+	requestPauseAction
 	requestResume
+	requestResumeAction
 	requestSnapshot
 	requestClose
 )
@@ -146,18 +180,23 @@ type response struct {
 }
 
 type Sequencer struct {
-	clock     Clock
-	executor  Executor
-	schedule  Schedule
-	wake      chan struct{}
-	done      chan struct{}
-	admission sync.Mutex
-	pending   []request
-	accepting bool
-	shutdown  sync.Mutex
-	final     Snapshot
-	finalErr  error
-	closed    bool
+	clock            Clock
+	executor         Executor
+	schedule         Schedule
+	replay           ReplayLookup
+	countdown        time.Duration
+	countdownAction  func(Action) Action
+	checkpoint       Checkpoint
+	durableLifecycle bool
+	wake             chan struct{}
+	done             chan struct{}
+	admission        sync.Mutex
+	pending          []request
+	accepting        bool
+	shutdown         sync.Mutex
+	final            Snapshot
+	finalErr         error
+	closed           bool
 }
 
 func New(schedule []ScheduledAction, executor Executor) (*Sequencer, error) {
@@ -177,15 +216,67 @@ func NewWithSchedule(schedule Schedule, executor Executor) (*Sequencer, error) {
 }
 
 func NewWithScheduleAndClock(schedule Schedule, executor Executor, clock Clock) (*Sequencer, error) {
-	if isNilInterface(schedule) || executor == nil || isNilInterface(clock) {
-		return nil, errors.New("schedule, executor, and clock are required")
+	return NewConfigured(Config{Schedule: schedule, Executor: executor, Clock: clock})
+}
+
+func NewConfigured(config Config) (*Sequencer, error) {
+	if isNilInterface(config.Schedule) || config.Executor == nil {
+		return nil, errors.New("schedule and executor are required")
 	}
-	if _, err := currentTime(clock); err != nil {
+	if isNilInterface(config.Clock) {
+		config.Clock = systemClock{}
+	}
+	if config.Countdown < 0 {
+		return nil, errors.New("countdown must be non-negative")
+	}
+	if config.Countdown > 0 && config.CountdownAction == nil {
+		return nil, errors.New("countdown action factory is required")
+	}
+	if config.DurableLifecycle && (config.Countdown <= 0 || config.ReplayLookup == nil || config.CountdownAction == nil) {
+		return nil, errors.New("durable lifecycle requires countdown, replay lookup, and countdown action factory")
+	}
+	checkpoint := config.Checkpoint
+	if checkpoint.Status == "" {
+		checkpoint.Status = StatusPreparing
+	}
+	if err := validateCheckpoint(checkpoint); err != nil {
 		return nil, err
 	}
-	sequencer := &Sequencer{clock: clock, executor: executor, schedule: schedule, wake: make(chan struct{}, 1), done: make(chan struct{}), accepting: true}
+	if _, err := currentTime(config.Clock); err != nil {
+		return nil, err
+	}
+	sequencer := &Sequencer{
+		clock: config.Clock, executor: config.Executor, schedule: config.Schedule,
+		replay: config.ReplayLookup, countdown: config.Countdown,
+		countdownAction: config.CountdownAction, checkpoint: checkpoint,
+		durableLifecycle: config.DurableLifecycle,
+		wake:             make(chan struct{}, 1), done: make(chan struct{}), accepting: true,
+	}
 	go sequencer.run()
 	return sequencer, nil
+}
+
+func validateCheckpoint(checkpoint Checkpoint) error {
+	if checkpoint.Elapsed < 0 {
+		return errors.New("checkpoint elapsed time must be non-negative")
+	}
+	if checkpoint.NextScheduled > checkpoint.Sequence {
+		return errors.New("checkpoint next scheduled exceeds sequence")
+	}
+	switch checkpoint.Status {
+	case StatusPreparing:
+		if checkpoint.Elapsed != 0 || checkpoint.NextScheduled != 0 || checkpoint.Sequence != 0 {
+			return errors.New("preparing checkpoint must be empty")
+		}
+	case StatusPaused:
+	case StatusCompleted:
+		if checkpoint.Sequence == 0 {
+			return errors.New("completed checkpoint must have executed an action")
+		}
+	default:
+		return fmt.Errorf("checkpoint status %q cannot be restored", checkpoint.Status)
+	}
+	return nil
 }
 
 func isNilInterface(value any) bool {
@@ -310,6 +401,17 @@ func (s *Sequencer) Start(ctx context.Context) error {
 	return response.err
 }
 
+func (s *Sequencer) StartAction(ctx context.Context, action Action) (Execution, error) {
+	if err := validateLifecycleAction(action, ActionStartSession, false); err != nil {
+		return Execution{}, err
+	}
+	response, err := s.request(ctx, request{kind: requestStartAction, action: action})
+	if err != nil {
+		return Execution{}, err
+	}
+	return response.execution, response.err
+}
+
 func (s *Sequencer) Submit(ctx context.Context, action Action) (Execution, error) {
 	if err := validateAction(action, SourceParticipant); err != nil {
 		return Execution{}, err
@@ -329,12 +431,34 @@ func (s *Sequencer) Pause(ctx context.Context) (Snapshot, error) {
 	return response.snapshot, response.err
 }
 
+func (s *Sequencer) PauseAction(ctx context.Context, action Action) (Execution, error) {
+	if err := validateLifecycleAction(action, ActionPauseSession, true); err != nil {
+		return Execution{}, err
+	}
+	response, err := s.request(ctx, request{kind: requestPauseAction, action: action})
+	if err != nil {
+		return Execution{}, err
+	}
+	return response.execution, response.err
+}
+
 func (s *Sequencer) Resume(ctx context.Context) error {
 	response, err := s.request(ctx, request{kind: requestResume})
 	if err != nil {
 		return err
 	}
 	return response.err
+}
+
+func (s *Sequencer) ResumeAction(ctx context.Context, action Action) (Execution, error) {
+	if err := validateLifecycleAction(action, ActionResumeSession, false); err != nil {
+		return Execution{}, err
+	}
+	response, err := s.request(ctx, request{kind: requestResumeAction, action: action})
+	if err != nil {
+		return Execution{}, err
+	}
+	return response.execution, response.err
 }
 
 func (s *Sequencer) Snapshot(ctx context.Context) (Snapshot, error) {
@@ -350,6 +474,8 @@ func (s *Sequencer) Close() error {
 	return err
 }
 
+// Shutdown is an in-memory stop. Durable lifecycle configurations must
+// successfully PauseAction before calling Shutdown.
 func (s *Sequencer) Shutdown(ctx context.Context) (Snapshot, error) {
 	s.shutdown.Lock()
 	defer s.shutdown.Unlock()
@@ -360,6 +486,7 @@ func (s *Sequencer) Shutdown(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	<-s.done
 	s.final, s.finalErr, s.closed = response.snapshot, response.err, true
 	return s.final, s.finalErr
 }
@@ -430,11 +557,74 @@ func validateAction(action Action, source Source) error {
 	return nil
 }
 
+func validateLifecycleAction(action Action, kind string, allowSystem bool) error {
+	if action.Kind != kind {
+		return fmt.Errorf("lifecycle action kind must be %q", kind)
+	}
+	if action.Source == SourceSystem && allowSystem {
+		if err := validateAction(action, SourceSystem); err != nil {
+			return err
+		}
+		if err := validatePayloadType(action); err != nil {
+			return err
+		}
+		return validatePauseSourceReason(action)
+	}
+	if err := validateAction(action, SourceParticipant); err != nil {
+		return err
+	}
+	if err := validatePayloadType(action); err != nil {
+		return err
+	}
+	if kind == ActionPauseSession {
+		return validatePauseSourceReason(action)
+	}
+	return nil
+}
+
+func validatePauseSourceReason(action Action) error {
+	payload := action.Payload.(PauseSessionPayload)
+	if action.Source == SourceParticipant && payload.Reason != PauseReasonPlayer {
+		return errors.New("participant pause reason must be player")
+	}
+	if action.Source == SourceSystem && payload.Reason != PauseReasonShutdown && payload.Reason != PauseReasonRecovery {
+		return errors.New("system pause reason must be shutdown or recovery")
+	}
+	return nil
+}
+
 func validateScheduledAction(action ScheduledAction) error {
 	if action.Due < 0 {
 		return errors.New("scheduled time must be non-negative")
 	}
 	return validateAction(action.Action, SourceSystem)
+}
+
+func normalizeOutcome(outcome Outcome) Outcome {
+	switch outcome.Disposition {
+	case DispositionContinue, DispositionComplete:
+		if outcome.Err != nil {
+			outcome.Disposition = DispositionFail
+			outcome.Err = errors.New("successful executor outcome contains an error")
+		}
+	case DispositionReject, DispositionFail:
+		if outcome.Err == nil {
+			outcome.Disposition = DispositionFail
+			outcome.Err = errors.New("failed executor outcome is missing an error")
+		}
+	default:
+		outcome.Disposition = DispositionFail
+		outcome.Err = errors.New("executor returned an invalid disposition")
+	}
+	return outcome
+}
+
+func normalizeExecution(execution Execution) Execution {
+	outcome := normalizeOutcome(Outcome{
+		Result: execution.Result, Disposition: execution.Disposition, Err: execution.Err,
+	})
+	execution.Result, execution.Disposition, execution.Err = outcome.Result, outcome.Disposition, outcome.Err
+	return execution
 }
 
 func (s *Sequencer) run() {
@@ -444,17 +634,19 @@ func (s *Sequencer) run() {
 		}
 		close(s.done)
 	}()
-	status := StatusPreparing
-	elapsed := time.Duration(0)
+	status := s.checkpoint.Status
+	elapsed := s.checkpoint.Elapsed
 	anchor := time.Time{}
-	nextScheduled := 0
-	sequence := uint64(0)
+	nextScheduled := s.checkpoint.NextScheduled
+	sequence := s.checkpoint.Sequence
 	var failure error
 	var timer Timer
 	var candidate ScheduledAction
 	hasCandidate := false
 	lastScheduledDue := time.Duration(0)
 	scheduledIDs := make(map[string]struct{})
+	var countdownStart Action
+	var countdownAnchor time.Time
 
 	logicalAt := func(now time.Time) time.Duration {
 		if status != StatusRunning || now.Before(anchor) {
@@ -508,18 +700,13 @@ func (s *Sequencer) run() {
 		candidate = ScheduledAction{}
 		return nil
 	}
-	armTimer := func() error {
+	armTimerAt := func(now time.Time) error {
 		if err := stopTimer(); err != nil {
 			fail(elapsed, err)
 			return failure
 		}
 		if status != StatusRunning {
 			return nil
-		}
-		now, err := currentTime(s.clock)
-		if err != nil {
-			fail(elapsed, err)
-			return failure
 		}
 		next, ok, err := loadCandidate()
 		if err != nil {
@@ -541,6 +728,39 @@ func (s *Sequencer) run() {
 		timer = created
 		return nil
 	}
+	armTimer := func() error {
+		now, err := currentTime(s.clock)
+		if err != nil {
+			fail(elapsed, err)
+			return failure
+		}
+		return armTimerAt(now)
+	}
+	armCountdownTimer := func(delay time.Duration) error {
+		if err := stopTimer(); err != nil {
+			fail(0, err)
+			return failure
+		}
+		created, err := createTimer(s.clock, delay)
+		if err != nil {
+			fail(0, err)
+			return failure
+		}
+		timer = created
+		return nil
+	}
+	rearmCountdownTimer := func() error {
+		now, err := currentTime(s.clock)
+		if err != nil {
+			fail(0, err)
+			return failure
+		}
+		remaining := countdownAnchor.Add(s.countdown).Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return armCountdownTimer(remaining)
+	}
 	execute := func(action Action, at time.Duration) (execution Execution) {
 		sequence++
 		execution = Execution{Sequence: sequence, Elapsed: at, Action: action}
@@ -550,24 +770,72 @@ func (s *Sequencer) run() {
 				execution.Err = &executorPanicError{value: recovered}
 			}
 		}()
-		outcome := s.executor(action, at)
+		outcome := normalizeOutcome(s.executor(action, at))
 		execution.Result, execution.Disposition, execution.Err = outcome.Result, outcome.Disposition, outcome.Err
-		switch execution.Disposition {
-		case DispositionContinue, DispositionComplete:
-			if execution.Err != nil {
-				execution.Disposition = DispositionFail
-				execution.Err = errors.New("successful executor outcome contains an error")
-			}
-		case DispositionReject, DispositionFail:
-			if execution.Err == nil {
-				execution.Disposition = DispositionFail
-				execution.Err = errors.New("failed executor outcome is missing an error")
-			}
-		default:
-			execution.Disposition = DispositionFail
-			execution.Err = errors.New("executor returned an invalid disposition")
-		}
 		return execution
+	}
+	completeCountdown := func() error {
+		if err := stopTimer(); err != nil {
+			fail(0, err)
+			return failure
+		}
+		var action Action
+		var factoryErr error
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					factoryErr = fmt.Errorf("countdown action factory panicked: %v", recovered)
+				}
+			}()
+			action = s.countdownAction(countdownStart)
+		}()
+		if factoryErr == nil {
+			if action.Kind != ActionCountdownComplete {
+				factoryErr = fmt.Errorf("countdown action kind must be %q", ActionCountdownComplete)
+			} else if factoryErr = validateAction(action, SourceSystem); factoryErr == nil {
+				factoryErr = validatePayloadType(action)
+			}
+		}
+		if factoryErr != nil {
+			fail(0, factoryErr)
+			return failure
+		}
+		execution := execute(action, 0)
+		if execution.Disposition != DispositionContinue {
+			cause := execution.Err
+			if cause == nil {
+				cause = errors.New("countdown action must continue")
+			}
+			fail(0, fmt.Errorf("countdown action %q failed: %w", action.ID, cause))
+			return failure
+		}
+		now, err := currentTime(s.clock)
+		if err != nil {
+			fail(0, err)
+			return failure
+		}
+		anchor, status = now, StatusRunning
+		return armTimerAt(now)
+	}
+	replay := func(action Action) (Execution, bool) {
+		if s.replay == nil {
+			return Execution{}, false
+		}
+		var execution Execution
+		var found bool
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					execution = Execution{Action: action, Disposition: DispositionFail, Err: fmt.Errorf("replay lookup panicked: %v", recovered)}
+					found = true
+				}
+			}()
+			execution, found = s.replay(action)
+		}()
+		if !found {
+			return Execution{}, false
+		}
+		return normalizeExecution(execution), true
 	}
 	processDue := func(target time.Duration) error {
 		for {
@@ -599,6 +867,20 @@ func (s *Sequencer) run() {
 		return Snapshot{Status: status, Elapsed: logicalAt(now), NextScheduled: nextScheduled, Sequence: sequence, Failure: failure}
 	}
 	handleRequest := func(req request) bool {
+		switch req.kind {
+		case requestStartAction, requestPauseAction, requestResumeAction, requestSubmit:
+			if execution, found := replay(req.action); found {
+				var err error
+				if execution.Disposition == DispositionReject || execution.Disposition == DispositionFail {
+					err = execution.Err
+				}
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: err}
+				return false
+			}
+		}
+		if (req.kind == requestPauseAction || req.kind == requestSubmit) && status == StatusCountdown && !req.received.Before(countdownAnchor.Add(s.countdown)) {
+			_ = completeCountdown()
+		}
 		if status == StatusFailed && req.kind != requestSnapshot && req.kind != requestClose {
 			req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
 			return false
@@ -609,6 +891,10 @@ func (s *Sequencer) run() {
 		}
 		switch req.kind {
 		case requestStart:
+			if s.durableLifecycle {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
 			if status != StatusPreparing {
 				req.reply <- response{err: ErrInvalidState}
 				return false
@@ -619,6 +905,36 @@ func (s *Sequencer) run() {
 				return false
 			}
 			req.reply <- response{}
+		case requestStartAction:
+			if status != StatusPreparing || s.countdown <= 0 {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
+			execution := execute(req.action, 0)
+			switch execution.Disposition {
+			case DispositionContinue:
+				now, err := currentTime(s.clock)
+				if err != nil {
+					fail(0, err)
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+					return false
+				}
+				status, elapsed, countdownStart, countdownAnchor = StatusCountdown, 0, req.action, now
+				if err := armCountdownTimer(s.countdown); err != nil {
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
+				req.reply <- response{execution: execution}
+			case DispositionReject:
+				req.reply <- response{execution: execution, err: execution.Err}
+			case DispositionComplete, DispositionFail:
+				cause := execution.Err
+				if cause == nil {
+					cause = errors.New("start action must continue")
+				}
+				fail(0, fmt.Errorf("start action %q failed: %w", req.action.ID, cause))
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+			}
 		case requestSubmit:
 			if status != StatusRunning {
 				req.reply <- response{err: ErrInvalidState}
@@ -656,6 +972,10 @@ func (s *Sequencer) run() {
 				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
 			}
 		case requestPause:
+			if s.durableLifecycle {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
 			if status != StatusRunning {
 				req.reply <- response{err: ErrInvalidState}
 				return false
@@ -672,7 +992,48 @@ func (s *Sequencer) run() {
 			elapsed, status = target, StatusPaused
 			stopTimer()
 			req.reply <- response{snapshot: snapshot(req.received)}
+		case requestPauseAction:
+			if status != StatusRunning && status != StatusCountdown {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
+			target := time.Duration(0)
+			if status == StatusRunning {
+				target = logicalAt(req.received)
+				if err := processDue(target); err != nil {
+					req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
+				if status == StatusCompleted {
+					req.reply <- response{snapshot: snapshot(req.received), err: ErrInvalidState}
+					return false
+				}
+			}
+			execution := execute(req.action, target)
+			switch execution.Disposition {
+			case DispositionContinue:
+				// Countdown progress is intentionally discarded. A durable resume
+				// starts market time directly from this elapsed-zero checkpoint.
+				elapsed, status = target, StatusPaused
+				if err := stopTimer(); err != nil {
+					fail(target, err)
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+					return false
+				}
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received)}
+			case DispositionReject, DispositionComplete, DispositionFail:
+				cause := execution.Err
+				if cause == nil {
+					cause = errors.New("pause action executor must continue")
+				}
+				fail(target, fmt.Errorf("pause action %q failed: %w", req.action.ID, cause))
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+			}
 		case requestResume:
+			if s.durableLifecycle {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
 			if status != StatusPaused {
 				req.reply <- response{err: ErrInvalidState}
 				return false
@@ -683,6 +1044,34 @@ func (s *Sequencer) run() {
 				return false
 			}
 			req.reply <- response{}
+		case requestResumeAction:
+			if status != StatusPaused {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
+			execution := execute(req.action, elapsed)
+			switch execution.Disposition {
+			case DispositionContinue:
+				now, err := currentTime(s.clock)
+				if err != nil {
+					fail(elapsed, err)
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+					return false
+				}
+				status, anchor = StatusRunning, now
+				if err := armTimerAt(now); err != nil {
+					req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
+				req.reply <- response{execution: execution}
+			case DispositionReject, DispositionComplete, DispositionFail:
+				cause := execution.Err
+				if cause == nil {
+					cause = errors.New("resume action executor must continue")
+				}
+				fail(elapsed, fmt.Errorf("resume action %q failed: %w", req.action.ID, cause))
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+			}
 		case requestSnapshot:
 			req.reply <- response{snapshot: snapshot(req.received)}
 		case requestClose:
@@ -697,6 +1086,8 @@ func (s *Sequencer) run() {
 				} else if status == StatusRunning {
 					elapsed, status = target, StatusPaused
 				}
+			} else if status == StatusCountdown {
+				status, elapsed = StatusPaused, 0
 			}
 			stopTimer()
 			final := snapshot(req.received)
@@ -713,8 +1104,9 @@ func (s *Sequencer) run() {
 
 	for {
 		// Requests already waiting at the serialized admission point take priority
-		// over timers. Their receipt timestamp is authoritative, and processDue
-		// will still execute every scheduled action due at or before that point.
+		// over timers. Their receipt timestamp is authoritative, except that a
+		// pause or submit received at the countdown deadline completes countdown
+		// first.
 		if req, ok := s.dequeue(); ok {
 			if handleRequest(req) {
 				return
@@ -739,11 +1131,19 @@ func (s *Sequencer) run() {
 				if handleRequest(req) {
 					return
 				}
+				// The timer channel was consumed before the earlier request ran.
+				// If that operation left countdown active, use current wall time
+				// rather than its stale receipt time to restore the deadline.
+				if status == StatusCountdown && timer == nil {
+					_ = rearmCountdownTimer()
+				}
 				continue
 			}
 			if status == StatusRunning {
 				_ = processDue(logicalAt(now))
 				_ = armTimer()
+			} else if status == StatusCountdown {
+				_ = completeCountdown()
 			}
 		}
 	}
