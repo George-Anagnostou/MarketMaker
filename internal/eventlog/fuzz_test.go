@@ -49,3 +49,39 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 		}
 	})
 }
+
+func FuzzRealTimeRecordJSON(f *testing.F) {
+	for _, seed := range []string{
+		`{"schema":5,"version":1,"action":{"id":"start","kind":"start_session","source":"participant","payload":{"bid":"99.0000","ask":"101.0000"}},"lifecycle":"countdown"}`,
+		`{"schema":5,"version":1,"action":{"id":"system/countdown","kind":"countdown_complete","source":"system"},"lifecycle":"running"}`,
+		`{"schema":5,"version":1,"action":{"id":"bad","kind":"mark_move","source":"operator"},"lifecycle":"running"}`,
+	} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8192 {
+			return
+		}
+		var record Record
+		if err := decodeStrictJSON(data, &record); err != nil {
+			return
+		}
+		if record.Action == nil {
+			return
+		}
+		if _, err := record.Action.Decode(); err != nil {
+			return
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reparsed Record
+		if err := decodeStrictJSON(encoded, &reparsed); err != nil {
+			t.Fatalf("canonical record rejected: %v", err)
+		}
+		if !reflect.DeepEqual(reparsed, record) {
+			t.Fatalf("record round trip changed value: got=%+v want=%+v", reparsed, record)
+		}
+	})
+}

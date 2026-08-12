@@ -396,6 +396,51 @@ func TestRealTimeSequencerIsLazyAndOrdersCountdown(t *testing.T) {
 	}
 }
 
+func TestRealTimeSequencerConstructionIsSingleFlight(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	var calls int
+	installManualSequencer(service, clock, &calls, nil)
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers = 16
+	results := make(chan *realtime.Sequencer, workers)
+	errorsCh := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			sequencer, err := entry.ensureRealTimeSequencer()
+			results <- sequencer
+			errorsCh <- err
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errorsCh)
+	var first *realtime.Sequencer
+	for sequencer := range results {
+		if first == nil {
+			first = sequencer
+		} else if sequencer != first {
+			t.Fatal("concurrent construction returned different sequencers")
+		}
+	}
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("factory calls=%d want 1", calls)
+	}
+	closeRealTimeSequencer(t, entry)
+}
+
 func TestRealTimePauseResumeUsesLogicalTimeAndRunsDueWorkFirst(t *testing.T) {
 	service := newExchangeService(t.TempDir())
 	service.newSeed = func() (uint64, error) { return 99, nil }
