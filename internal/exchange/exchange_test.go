@@ -1742,3 +1742,118 @@ func TestAddAccountRejectsMinInt64Position(t *testing.T) {
 		t.Fatal("rejected account was added")
 	}
 }
+
+func TestRealTimeActionsAdvanceVersionWithoutAdvancingTurns(t *testing.T) {
+	cfg := config(t)
+	cfg.NumTurns = 1
+	cfg.MaxOrdersPerTurn = 0
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quote, err := e.UpdateQuote(mustPrice(t, "99"), mustPrice(t, "101"), mustQty(t, "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.State.Version != 1 || quote.State.Turn != 0 || quote.State.BestBid != mustPrice(t, "99") || quote.State.BestAsk != mustPrice(t, "101") || quote.Summary.ActionPnL != 0 || quote.Summary.TurnPnL != 0 {
+		t.Fatalf("quote=%+v", quote)
+	}
+	arrival, err := e.ApplyCustomerArrival(CustomerArrival{Side: Buy, Quantity: mustQty(t, "0.5"), SlippageBps: 100, Informed: true, InformedMark: mustPrice(t, "100.5")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arrival.State.Version != 2 || arrival.State.Turn != 0 || arrival.State.Position != mustQty(t, "-0.5") || arrival.Summary.OrdersReceived != 1 || arrival.Summary.UnitsTraded != mustQty(t, "0.5") || arrival.Summary.ActionPnL != mustMoney(t, "0.5") || arrival.Summary.TurnPnL != 0 || arrival.Summary.InformedOrders != 1 || arrival.Summary.InformedOrdersFilled != 1 || arrival.Summary.InformedUnitsTraded != mustQty(t, "0.5") || arrival.Summary.InformedFlowPnL != mustMoney(t, "0.25") {
+		t.Fatalf("arrival=%+v", arrival)
+	}
+	mark, err := e.ApplyMarkMove(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mark.State.Version != 3 || mark.State.Turn != 0 || mark.State.Mark != mustPrice(t, "101") || mark.Summary.ActionPnL != mustMoney(t, "-0.5") || mark.Summary.PnLAttribution == nil || mark.Summary.PnLAttribution.InventoryMarkPnL != mustMoney(t, "-0.5") || len(mark.Events) != 1 || mark.Events[0].PreviousMark != mustPrice(t, "100") {
+		t.Fatalf("mark=%+v", mark)
+	}
+	carry, err := e.ApplyCarry(mustPrice(t, "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if carry.State.Version != 4 || carry.State.Turn != 0 || carry.Summary.StorageCost != mustMoney(t, "0.5") || carry.Summary.ActionPnL != mustMoney(t, "-0.5") || carry.Summary.PnLAttribution == nil || carry.Summary.PnLAttribution.StoragePnL != mustMoney(t, "-0.5") || len(carry.Ledger) != 1 {
+		t.Fatalf("carry=%+v", carry)
+	}
+	expiry, err := e.ExpireTradingDay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expiry.State.Version != 5 || expiry.State.Turn != 0 || !expiry.State.IsOver || expiry.State.Reason != TimeExpired || expiry.State.BestBid != 0 || expiry.State.BestAsk != 0 || len(expiry.Events) != 3 || expiry.Events[len(expiry.Events)-1].Type != "game_ended" {
+		t.Fatalf("expiry=%+v", expiry)
+	}
+	account, ok := e.Account(PlayerAccount)
+	if !ok || account.ReservedCash != 0 || account.OpenBuyQuantity != 0 || account.OpenSellQuantity != 0 {
+		t.Fatalf("account after expiry=%+v", account)
+	}
+}
+
+func TestRealTimeMarkImmediatelyEvaluatesMaintenance(t *testing.T) {
+	cfg := config(t)
+	cfg.StartingCash = mustMoney(t, "1600")
+	cfg.StartingPosition = mustQty(t, "-10")
+	cfg.MaxPosition = mustQty(t, "100")
+	cfg.MinMoveBps, cfg.MaxMoveBps = 10_000, 10_000
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.UpdateQuote(mustPrice(t, "99"), mustPrice(t, "101"), mustQty(t, "1")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.ApplyMarkMove(10_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.State.IsOver || result.State.Reason != Insolvent || result.State.Version != 2 || result.State.BestBid != 0 || result.State.BestAsk != 0 || len(result.Events) != 4 || result.Events[len(result.Events)-1].Type != "game_ended" {
+		t.Fatalf("result=%+v", result)
+	}
+	account, _ := e.Account(PlayerAccount)
+	if account.ReservedCash != 0 || account.OpenBuyQuantity != 0 || account.OpenSellQuantity != 0 {
+		t.Fatalf("terminal account=%+v", account)
+	}
+	if rejected, err := e.ApplyCarry(0); err == nil || rejected.State.Version != 2 {
+		t.Fatalf("post-terminal result=%+v err=%v", rejected, err)
+	}
+}
+
+func TestRejectedRealTimeActionRollsBackCompletely(t *testing.T) {
+	cfg := config(t)
+	cfg.MinMoveBps, cfg.MaxMoveBps = -100, 100
+	left, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := left.ApplyCustomerArrival(CustomerArrival{Side: "invalid", Quantity: 1}); err == nil {
+		t.Fatal("invalid arrival accepted")
+	}
+	if _, err := left.ApplyMarkMove(101); err == nil {
+		t.Fatal("invalid mark accepted")
+	}
+	if _, err := left.ApplyCarry(-1); err == nil {
+		t.Fatal("invalid carry accepted")
+	}
+	if _, err := left.UpdateQuote(mustPrice(t, "99"), mustPrice(t, "101"), 0); err == nil {
+		t.Fatal("invalid quote accepted")
+	}
+	leftResult, err := left.UpdateQuote(mustPrice(t, "99"), mustPrice(t, "101"), mustQty(t, "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightResult, err := right.UpdateQuote(mustPrice(t, "99"), mustPrice(t, "101"), mustQty(t, "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(leftResult, rightResult) || !reflect.DeepEqual(left.State(), right.State()) {
+		t.Fatalf("rejected actions mutated engine: left=%+v right=%+v", leftResult, rightResult)
+	}
+}

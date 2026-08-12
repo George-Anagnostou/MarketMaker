@@ -36,6 +36,7 @@ type EndReason string
 const (
 	NotOver       EndReason = ""
 	TurnsComplete EndReason = "turns_complete"
+	TimeExpired   EndReason = "time_expired"
 	MarginBreach  EndReason = "margin_breach"
 	Insolvent     EndReason = "insolvent"
 	PlayerQuit    EndReason = "player_quit"
@@ -216,6 +217,7 @@ type Summary struct {
 	NetFillCash          fixed.Money     `json:"net_fill_cash"`
 	StorageCost          fixed.Money     `json:"storage_cost"`
 	TurnPnL              fixed.Money     `json:"turn_pnl"`
+	ActionPnL            fixed.Money     `json:"action_pnl,omitempty"`
 	BuyVolume            fixed.Qty       `json:"buy_volume"`
 	SellVolume           fixed.Qty       `json:"sell_volume"`
 	PnLAttribution       *PnLAttribution `json:"pnl_attribution,omitempty"`
@@ -586,6 +588,227 @@ func (e *Engine) SubmitQuote(bid, ask fixed.Price) (Result, error) {
 	return e.transact(func(candidate *Engine) (Result, error) { return candidate.submitQuote(bid, ask) })
 }
 
+// UpdateQuote atomically replaces the player's two-sided real-time quote.
+// Time and autonomous market activity are owned by the caller's sequencer.
+func (e *Engine) UpdateQuote(bid, ask fixed.Price, quantity fixed.Qty) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if !quantity.Positive() || quantity > candidate.cfg.MaxOrderQty {
+			return Result{State: candidate.State()}, errors.New("quote quantity exceeds configured limits")
+		}
+		if err := candidate.validatePlayerQuote(bid, ask, quantity); err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		attribution := &PnLAttribution{}
+		summary := Summary{PnLAttribution: attribution}
+		events, err := candidate.replacePlayerQuote(bid, ask, quantity, func(trade Trade) error {
+			if err := addExecutionEdge(attribution, trade, candidate.mark); err != nil {
+				return err
+			}
+			return addPlayerTrade(&summary, trade)
+		})
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		summary.ActionPnL, err = fixed.SubMoney(after, before)
+		if err != nil || summary.ActionPnL != attribution.ExecutionEdge {
+			return Result{State: candidate.State()}, errors.New("quote action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: summary, Events: events}, nil
+	})
+}
+
+type CustomerArrival struct {
+	Side         Side
+	Quantity     fixed.Qty
+	SlippageBps  int64
+	Informed     bool
+	InformedMark fixed.Price
+}
+
+// ApplyCustomerArrival executes one scheduled IOC customer order.
+func (e *Engine) ApplyCustomerArrival(arrival CustomerArrival) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if arrival.Side != Buy && arrival.Side != Sell || !arrival.Quantity.Positive() || arrival.Quantity > candidate.cfg.MaxOrderQty || arrival.SlippageBps < 0 || arrival.SlippageBps > candidate.cfg.MaxFlowSlippageBps || arrival.Informed && !arrival.InformedMark.Positive() || !arrival.Informed && arrival.InformedMark != 0 {
+			return Result{State: candidate.State()}, errors.New("invalid customer arrival")
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		attribution := &PnLAttribution{}
+		summary := Summary{OrdersReceived: 1, PnLAttribution: attribution}
+		playerFilled := false
+		informedTrades := make([]Trade, 0)
+		events, err := candidate.executeCustomerArrival(customerArrival{side: arrival.Side, quantity: arrival.Quantity, slippageBps: arrival.SlippageBps, informed: arrival.Informed}, func(trade Trade) error {
+			if err := addFlowTrade(&summary, trade); err != nil {
+				return err
+			}
+			if err := addExecutionEdge(attribution, trade, candidate.mark); err != nil {
+				return err
+			}
+			if arrival.Informed && isPlayerTrade(trade) {
+				playerFilled = true
+				summary.InformedUnitsTraded, err = fixed.AddQty(summary.InformedUnitsTraded, trade.Quantity)
+				if err != nil {
+					return err
+				}
+				informedTrades = append(informedTrades, trade)
+			}
+			return nil
+		})
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		if arrival.Informed {
+			summary.InformedOrders = 1
+			if playerFilled {
+				summary.InformedOrdersFilled = 1
+			}
+		}
+		for _, trade := range informedTrades {
+			pnl, err := playerFillPnL(trade, arrival.InformedMark)
+			if err != nil {
+				return Result{State: candidate.State()}, err
+			}
+			summary.InformedFlowPnL, err = fixed.AddMoney(summary.InformedFlowPnL, pnl)
+			if err != nil {
+				return Result{State: candidate.State()}, err
+			}
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		summary.ActionPnL, err = fixed.SubMoney(after, before)
+		if err != nil || summary.ActionPnL != attribution.ExecutionEdge {
+			return Result{State: candidate.State()}, errors.New("customer action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: summary, Events: events}, nil
+	})
+}
+
+// ApplyMarkMove applies one scheduled reference-price move.
+func (e *Engine) ApplyMarkMove(moveBps int64) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if moveBps < candidate.cfg.MinMoveBps || moveBps > candidate.cfg.MaxMoveBps {
+			return Result{State: candidate.State()}, errors.New("mark move exceeds configured limits")
+		}
+		previous := candidate.mark
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		next, err := fixed.ScalePrice(previous, 10_000+moveBps, 10_000)
+		if err != nil || !next.Positive() {
+			return Result{State: candidate.State()}, errors.New("mark movement produced invalid price")
+		}
+		attribution := &PnLAttribution{}
+		attribution.InventoryMarkPnL, err = markPnL(candidate.accounts[PlayerAccount].Position, previous, next)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events := []Event{candidate.applyMark(next, true)}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		delta, err := fixed.SubMoney(after, before)
+		if err != nil || delta != attribution.InventoryMarkPnL {
+			return Result{State: candidate.State()}, errors.New("mark action P&L does not reconcile")
+		}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: Summary{ActionPnL: attribution.InventoryMarkPnL, PnLAttribution: attribution}, Events: events}, nil
+	})
+}
+
+// ApplyCarry charges one scheduled inventory-carry interval.
+func (e *Engine) ApplyCarry(rate fixed.Price) (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		if rate < 0 {
+			return Result{State: candidate.State()}, errors.New("carry rate must be non-negative")
+		}
+		before, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		storage, events, err := candidate.chargeStorage(PlayerAccount, rate)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		storagePnL, err := fixed.NegMoney(storage)
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		after, err := candidate.equity(candidate.accounts[PlayerAccount])
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		delta, err := fixed.SubMoney(after, before)
+		if err != nil || delta != storagePnL {
+			return Result{State: candidate.State()}, errors.New("carry action P&L does not reconcile")
+		}
+		maintenanceEvents, err := candidate.endRealTimeOnMaintenanceBreach()
+		if err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, maintenanceEvents...)
+		attribution := &PnLAttribution{StoragePnL: storagePnL}
+		candidate.version++
+		return Result{State: candidate.State(), Summary: Summary{StorageCost: storage, ActionPnL: storagePnL, PnLAttribution: attribution}, Events: events}, nil
+	})
+}
+
+// ExpireTradingDay cancels the live player quote and marks the solo session at
+// the current reference price without synthesizing a liquidation trade.
+func (e *Engine) ExpireTradingDay() (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		events := candidate.cancelAccountOrders(PlayerAccount)
+		if err := candidate.reconcileReservations(); err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, candidate.endSession(TimeExpired))
+		candidate.version++
+		return Result{State: candidate.State(), Events: events}, nil
+	})
+}
+
 func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
 	if e.cfg.SimulationVersion == SimulationVersionAdverseSelection {
 		return e.submitQuoteV2(bid, ask)
@@ -594,33 +817,16 @@ func (e *Engine) submitQuote(bid, ask fixed.Price) (Result, error) {
 }
 
 func (e *Engine) submitQuoteLegacy(bid, ask fixed.Price) (Result, error) {
-	if e.isOver {
-		return Result{State: e.State()}, errors.New("game is over")
-	}
-	if !bid.Positive() || !ask.Positive() || bid >= ask {
-		return Result{State: e.State()}, errors.New("bid must be positive and strictly less than ask")
-	}
 	qty := e.cfg.MaxOrderQty
-	if !e.canPlaceQuotePair(bid, ask, qty) {
-		return Result{State: e.State()}, errors.New("quote would violate cash, position, or initial-margin limits")
+	if err := e.validatePlayerQuote(bid, ask, qty); err != nil {
+		return Result{State: e.State()}, err
 	}
 	before, err := e.equity(e.accounts[PlayerAccount])
 	if err != nil {
 		return Result{State: e.State()}, err
 	}
-	events := e.cancelAccountOrders(PlayerAccount)
-	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
-		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
-		trades, lifecycle, err := e.submitBookOrder(order)
-		if err != nil {
-			return Result{State: e.State()}, err
-		}
-		for _, trade := range trades {
-			events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
-		}
-		events = append(events, e.emitLifecycle(lifecycle)...)
-	}
-	if err := e.reconcileReservations(); err != nil {
+	events, err := e.replacePlayerQuote(bid, ask, qty, nil)
+	if err != nil {
 		return Result{State: e.State()}, err
 	}
 	summary, err := e.advance(&events)
@@ -640,15 +846,9 @@ func (e *Engine) submitQuoteLegacy(bid, ask fixed.Price) (Result, error) {
 }
 
 func (e *Engine) submitQuoteV2(bid, ask fixed.Price) (Result, error) {
-	if e.isOver {
-		return Result{State: e.State()}, errors.New("game is over")
-	}
-	if !bid.Positive() || !ask.Positive() || bid >= ask {
-		return Result{State: e.State()}, errors.New("bid must be positive and strictly less than ask")
-	}
 	qty := e.cfg.MaxOrderQty
-	if !e.canPlaceQuotePair(bid, ask, qty) {
-		return Result{State: e.State()}, errors.New("quote would violate cash, position, or initial-margin limits")
+	if err := e.validatePlayerQuote(bid, ask, qty); err != nil {
+		return Result{State: e.State()}, err
 	}
 	player := e.accounts[PlayerAccount]
 	before, err := e.equity(player)
@@ -657,22 +857,10 @@ func (e *Engine) submitQuoteV2(bid, ask fixed.Price) (Result, error) {
 	}
 	openingMark := e.mark
 	attribution := &PnLAttribution{}
-	events := e.cancelAccountOrders(PlayerAccount)
-	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
-		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
-		trades, lifecycle, err := e.submitBookOrder(order)
-		if err != nil {
-			return Result{State: e.State()}, err
-		}
-		for _, trade := range trades {
-			if err := addExecutionEdge(attribution, trade, openingMark); err != nil {
-				return Result{State: e.State()}, err
-			}
-			events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
-		}
-		events = append(events, e.emitLifecycle(lifecycle)...)
-	}
-	if err := e.reconcileReservations(); err != nil {
+	events, err := e.replacePlayerQuote(bid, ask, qty, func(trade Trade) error {
+		return addExecutionEdge(attribution, trade, openingMark)
+	})
+	if err != nil {
 		return Result{State: e.State()}, err
 	}
 	summary, err := e.advanceV2(&events, openingMark, attribution)
@@ -692,6 +880,43 @@ func (e *Engine) submitQuoteV2(bid, ask fixed.Price) (Result, error) {
 	}
 	e.version++
 	return Result{State: e.State(), Summary: summary, Events: events}, nil
+}
+
+func (e *Engine) validatePlayerQuote(bid, ask fixed.Price, qty fixed.Qty) error {
+	if e.isOver {
+		return errors.New("game is over")
+	}
+	if !bid.Positive() || !ask.Positive() || bid >= ask {
+		return errors.New("bid must be positive and strictly less than ask")
+	}
+	if !e.canPlaceQuotePair(bid, ask, qty) {
+		return errors.New("quote would violate cash, position, or initial-margin limits")
+	}
+	return nil
+}
+
+func (e *Engine) replacePlayerQuote(bid, ask fixed.Price, qty fixed.Qty, onTrade func(Trade) error) ([]Event, error) {
+	events := e.cancelAccountOrders(PlayerAccount)
+	for _, order := range []*Order{e.newOrder(PlayerAccount, Buy, bid, qty, GTC), e.newOrder(PlayerAccount, Sell, ask, qty, GTC)} {
+		events = append(events, e.emit(Event{Type: "order_accepted", Order: copyOrder(order)}))
+		trades, lifecycle, err := e.submitBookOrder(order)
+		if err != nil {
+			return nil, err
+		}
+		for _, trade := range trades {
+			if onTrade != nil {
+				if err := onTrade(trade); err != nil {
+					return nil, err
+				}
+			}
+			events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
+		}
+		events = append(events, e.emitLifecycle(lifecycle)...)
+	}
+	if err := e.reconcileReservations(); err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 func (e *Engine) Quit() (Result, error) {
@@ -935,86 +1160,130 @@ func (e *Engine) accountWithinLimits(accountID string, maintenance bool) bool {
 	return err == nil && eq >= required
 }
 
+type customerArrival struct {
+	side        Side
+	quantity    fixed.Qty
+	slippageBps int64
+	informed    bool
+}
+
+func (e *Engine) drawLegacyCustomerArrival() customerArrival {
+	arrival := customerArrival{side: Buy}
+	if e.rng.IntN(2) == 1 {
+		arrival.side = Sell
+	}
+	arrival.quantity = fixed.Qty(1 + e.rng.Int64N(int64(e.cfg.MaxOrderQty)))
+	if e.cfg.MaxFlowSlippageBps > 0 {
+		arrival.slippageBps = e.rng.Int64N(e.cfg.MaxFlowSlippageBps + 1)
+	}
+	return arrival
+}
+
+func (e *Engine) drawV2CustomerArrival(openingMark, nextMark fixed.Price) customerArrival {
+	arrival := customerArrival{side: Buy}
+	if e.flowRNG.bounded(2) == 1 {
+		arrival.side = Sell
+	}
+	arrival.quantity = fixed.Qty(1 + e.flowRNG.bounded(uint64(e.cfg.MaxOrderQty)))
+	arrival.slippageBps = int64(e.flowRNG.bounded(uint64(e.cfg.MaxFlowSlippageBps + 1)))
+	informedDraw := e.informedRNG.bounded(10_000)
+	arrival.informed = nextMark != openingMark && informedDraw < uint64(e.cfg.InformedFlowBps)
+	if arrival.informed {
+		if nextMark > openingMark {
+			arrival.side = Buy
+		} else {
+			arrival.side = Sell
+		}
+	}
+	return arrival
+}
+
+func (e *Engine) executeCustomerArrival(arrival customerArrival, onTrade func(Trade) error) ([]Event, error) {
+	price, err := e.flowLimitV2(arrival.side, arrival.slippageBps)
+	if err != nil {
+		return nil, err
+	}
+	order := e.newOrder(FlowAccount, arrival.side, price, arrival.quantity, IOC)
+	order.Informed = arrival.informed
+	events := []Event{e.emit(Event{Type: "flow_order", Order: copyOrder(order)})}
+	trades, lifecycle, err := e.submitBookOrder(order)
+	if err != nil {
+		return nil, err
+	}
+	for _, trade := range trades {
+		events = append(events, e.emit(Event{Type: "trade", Trade: &trade}))
+		if onTrade != nil {
+			if err := onTrade(trade); err != nil {
+				return nil, err
+			}
+		}
+	}
+	lifecycleEvents := e.emitLifecycle(lifecycle)
+	markLifecycleOrderInformed(lifecycleEvents, order.ID, arrival.informed)
+	events = append(events, lifecycleEvents...)
+	if err := e.reconcileReservations(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func (e *Engine) chargeStorage(accountID string, rate fixed.Price) (fixed.Money, []Event, error) {
+	account := e.accounts[accountID]
+	positionAbs, err := fixed.AbsQtyChecked(account.Position)
+	if err != nil {
+		return 0, nil, err
+	}
+	storage, err := fixed.Notional(rate, positionAbs)
+	if err != nil {
+		return 0, nil, err
+	}
+	if storage > 0 {
+		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(accountID), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
+			return 0, nil, err
+		}
+	}
+	account.Cash, err = fixed.AddMoney(account.Cash, -storage)
+	if err != nil {
+		return 0, nil, err
+	}
+	if storage == 0 {
+		return 0, nil, nil
+	}
+	return storage, []Event{e.emit(Event{Type: "storage_charged", Amount: storage})}, nil
+}
+
 func (e *Engine) advance(events *[]Event) (Summary, error) {
 	s := Summary{}
 	if e.cfg.MaxOrdersPerTurn > 0 {
 		n := 1 + e.rng.IntN(e.cfg.MaxOrdersPerTurn)
 		for range n {
 			s.OrdersReceived++
-			side := Buy
-			if e.rng.IntN(2) == 1 {
-				side = Sell
-			}
-			qty := fixed.Qty(1 + e.rng.Int64N(int64(e.cfg.MaxOrderQty)))
-			price, err := e.flowLimit(side)
+			arrival := e.drawLegacyCustomerArrival()
+			arrivalEvents, err := e.executeCustomerArrival(arrival, func(trade Trade) error {
+				return addLegacyFlowTrade(&s, trade)
+			})
 			if err != nil {
 				return Summary{}, err
 			}
-			order := e.newOrder(FlowAccount, side, price, qty, IOC)
-			*events = append(*events, e.emit(Event{Type: "flow_order", Order: copyOrder(order)}))
-			trades, lifecycle, err := e.submitBookOrder(order)
-			if err != nil {
-				return Summary{}, err
-			}
-			for _, trade := range trades {
-				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
-				if err := addLegacyFlowTrade(&s, trade); err != nil {
-					return Summary{}, err
-				}
-			}
-			*events = append(*events, e.emitLifecycle(lifecycle)...)
-			if err := e.reconcileReservations(); err != nil {
-				return Summary{}, err
-			}
+			*events = append(*events, arrivalEvents...)
 		}
 	}
-	player := e.accounts[PlayerAccount]
-	positionAbs, err := fixed.AbsQtyChecked(player.Position)
-	if err != nil {
-		return Summary{}, err
-	}
-	storage, err := fixed.Notional(e.cfg.StoragePerUnit, positionAbs)
-	if err != nil {
-		return Summary{}, err
-	}
-	if storage > 0 {
-		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(PlayerAccount), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
-			return Summary{}, err
-		}
-	}
-	player.Cash, err = fixed.AddMoney(player.Cash, -storage)
+	storage, storageEvents, err := e.chargeStorage(PlayerAccount, e.cfg.StoragePerUnit)
 	if err != nil {
 		return Summary{}, err
 	}
 	s.StorageCost = storage
-	if storage > 0 {
-		*events = append(*events, e.emit(Event{Type: "storage_charged", Amount: storage}))
-	}
+	*events = append(*events, storageEvents...)
 	e.turn++
-	previous := e.mark
-	move := e.cfg.MinMoveBps
-	if e.cfg.MaxMoveBps > e.cfg.MinMoveBps {
-		move += e.rng.Int64N(e.cfg.MaxMoveBps - e.cfg.MinMoveBps + 1)
+	nextMark, err := e.nextLegacyMark()
+	if err != nil {
+		return Summary{}, err
 	}
-	nextMark, err := fixed.ScalePrice(e.mark, 10_000+move, 10_000)
-	if err != nil || !nextMark.Positive() {
-		return Summary{}, errors.New("mark movement produced invalid price")
-	}
-	e.mark = nextMark
-	*events = append(*events, e.emit(Event{Type: "mark_updated", Mark: e.mark, Message: fmt.Sprintf("previous=%s", previous)}))
-	if !e.accountWithinLimits(PlayerAccount, true) {
-		e.isOver = true
-		eq, _ := e.equity(player)
-		if eq <= 0 {
-			e.reason = Insolvent
-		} else {
-			e.reason = MarginBreach
-		}
-		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
-	} else if e.cfg.NumTurns > 0 && e.turn >= e.cfg.NumTurns {
-		e.isOver = true
-		e.reason = TurnsComplete
-		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
+	*events = append(*events, e.applyMark(nextMark, false))
+	if terminal := e.evaluatePlayerMaintenance(); terminal != nil {
+		*events = append(*events, *terminal)
+	} else if terminal := e.completeTurnsIfDue(); terminal != nil {
+		*events = append(*events, *terminal)
 	}
 	return s, nil
 }
@@ -1030,87 +1299,46 @@ func (e *Engine) advanceV2(events *[]Event, openingMark fixed.Price, attribution
 		n := 1 + int(e.flowRNG.bounded(uint64(e.cfg.MaxOrdersPerTurn)))
 		for range n {
 			s.OrdersReceived++
-			side := Buy
-			if e.flowRNG.bounded(2) == 1 {
-				side = Sell
-			}
-			qty := fixed.Qty(1 + e.flowRNG.bounded(uint64(e.cfg.MaxOrderQty)))
-			slip := int64(e.flowRNG.bounded(uint64(e.cfg.MaxFlowSlippageBps + 1)))
-			informedDraw := e.informedRNG.bounded(10_000)
-			informed := nextMark != openingMark && informedDraw < uint64(e.cfg.InformedFlowBps)
-			if informed {
+			arrival := e.drawV2CustomerArrival(openingMark, nextMark)
+			if arrival.informed {
 				s.InformedOrders++
-				if nextMark > openingMark {
-					side = Buy
-				} else {
-					side = Sell
-				}
-			}
-			price, err := e.flowLimitV2(side, slip)
-			if err != nil {
-				return Summary{}, err
-			}
-			order := e.newOrder(FlowAccount, side, price, qty, IOC)
-			order.Informed = informed
-			*events = append(*events, e.emit(Event{Type: "flow_order", Order: copyOrder(order)}))
-			trades, lifecycle, err := e.submitBookOrder(order)
-			if err != nil {
-				return Summary{}, err
 			}
 			informedPlayerFill := false
-			for _, trade := range trades {
-				*events = append(*events, e.emit(Event{Type: "trade", Trade: &trade}))
+			arrivalEvents, err := e.executeCustomerArrival(arrival, func(trade Trade) error {
 				if err := addFlowTrade(&s, trade); err != nil {
-					return Summary{}, err
+					return err
 				}
 				if err := addExecutionEdge(attribution, trade, openingMark); err != nil {
-					return Summary{}, err
+					return err
 				}
-				if informed && isPlayerTrade(trade) {
+				if arrival.informed && isPlayerTrade(trade) {
 					informedPlayerFill = true
 					s.InformedUnitsTraded, err = fixed.AddQty(s.InformedUnitsTraded, trade.Quantity)
 					if err != nil {
-						return Summary{}, err
+						return err
 					}
 					informedTrades = append(informedTrades, trade)
 				}
+				return nil
+			})
+			if err != nil {
+				return Summary{}, err
 			}
+			*events = append(*events, arrivalEvents...)
 			if informedPlayerFill {
 				s.InformedOrdersFilled++
-			}
-			lifecycleEvents := e.emitLifecycle(lifecycle)
-			markLifecycleOrderInformed(lifecycleEvents, order.ID, informed)
-			*events = append(*events, lifecycleEvents...)
-			if err := e.reconcileReservations(); err != nil {
-				return Summary{}, err
 			}
 		}
 	}
 	player := e.accounts[PlayerAccount]
-	positionAbs, err := fixed.AbsQtyChecked(player.Position)
-	if err != nil {
-		return Summary{}, err
-	}
-	storage, err := fixed.Notional(e.cfg.StoragePerUnit, positionAbs)
-	if err != nil {
-		return Summary{}, err
-	}
-	if storage > 0 {
-		if err := e.ledger.append(LedgerEntry{Type: "storage_charged", Postings: []Posting{{Account: cashAvailable(PlayerAccount), Money: -storage}, {Account: storageAccount, Money: storage}}}); err != nil {
-			return Summary{}, err
-		}
-	}
-	player.Cash, err = fixed.SubMoney(player.Cash, storage)
+	storage, storageEvents, err := e.chargeStorage(PlayerAccount, e.cfg.StoragePerUnit)
 	if err != nil {
 		return Summary{}, err
 	}
 	s.StorageCost = storage
-	if storage > 0 {
-		*events = append(*events, e.emit(Event{Type: "storage_charged", Amount: storage}))
-	}
+	*events = append(*events, storageEvents...)
 	e.turn++
-	e.mark = nextMark
-	*events = append(*events, e.emit(Event{Type: "mark_updated", Mark: e.mark, PreviousMark: openingMark, Message: fmt.Sprintf("previous=%s", openingMark)}))
+	*events = append(*events, e.applyMark(nextMark, true))
 
 	attribution.InventoryMarkPnL, err = markPnL(player.Position, openingMark, e.mark)
 	if err != nil {
@@ -1138,21 +1366,82 @@ func (e *Engine) advanceV2(events *[]Event, openingMark fixed.Price, attribution
 			return Summary{}, err
 		}
 	}
-	if !e.accountWithinLimits(PlayerAccount, true) {
-		e.isOver = true
-		eq, _ := e.equity(player)
-		if eq <= 0 {
-			e.reason = Insolvent
-		} else {
-			e.reason = MarginBreach
-		}
-		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
-	} else if e.cfg.NumTurns > 0 && e.turn >= e.cfg.NumTurns {
-		e.isOver = true
-		e.reason = TurnsComplete
-		*events = append(*events, e.emit(Event{Type: "game_ended", Reason: e.reason}))
+	if terminal := e.evaluatePlayerMaintenance(); terminal != nil {
+		*events = append(*events, *terminal)
+	} else if terminal := e.completeTurnsIfDue(); terminal != nil {
+		*events = append(*events, *terminal)
 	}
 	return s, nil
+}
+
+func (e *Engine) nextLegacyMark() (fixed.Price, error) {
+	move := e.cfg.MinMoveBps
+	if e.cfg.MaxMoveBps > e.cfg.MinMoveBps {
+		move += e.rng.Int64N(e.cfg.MaxMoveBps - e.cfg.MinMoveBps + 1)
+	}
+	nextMark, err := fixed.ScalePrice(e.mark, 10_000+move, 10_000)
+	if err != nil || !nextMark.Positive() {
+		return 0, errors.New("mark movement produced invalid price")
+	}
+	return nextMark, nil
+}
+
+func (e *Engine) applyMark(nextMark fixed.Price, includePreviousMark bool) Event {
+	previous := e.mark
+	e.mark = nextMark
+	event := Event{Type: "mark_updated", Mark: e.mark, Message: fmt.Sprintf("previous=%s", previous)}
+	if includePreviousMark {
+		event.PreviousMark = previous
+	}
+	return e.emit(event)
+}
+
+func (e *Engine) evaluatePlayerMaintenance() *Event {
+	reason, breached := e.playerMaintenanceReason()
+	if !breached {
+		return nil
+	}
+	event := e.endSession(reason)
+	return &event
+}
+
+func (e *Engine) playerMaintenanceReason() (EndReason, bool) {
+	if e.accountWithinLimits(PlayerAccount, true) {
+		return NotOver, false
+	}
+	reason := MarginBreach
+	equity, _ := e.equity(e.accounts[PlayerAccount])
+	if equity <= 0 {
+		reason = Insolvent
+	}
+	return reason, true
+}
+
+func (e *Engine) endRealTimeOnMaintenanceBreach() ([]Event, error) {
+	reason, breached := e.playerMaintenanceReason()
+	if !breached {
+		return nil, nil
+	}
+	events := e.cancelAccountOrders(PlayerAccount)
+	if err := e.reconcileReservations(); err != nil {
+		return nil, err
+	}
+	events = append(events, e.endSession(reason))
+	return events, nil
+}
+
+func (e *Engine) completeTurnsIfDue() *Event {
+	if e.cfg.NumTurns <= 0 || e.turn < e.cfg.NumTurns {
+		return nil
+	}
+	event := e.endSession(TurnsComplete)
+	return &event
+}
+
+func (e *Engine) endSession(reason EndReason) Event {
+	e.isOver = true
+	e.reason = reason
+	return e.emit(Event{Type: "game_ended", Reason: reason})
 }
 
 func (e *Engine) nextMarkV2() (fixed.Price, error) {
@@ -1214,6 +1503,27 @@ func addFlowTrade(summary *Summary, trade Trade) error {
 		}
 	}
 	return nil
+}
+
+func addPlayerTrade(summary *Summary, trade Trade) error {
+	if !isPlayerTrade(trade) {
+		return nil
+	}
+	var err error
+	summary.UnitsTraded, err = fixed.AddQty(summary.UnitsTraded, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	notional, err := fixed.Notional(trade.Price, trade.Quantity)
+	if err != nil {
+		return err
+	}
+	if trade.BuyerID == PlayerAccount {
+		summary.NetFillCash, err = fixed.SubMoney(summary.NetFillCash, notional)
+	} else {
+		summary.NetFillCash, err = fixed.AddMoney(summary.NetFillCash, notional)
+	}
+	return err
 }
 
 func addLegacyFlowTrade(summary *Summary, trade Trade) error {
@@ -1309,25 +1619,6 @@ func markLifecycleOrderInformed(events []Event, orderID uint64, informed bool) {
 			events[i].Order.Informed = true
 		}
 	}
-}
-
-func (e *Engine) flowLimit(side Side) (fixed.Price, error) {
-	slip := int64(0)
-	if e.cfg.MaxFlowSlippageBps > 0 {
-		slip = e.rng.Int64N(e.cfg.MaxFlowSlippageBps + 1)
-	}
-	factor := int64(10_000) + slip
-	if side == Sell {
-		factor = 10_000 - slip
-	}
-	p, err := fixed.ScalePrice(e.mark, factor, 10_000)
-	if err != nil {
-		return 0, err
-	}
-	if p < 1 {
-		return 1, nil
-	}
-	return p, nil
 }
 
 func (e *Engine) newOrder(accountID string, side Side, price fixed.Price, qty fixed.Qty, tif TimeInForce) *Order {

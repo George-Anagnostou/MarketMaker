@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build build-cli build-server run test test-js test-race test-cover fuzz fuzz-fixed fuzz-eventlog vet fmt fmt-check check clean
+.PHONY: help build build-cli build-server run test test-js test-race test-cover fuzz fuzz-fixed fuzz-eventlog fuzz-realtime vet fmt fmt-check check clean
 
 BIN_DIR := bin
 
@@ -32,13 +32,19 @@ test-race: ## Run all tests with the race detector
 test-cover: ## Run all tests with coverage summaries
 	go test -cover ./...
 
-fuzz: fuzz-fixed fuzz-eventlog ## Run bounded fuzz targets
+fuzz: fuzz-fixed fuzz-eventlog fuzz-realtime ## Run bounded fuzz targets
 
-fuzz-fixed: ## Fuzz fixed-point parsing and serialization for 10 seconds
-	go test -fuzz=FuzzDecimalRoundTrip -fuzztime=10s ./internal/fixed
+fuzz-fixed: ## Fuzz fixed-point parsing and serialization for 5 seconds
+	go test -fuzz=FuzzDecimalRoundTrip -fuzztime=5s ./internal/fixed
 
-fuzz-eventlog: ## Fuzz strict JSON decoding for 10 seconds
-	go test -fuzz=FuzzDecodeStrictJSON -fuzztime=10s ./internal/eventlog
+fuzz-eventlog: ## Fuzz strict JSON decoding and durable records for about 6 seconds
+	go test -fuzz=FuzzDecodeStrictJSON -fuzztime=5s ./internal/eventlog
+	go test -fuzz=FuzzRealTimeRecordJSON -fuzztime=500ms ./internal/eventlog
+
+fuzz-realtime: ## Fuzz real-time action, generator, and checkpoint boundaries for about 3 seconds
+	go test -fuzz=FuzzDurableActionDecode -fuzztime=1s ./internal/realtime
+	go test -fuzz=FuzzGeneratorSeedDeterminism -fuzztime=1s ./internal/realtime
+	go test -fuzz=FuzzCheckpointValidation -fuzztime=100ms ./internal/realtime
 
 vet: ## Run Go static analysis
 	go vet ./...

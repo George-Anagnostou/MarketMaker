@@ -1,6 +1,9 @@
 package scenario
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"math"
 	"reflect"
 	"strings"
@@ -8,7 +11,53 @@ import (
 
 	"market-maker/internal/exchange"
 	"market-maker/internal/fixed"
+	"market-maker/internal/game"
 )
+
+func TestTurnBasedScenarioGoldenResults(t *testing.T) {
+	want := map[string]string{
+		"first-spread-v1":       "e9bbe6e31cad7af6cd41f8626e38217e98c04d82489f17e954203a46d6c76a02",
+		"inventory-pressure-v1": "511582a87427e491ef2a11e27eaec5bfabb3d1226b0bb203b316eb8fbee6ad33",
+		"volatility-shock-v1":   "819ce8080733583826e83ddc4523b45ffcf06c1f09b0867f498ef7b26e418d8b",
+		"volatility-shock-v2":   "e06f2ca8fe2b8db9d89a384e281d7428d8f075422b4c43395f63e4548024b68d",
+	}
+	for _, snapshot := range List() {
+		definition, ok := Get(snapshot.ID)
+		if !ok {
+			t.Fatalf("missing scenario %q", snapshot.ID)
+		}
+		engine, err := exchange.New(definition.Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := make([]exchange.Result, 0, definition.Config.NumTurns)
+		for !engine.State().IsOver {
+			mark := engine.State().Mark
+			bid, err := fixed.ScalePrice(mark, 9_950, 10_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ask, err := fixed.ScalePrice(mark, 10_050, 10_000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := engine.SubmitQuote(bid, ask)
+			if err != nil {
+				t.Fatal(err)
+			}
+			results = append(results, result)
+		}
+		encoded, err := json.Marshal(results)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(encoded)
+		got := hex.EncodeToString(digest[:])
+		if got != want[snapshot.ID] {
+			t.Errorf("%s golden digest = %s, want %s", snapshot.ID, got, want[snapshot.ID])
+		}
+	}
+}
 
 func TestCatalogIsValidAndStable(t *testing.T) {
 	if err := ValidateCatalog(); err != nil {
@@ -23,6 +72,24 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	}
 	if first.Revision != "2" || len(first.Snapshot().Tutorial) != 4 || first.Snapshot().Reflection == "" || first.Snapshot().ScorecardKind != "matched_volume" {
 		t.Fatalf("first tutorial=%+v", first.Snapshot().Tutorial)
+	}
+	wantRealTime := &RealTimeConfig{
+		Revision:                    "1",
+		GeneratorVersion:            game.GeneratorVersion,
+		DurationMilliseconds:        90_000,
+		CountdownMilliseconds:       3_000,
+		DisconnectGraceMilliseconds: 5_000,
+		QuoteQuantity:               fixed.Qty(100_000),
+		CustomerCadence:             IntervalRange{MinMilliseconds: 1_500, MaxMilliseconds: 3_000},
+		MarkCadence:                 IntervalRange{MinMilliseconds: 5_000, MaxMilliseconds: 8_000},
+		CarryCadenceMilliseconds:    10_000,
+		CarryPerUnit:                fixed.Price(10_000),
+		CustomerSeedDomain:          "first-spread-v1/realtime/customer/v1",
+		MarkSeedDomain:              "first-spread-v1/realtime/mark/v1",
+		InformedSeedDomain:          "first-spread-v1/realtime/informed/v1",
+	}
+	if !reflect.DeepEqual(first.RealTime, wantRealTime) || !reflect.DeepEqual(first.Snapshot().Modes, []game.PlayMode{game.PlayModeTurnBased, game.PlayModeRealTime}) {
+		t.Fatalf("first real-time config=%+v modes=%v", first.RealTime, first.Snapshot().Modes)
 	}
 	inventory, ok := Get("inventory-pressure-v1")
 	if !ok || inventory.Revision != "2" || len(inventory.Snapshot().Tutorial) != 5 || inventory.Snapshot().Reflection == "" || inventory.Snapshot().ScorecardKind != "peak_inventory" {
@@ -61,6 +128,11 @@ func TestCatalogIsValidAndStable(t *testing.T) {
 	if !reflect.DeepEqual(informed.Config, wantInformedConfig) {
 		t.Fatalf("informed config=%+v", informed.Config)
 	}
+	for _, definition := range []Definition{inventory, volatility, informed} {
+		if definition.RealTime != nil || !reflect.DeepEqual(definition.Snapshot().Modes, []game.PlayMode{game.PlayModeTurnBased}) {
+			t.Fatalf("unexpected real-time support for %s", definition.ID)
+		}
+	}
 	tutorialText := informed.Briefing
 	for _, step := range informed.Tutorial {
 		tutorialText += " " + step.Body
@@ -84,16 +156,71 @@ func TestCatalogTutorialsAreCloned(t *testing.T) {
 	}
 	definition.Tutorial[0].Title = "mutated"
 	definition.Tutorial = definition.Tutorial[:1]
+	definition.RealTime.DurationMilliseconds = 1
 
 	fresh, ok := Get("first-spread-v1")
-	if !ok || len(fresh.Tutorial) != 4 || fresh.Tutorial[0].Title == "mutated" {
+	if !ok || len(fresh.Tutorial) != 4 || fresh.Tutorial[0].Title == "mutated" || fresh.RealTime.DurationMilliseconds != 90_000 {
 		t.Fatalf("catalog was mutated: %+v", fresh.Tutorial)
 	}
 
 	snapshot := fresh.Snapshot()
 	snapshot.Tutorial[0].Title = "mutated snapshot"
-	if fresh.Tutorial[0].Title == "mutated snapshot" {
-		t.Fatalf("snapshot aliases definition tutorial: %+v", fresh.Tutorial)
+	snapshot.Modes[0] = game.PlayModeRealTime
+	snapshot.RealTime.DurationMilliseconds = 1
+	if fresh.Tutorial[0].Title == "mutated snapshot" || fresh.RealTime.DurationMilliseconds != 90_000 || fresh.Snapshot().Modes[0] != game.PlayModeTurnBased {
+		t.Fatalf("snapshot aliases definition: %+v", fresh)
+	}
+}
+
+func TestRealTimeConfigValidation(t *testing.T) {
+	definition, ok := Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	valid := *definition.RealTime
+	tests := map[string]func(*RealTimeConfig){
+		"revision":          func(config *RealTimeConfig) { config.Revision = "" },
+		"generator version": func(config *RealTimeConfig) { config.GeneratorVersion++ },
+		"duration":          func(config *RealTimeConfig) { config.DurationMilliseconds = 0 },
+		"countdown":         func(config *RealTimeConfig) { config.CountdownMilliseconds = 0 },
+		"disconnect grace":  func(config *RealTimeConfig) { config.DisconnectGraceMilliseconds = 0 },
+		"customer cadence": func(config *RealTimeConfig) {
+			config.CustomerCadence.MinMilliseconds = config.CustomerCadence.MaxMilliseconds + 1
+		},
+		"mark cadence":      func(config *RealTimeConfig) { config.MarkCadence.MaxMilliseconds = config.DurationMilliseconds + 1 },
+		"carry cadence":     func(config *RealTimeConfig) { config.CarryCadenceMilliseconds = 0 },
+		"quote quantity":    func(config *RealTimeConfig) { config.QuoteQuantity = definition.Config.MaxOrderQty + 1 },
+		"negative carry":    func(config *RealTimeConfig) { config.CarryPerUnit = -1 },
+		"customer domain":   func(config *RealTimeConfig) { config.CustomerSeedDomain = "" },
+		"duplicate domains": func(config *RealTimeConfig) { config.CustomerSeedDomain = config.MarkSeedDomain },
+		"informed domain":   func(config *RealTimeConfig) { config.InformedSeedDomain = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := valid
+			mutate(&config)
+			if err := ValidateRealTimeConfig(definition.Config, &config); err == nil {
+				t.Fatal("invalid real-time config accepted")
+			}
+		})
+	}
+	if err := ValidateRealTimeConfig(definition.Config, nil); err != nil {
+		t.Fatalf("nil real-time config rejected: %v", err)
+	}
+}
+
+func TestLegacySnapshotJSONRoundTripOmitsRealTimeFields(t *testing.T) {
+	const legacy = `{"id":"legacy","revision":"1","title":"Legacy","briefing":"Brief","objective":"Objective","turns":3}`
+	var snapshot Snapshot
+	if err := json.Unmarshal([]byte(legacy), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != legacy {
+		t.Fatalf("legacy snapshot changed: %s", encoded)
 	}
 }
 
