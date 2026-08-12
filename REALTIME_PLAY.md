@@ -2,7 +2,7 @@
 
 ## Status
 
-This document is the proposed specification and implementation roadmap for real-time play. It is intentionally a design artifact, not an implementation. Work should pause for review before the first engine change.
+This document is the product specification and implementation roadmap for real-time play. The current branch implements the internal deterministic runtime, durable lifecycle log, replay, recovery, and shutdown foundations. Public real-time commands, SSE, and browser play remain explicitly deferred to Phase 5 and later.
 
 ## Product Direction
 
@@ -395,12 +395,12 @@ Exit criterion: a headless 90-second First Spread trading day runs under a manua
 
 ### Phase 4: Durable Real-Time Log And Read Models
 
-1. Introduce the new metadata/log schema and checksum domain.
-2. Persist logical time, source, lifecycle, schedule progress, results, and ledger entries.
-3. Build state, quote, depth, tape, chart, and P&L projections.
-4. Benchmark fsync pacing, file growth, and recovery.
+1. Introduce the new metadata/log schema and checksum domain. **Complete.**
+2. Persist logical time, source, lifecycle, schedule progress, results, and ledger entries. **Complete.**
+3. Build state, quote, depth, tape, chart, and P&L projections. **Deferred to the public API/browser slices.**
+4. Benchmark fsync pacing, file growth, and recovery. **Deferred to hardening.**
 
-Exit criterion: interruption and replay tests pass at every action boundary within target budgets.
+Exit criterion: interruption and replay tests pass at every implemented action boundary. The runtime is internally playable under injected clocks; it is not yet exposed as a public real-time API.
 
 ### Phase 5: HTTP Commands And SSE
 

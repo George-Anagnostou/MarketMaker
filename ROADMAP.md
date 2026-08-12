@@ -2,6 +2,10 @@
 
 ## Current Status
 
+The real-time branch now contains an internal deterministic runtime alongside
+the existing turn-based product. It is not yet a public real-time venue: HTTP
+real-time commands and SSE remain deferred to the next phase.
+
 The project now has a coherent local exchange foundation:
 
 - A fixed-point, deterministic, single-instrument CLOB with maker-price execution, price-time priority, partial fills, IOC/GTC behavior, self-trade prevention, and explicit order IDs.
@@ -17,7 +21,7 @@ This is a sound simulation kernel, not yet a shared real-time venue. Known const
 
 - The HTTP scenario API intentionally exposes only player quote/quit commands until authenticated account ownership exists. The venue supports multi-account order primitives internally.
 - The book uses deterministic price levels and FIFO queues. It is correct for a single instrument, but it still needs per-instrument sharding and performance profiling before high order counts.
-- Time advances when a player submits a quote. There is no independent market clock, latency model, or scheduled event queue.
+- Turn-based time advances when a player submits a quote. The internal real-time mode has an independent sequencer and scheduled event queue, but it is not yet exposed through the public API.
 - JSONL storage is single-process and local. New games use atomic directory publication and schema-3 metadata-to-record binding; schema-1 and schema-2 games remain readable and appendable. It still has no compaction snapshots, cross-process lock, or PostgreSQL transaction layer.
 - Risk has a balanced in-memory journal and conservative order-entry checks, but still lacks collateral/borrow models, forced liquidation, and kill switches.
 - The browser restores its durable turn audit, session path, latest coaching, and authoritative P&L attribution after refresh. It validates API envelopes before rendering and pins paginated audit hydration to the authoritative event boundary, but it has no charting or offline replay export.

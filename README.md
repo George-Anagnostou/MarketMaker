@@ -68,6 +68,8 @@ Execution edge values player fills against the opening mark, inventory mark P&L 
 
 All mutating v2 requests are versioned and idempotent. IDs are UUIDs.
 
+The public command endpoint currently supports the turn-based mode only. Real-time games can be created and recovered as an internal foundation, but their start, quote, pause, resume, and quit commands remain deferred until the real-time HTTP/SSE slice is implemented.
+
 ```text
 POST /api/v2/games
 GET  /api/v2/scenarios
