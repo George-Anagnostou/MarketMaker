@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +30,174 @@ const testOtherGameID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 const testCreateID = "22222222-2222-4222-8222-222222222222"
 const testQuoteID = "33333333-3333-4333-8333-333333333333"
 const testQuitID = "44444444-4444-4444-8444-444444444444"
+
+type serverManualClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers map[*serverManualTimer]struct{}
+}
+
+type serverManualTimer struct {
+	clock   *serverManualClock
+	due     time.Time
+	channel chan time.Time
+	stopped bool
+	fired   bool
+}
+
+func newServerManualClock() *serverManualClock {
+	return &serverManualClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), timers: make(map[*serverManualTimer]struct{})}
+}
+
+func (c *serverManualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *serverManualClock) NewTimer(delay time.Duration) realtime.Timer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &serverManualTimer{clock: c, due: c.now.Add(delay), channel: make(chan time.Time, 1)}
+	c.timers[timer] = struct{}{}
+	if delay <= 0 {
+		timer.fired = true
+		timer.channel <- c.now
+	}
+	return timer
+}
+
+func (c *serverManualClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if delta < 0 {
+		panic("manual clock cannot move backward")
+	}
+	c.now = c.now.Add(delta)
+	for timer := range c.timers {
+		if !timer.stopped && !timer.fired && !timer.due.After(c.now) {
+			timer.fired = true
+			timer.channel <- c.now
+		}
+	}
+}
+
+func (t *serverManualTimer) C() <-chan time.Time { return t.channel }
+
+func (t *serverManualTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	if t.stopped || t.fired {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func installManualSequencer(service *exchangeService, clock *serverManualClock, calls *int, observed *realtime.Config) {
+	service.newSequencer = func(config realtime.Config) (*realtime.Sequencer, error) {
+		(*calls)++
+		config.Clock = clock
+		if observed != nil {
+			*observed = config
+		}
+		return realtime.NewConfigured(config)
+	}
+}
+
+func waitForRealTime(t *testing.T, entry *exchangeEntry, condition func(*exchangeEntry) bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		entry.mu.Lock()
+		ready := condition(entry)
+		entry.mu.Unlock()
+		if ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for real-time state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func closeRealTimeSequencer(t *testing.T, entry *exchangeEntry) {
+	t.Helper()
+	entry.mu.Lock()
+	sequencer := entry.sequencer
+	entry.mu.Unlock()
+	if sequencer == nil {
+		return
+	}
+	snapshot, err := sequencer.Snapshot(t.Context())
+	if err == nil && (snapshot.Status == realtime.StatusRunning || snapshot.Status == realtime.StatusCountdown) {
+		_, _ = entry.systemPauseRealTime(t.Context(), fmt.Sprintf("system/test_pause/%d", snapshot.Sequence), realtime.PauseReasonShutdown)
+	}
+	_, _ = sequencer.Shutdown(t.Context())
+}
+
+func TestExchangeServiceShutdownDurablyPausesRunningGame(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(3 * time.Second)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	clock.Advance(time.Second)
+	if err := service.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Shutdown(t.Context()); err != nil {
+		t.Fatalf("idempotent shutdown: %v", err)
+	}
+	_, records, err := eventlog.Open(root, testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := records[len(records)-1]
+	action, err := last.Action.Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, ok := action.Payload.(realtime.PauseSessionPayload)
+	if !ok || action.Source != realtime.SourceSystem || payload.Reason != realtime.PauseReasonShutdown || last.Lifecycle != game.LifecyclePaused || last.ElapsedNanoseconds != int64(time.Second) {
+		t.Fatalf("shutdown record=%+v action=%+v", last, action)
+	}
+}
+
+func TestExchangeServiceShutdownRetriesAfterCancelledContext(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.ensureRealTimeSequencer(); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := service.Shutdown(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled shutdown error=%v", err)
+	}
+	if service.shutdownDone {
+		t.Fatal("failed shutdown was latched as complete")
+	}
+	if err := service.Shutdown(t.Context()); err != nil {
+		t.Fatalf("retried shutdown: %v", err)
+	}
+}
 
 func v2Server(root string) *httptest.Server {
 	svc := newExchangeService(root)
@@ -185,6 +355,251 @@ func TestV2CreatesAndRecoversRealTimePreparingGame(t *testing.T) {
 	}
 }
 
+func TestRealTimeSequencerIsLazyAndOrdersCountdown(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	entry, created, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil || !created || calls != 0 || entry.sequencer != nil {
+		t.Fatalf("create created=%v calls=%d sequencer=%v err=%v", created, calls, entry.sequencer, err)
+	}
+	defer closeRealTimeSequencer(t, entry)
+
+	start, err := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000))
+	if err != nil || start.Sequence != 1 || calls != 1 {
+		t.Fatalf("start=%+v calls=%d err=%v", start, calls, err)
+	}
+	if replayed, replayErr := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); replayErr != nil || !reflect.DeepEqual(replayed, start) || calls != 1 {
+		t.Fatalf("replayed start=%+v calls=%d err=%v", replayed, calls, replayErr)
+	}
+	countdown := time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond
+	clock.Advance(countdown - time.Nanosecond)
+	time.Sleep(time.Millisecond)
+	entry.mu.Lock()
+	recordsBeforeDeadline := len(entry.commands)
+	lifecycleBeforeDeadline := entry.realTime.Lifecycle
+	entry.mu.Unlock()
+	if recordsBeforeDeadline != 1 || lifecycleBeforeDeadline != game.LifecycleCountdown {
+		t.Fatalf("before deadline records=%d lifecycle=%s", recordsBeforeDeadline, lifecycleBeforeDeadline)
+	}
+	clock.Advance(time.Nanosecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	entry.mu.Lock()
+	startRecord := entry.commands["start"]
+	countdownRecord := entry.commands["system/countdown_complete/start"]
+	recordCount := len(entry.commands)
+	entry.mu.Unlock()
+	if recordCount != 2 || startRecord.Version != 1 || startRecord.Lifecycle != game.LifecycleCountdown || countdownRecord.Version != 2 || countdownRecord.ElapsedNanoseconds != 0 || countdownRecord.Lifecycle != game.LifecycleRunning {
+		t.Fatalf("records=%d start=%+v countdown=%+v", recordCount, startRecord, countdownRecord)
+	}
+}
+
+func TestRealTimePauseResumeUsesLogicalTimeAndRunsDueWorkFirst(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRealTimeSequencer(t, entry)
+	if _, err := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	next, ok, err := entry.generator.Next()
+	if err != nil || !ok {
+		t.Fatalf("next=%+v ok=%v err=%v", next, ok, err)
+	}
+	clock.Advance(next.Due)
+	pause, err := entry.pauseRealTime(t.Context(), "pause")
+	if err != nil || pause.Elapsed != next.Due {
+		t.Fatalf("pause=%+v err=%v", pause, err)
+	}
+	entry.mu.Lock()
+	generated := entry.commands[next.Action.ID]
+	pauseRecord := entry.commands["pause"]
+	recordsWhilePaused := len(entry.commands)
+	entry.mu.Unlock()
+	if generated.Version == 0 || generated.Version >= pauseRecord.Version || pauseRecord.ElapsedNanoseconds != int64(next.Due) {
+		t.Fatalf("generated=%+v pause=%+v", generated, pauseRecord)
+	}
+	clock.Advance(time.Hour)
+	time.Sleep(time.Millisecond)
+	entry.mu.Lock()
+	if len(entry.commands) != recordsWhilePaused {
+		entry.mu.Unlock()
+		t.Fatal("paused sequencer executed market activity")
+	}
+	entry.mu.Unlock()
+	resume, err := entry.resumeRealTime(t.Context(), "resume")
+	if err != nil || resume.Elapsed != next.Due {
+		t.Fatalf("resume=%+v err=%v", resume, err)
+	}
+	if _, err := entry.systemPauseRealTime(t.Context(), "system/pause_after_resume", realtime.PauseReasonShutdown); err != nil {
+		t.Fatal(err)
+	}
+	entry.mu.Lock()
+	finalPause := entry.commands["system/pause_after_resume"]
+	entry.mu.Unlock()
+	if finalPause.ElapsedNanoseconds != int64(next.Due) {
+		t.Fatalf("logical time advanced during pause: %+v", finalPause)
+	}
+}
+
+func TestRealTimeColdLoadNormalizesActiveLifecycle(t *testing.T) {
+	for _, lifecycle := range []game.LifecycleState{game.LifecycleCountdown, game.LifecycleRunning} {
+		t.Run(string(lifecycle), func(t *testing.T) {
+			root := t.TempDir()
+			creator := newExchangeService(root)
+			creator.newSeed = func() (uint64, error) { return 99, nil }
+			entry, _, err := creator.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+			if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
+				t.Fatalf("start=%+v", outcome)
+			}
+			wantElapsed := time.Duration(0)
+			if lifecycle == game.LifecycleRunning {
+				countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+				if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
+					t.Fatalf("countdown=%+v", outcome)
+				}
+				wantElapsed = time.Millisecond
+				quote := realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(994_000), Ask: fixed.Price(1_006_000)}}
+				if outcome := entry.executeRealTimeAction(quote, wantElapsed); outcome.Disposition != realtime.DispositionContinue {
+					t.Fatalf("quote=%+v", outcome)
+				}
+			}
+			loader := newExchangeService(root)
+			calls := 0
+			installManualSequencer(loader, newServerManualClock(), &calls, nil)
+			loaded, err := loader.load(testGameID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.realTime.Lifecycle != game.LifecyclePaused || loaded.sequencer != nil || calls != 0 {
+				t.Fatalf("loaded lifecycle=%s sequencer=%v calls=%d", loaded.realTime.Lifecycle, loaded.sequencer, calls)
+			}
+			_, records, err := eventlog.Open(root, testGameID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := records[len(records)-1]
+			if last.Action.Kind != realtime.ActionPauseSession || last.Action.Source != realtime.SourceSystem || last.Lifecycle != game.LifecyclePaused || last.ElapsedNanoseconds != int64(wantElapsed) || last.Action.ID != fmt.Sprintf("system/recovery_pause/%d", len(records)-1) {
+				t.Fatalf("recovery record=%+v", last)
+			}
+		})
+	}
+}
+
+func TestRealTimeRestartPausedRestoresExactGeneratorCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	creator := newExchangeService(root)
+	creator.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	creatorCalls := 0
+	installManualSequencer(creator, clock, &creatorCalls, nil)
+	entry, _, err := creator.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	first, ok, err := entry.generator.Next()
+	if err != nil || !ok {
+		t.Fatalf("first=%+v ok=%v err=%v", first, ok, err)
+	}
+	clock.Advance(first.Due)
+	pauseExecution, err := entry.pauseRealTime(t.Context(), "pause")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNext, ok, err := entry.generator.Next()
+	if err != nil || !ok {
+		t.Fatalf("next=%+v ok=%v err=%v", wantNext, ok, err)
+	}
+	closeRealTimeSequencer(t, entry)
+
+	restarted := newExchangeService(root)
+	restartClock := newServerManualClock()
+	restartCalls := 0
+	var checkpoint realtime.Checkpoint
+	var restoredNext realtime.ScheduledAction
+	restarted.newSequencer = func(config realtime.Config) (*realtime.Sequencer, error) {
+		restartCalls++
+		checkpoint = config.Checkpoint
+		restoredNext, _, err = config.Schedule.Next()
+		if err != nil {
+			return nil, err
+		}
+		config.Clock = restartClock
+		return realtime.NewConfigured(config)
+	}
+	loaded, err := restarted.load(testGameID)
+	if err != nil || restartCalls != 0 || loaded.realTime.Lifecycle != game.LifecyclePaused {
+		t.Fatalf("load lifecycle=%s calls=%d err=%v", loaded.realTime.Lifecycle, restartCalls, err)
+	}
+	defer closeRealTimeSequencer(t, loaded)
+	replayedPause, err := loaded.pauseRealTime(t.Context(), "pause")
+	if err != nil || !reflect.DeepEqual(replayedPause, pauseExecution) || restartCalls != 1 {
+		t.Fatalf("pause replay=%+v calls=%d err=%v", replayedPause, restartCalls, err)
+	}
+	if !reflect.DeepEqual(restoredNext, wantNext) || checkpoint.Status != realtime.StatusPaused || checkpoint.Elapsed != first.Due || checkpoint.NextScheduled != 1 || checkpoint.Sequence != uint64(len(loaded.commands)) {
+		t.Fatalf("next=%+v want=%+v checkpoint=%+v", restoredNext, wantNext, checkpoint)
+	}
+	resume, err := loaded.resumeRealTime(t.Context(), "resume")
+	if err != nil || resume.Elapsed != first.Due {
+		t.Fatalf("resume=%+v err=%v", resume, err)
+	}
+}
+
+func TestRealTimeCompletedReplaySurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	entry, _, err := service.createOrLoadMode(testGameID, testCreateID, "first-spread-v1", game.PlayModeRealTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	clock.Advance(time.Duration(entry.scenario.RealTime.DurationMilliseconds) * time.Millisecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleCompleted })
+	closeRealTimeSequencer(t, entry)
+
+	restarted := newExchangeService(root)
+	restartCalls := 0
+	var observed realtime.Config
+	installManualSequencer(restarted, newServerManualClock(), &restartCalls, &observed)
+	loaded, err := restarted.load(testGameID)
+	if err != nil || loaded.realTime.Lifecycle != game.LifecycleCompleted || restartCalls != 0 {
+		t.Fatalf("load lifecycle=%s calls=%d err=%v", loaded.realTime.Lifecycle, restartCalls, err)
+	}
+	defer closeRealTimeSequencer(t, loaded)
+	replayed, err := loaded.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000))
+	if err != nil || !reflect.DeepEqual(replayed, start) || restartCalls != 1 || observed.Checkpoint.Status != realtime.StatusCompleted || observed.Checkpoint.NextScheduled != loaded.replay.GeneratorCommitted {
+		t.Fatalf("replay=%+v start=%+v calls=%d checkpoint=%+v summary=%+v err=%v", replayed, start, restartCalls, observed.Checkpoint, loaded.replay, err)
+	}
+}
+
 func TestV2ValidatesAndScopesCreateMode(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -311,36 +726,31 @@ func TestRealTimeActionsAndRejectionsReplayExactly(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("create created=%v err=%v", created, err)
 	}
-	appendAction := func(t *testing.T, version uint64, elapsed time.Duration, action realtime.Action, result exchange.Result, rejection *eventlog.ActionRejection) {
-		t.Helper()
-		for index := range result.Events {
-			result.Events[index].CommandID = action.ID
-		}
-		durable, err := realtime.EncodeAction(action)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: version, Action: &durable, ElapsedNanoseconds: int64(elapsed), Result: result, Rejection: rejection}); err != nil {
-			t.Fatal(err)
-		}
+	start := realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("start=%+v", outcome)
+	}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("countdown=%+v", outcome)
 	}
 	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
-	quoteOutcome := entry.realtimeExec.Execute(quote, 0)
-	quoteResult := quoteOutcome.Result.(exchange.Result)
-	appendAction(t, 1, 0, quote, quoteResult, nil)
+	if outcome := entry.executeRealTimeAction(quote, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("quote=%+v", outcome)
+	}
 	rejected := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000)}}
-	rejectedOutcome := entry.realtimeExec.Execute(rejected, 0)
+	rejectedOutcome := entry.executeRealTimeAction(rejected, 0)
 	if rejectedOutcome.Disposition != realtime.DispositionReject {
 		t.Fatalf("rejected outcome=%+v", rejectedOutcome)
 	}
-	appendAction(t, 2, 0, rejected, exchange.Result{State: entry.engine.State()}, &eventlog.ActionRejection{Code: "command_rejected", Message: rejectedOutcome.Err.Error()})
 	system, ok, err := entry.generator.Next()
 	if err != nil || !ok {
 		t.Fatalf("system=%+v ok=%v err=%v", system, ok, err)
 	}
-	systemOutcome := entry.realtimeExec.Execute(system.Action, system.Due)
-	systemResult := systemOutcome.Result.(exchange.Result)
-	appendAction(t, 3, system.Due, system.Action, systemResult, nil)
+	systemOutcome := entry.executeRealTimeAction(system.Action, system.Due)
+	if systemOutcome.Disposition == realtime.DispositionFail || systemOutcome.Disposition == realtime.DispositionReject {
+		t.Fatalf("system outcome=%+v", systemOutcome)
+	}
 	if err := entry.generator.Commit(system); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +768,7 @@ func TestRealTimeActionsAndRejectionsReplayExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 	gotNext, _, err := rebuilt.generator.Next()
-	if err != nil || !reflect.DeepEqual(rebuilt.engine.State(), entry.engine.State()) || !reflect.DeepEqual(gotNext, wantNext) || len(rebuilt.commands) != 3 {
+	if err != nil || !reflect.DeepEqual(rebuilt.engine.State(), entry.engine.State()) || !reflect.DeepEqual(gotNext, wantNext) || len(rebuilt.commands) != 5 || rebuilt.replay.Lifecycle != game.LifecycleRunning || rebuilt.replay.GeneratorCommitted != 1 {
 		t.Fatalf("rebuilt state=%+v next=%+v commands=%d err=%v", rebuilt.engine.State(), gotNext, len(rebuilt.commands), err)
 	}
 }
@@ -379,6 +789,14 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 			t.Fatalf("reserved action id %q outcome=%+v state=%+v", id, outcome, entry.engine.State())
 		}
 	}
+	start := realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("start=%+v", outcome)
+	}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("countdown=%+v", outcome)
+	}
 	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	accepted := entry.executeRealTimeAction(quote, 0)
 	if accepted.Disposition != realtime.DispositionContinue || accepted.Err != nil {
@@ -398,7 +816,7 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 		t.Fatalf("conflict=%+v", outcome)
 	}
 	_, records, err := eventlog.Open(root, testGameID)
-	if err != nil || len(records) != 2 || records[1].Rejection == nil {
+	if err != nil || len(records) != 4 || records[3].Rejection == nil {
 		t.Fatalf("records=%+v err=%v", records, err)
 	}
 
@@ -407,7 +825,7 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outcome := rebuilt.executeRealTimeAction(quote, time.Second); outcome.Disposition != realtime.DispositionContinue || !reflect.DeepEqual(outcome.Result, accepted.Result) {
+	if outcome := rebuilt.executeRealTimeAction(quote, time.Second); outcome.Disposition != realtime.DispositionContinue || !durableResultsEqual(outcome.Result.(exchange.Result), accepted.Result.(exchange.Result)) {
 		t.Fatalf("replayed acceptance=%+v", outcome)
 	}
 	if outcome := rebuilt.executeRealTimeAction(rejectedAction, time.Second); outcome.Disposition != realtime.DispositionReject || outcome.Err.Error() != rejected.Err.Error() {
@@ -423,23 +841,23 @@ func TestRealTimeRecoveryRetainsSystemActionAndTruncatesPartialSuffix(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	start := realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("start=%+v", outcome)
+	}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
+		t.Fatalf("countdown=%+v", outcome)
+	}
 	scheduled, ok, err := entry.generator.Next()
 	if err != nil || !ok {
 		t.Fatalf("next scheduled action=%+v ok=%v err=%v", scheduled, ok, err)
 	}
-	outcome := entry.realtimeExec.Execute(scheduled.Action, scheduled.Due)
-	result, ok := outcome.Result.(exchange.Result)
-	if !ok || outcome.Disposition == realtime.DispositionFail || outcome.Disposition == realtime.DispositionReject {
+	outcome := entry.executeRealTimeAction(scheduled.Action, scheduled.Due)
+	if outcome.Disposition == realtime.DispositionFail || outcome.Disposition == realtime.DispositionReject {
 		t.Fatalf("system outcome=%+v", outcome)
 	}
-	for index := range result.Events {
-		result.Events[index].CommandID = scheduled.Action.ID
-	}
-	durable, err := realtime.EncodeAction(scheduled.Action)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := entry.log.Append(eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: 1, Action: &durable, ElapsedNanoseconds: int64(scheduled.Due), Result: result}); err != nil {
+	if err := entry.generator.Commit(scheduled); err != nil {
 		t.Fatal(err)
 	}
 	eventsPath := filepath.Join(entry.log.Path(), "events.jsonl")
@@ -462,7 +880,7 @@ func TestRealTimeRecoveryRetainsSystemActionAndTruncatesPartialSuffix(t *testing
 		t.Fatal(err)
 	}
 	next, ok, err := entry.generator.Next()
-	if err != nil || !ok || next.Action.ID == scheduled.Action.ID || entry.generator.Snapshot().Committed != 1 || len(entry.commands) != 1 {
+	if err != nil || !ok || next.Action.ID == scheduled.Action.ID || entry.generator.Snapshot().Committed != 1 || len(entry.commands) != 3 {
 		t.Fatalf("recovered next=%+v ok=%v snapshot=%+v commands=%d err=%v", next, ok, entry.generator.Snapshot(), len(entry.commands), err)
 	}
 	data, err := os.ReadFile(eventsPath)

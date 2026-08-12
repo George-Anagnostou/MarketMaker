@@ -223,7 +223,13 @@ func TestServeDrainsInFlightRequest(t *testing.T) {
 	logs := &bytes.Buffer{}
 	serveDone := make(chan error, 1)
 	metrics := newMetrics()
-	go func() { serveDone <- serve(ctx, httpServer, listener, newJSONLogger(logs), metrics, time.Second) }()
+	runtimeShutdown := make(chan struct{})
+	go func() {
+		serveDone <- serve(ctx, httpServer, listener, newJSONLogger(logs), metrics, time.Second, func(context.Context) error {
+			close(runtimeShutdown)
+			return nil
+		})
+	}()
 	requestDone := make(chan error, 1)
 	go func() {
 		response, err := http.Get("http://" + listener.Addr().String())
@@ -244,12 +250,22 @@ func TestServeDrainsInFlightRequest(t *testing.T) {
 		t.Fatalf("server stopped before request drained: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
+	select {
+	case <-runtimeShutdown:
+		t.Fatal("runtime shut down before HTTP request drained")
+	default:
+	}
 	close(release)
 	if err := <-requestDone; err != nil {
 		t.Fatalf("in-flight request: %v", err)
 	}
 	if err := <-serveDone; err != nil {
 		t.Fatalf("serve: %v", err)
+	}
+	select {
+	case <-runtimeShutdown:
+	default:
+		t.Fatal("runtime shutdown was not called")
 	}
 	if !strings.Contains(logs.String(), `"event":"server_shutdown_started"`) || !strings.Contains(logs.String(), `"event":"server_stopped"`) {
 		t.Fatalf("missing shutdown lifecycle logs: %q", logs.String())
@@ -277,7 +293,7 @@ func TestServeLogsTimeoutWithoutForceClosingRequest(t *testing.T) {
 	serveDone := make(chan error, 1)
 	metrics := newMetrics()
 	go func() {
-		serveDone <- serve(ctx, httpServer, listener, newJSONLogger(logs), metrics, 10*time.Millisecond)
+		serveDone <- serve(ctx, httpServer, listener, newJSONLogger(logs), metrics, 10*time.Millisecond, nil)
 	}()
 	requestDone := make(chan error, 1)
 	go func() {

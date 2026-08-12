@@ -293,7 +293,7 @@ func routeTemplate(path string) string {
 	return "unmatched"
 }
 
-func serve(ctx context.Context, httpServer *http.Server, listener net.Listener, logger *jsonLogger, metrics *metrics, shutdownTimeout time.Duration) error {
+func serve(ctx context.Context, httpServer *http.Server, listener net.Listener, logger *jsonLogger, metrics *metrics, shutdownTimeout time.Duration, shutdownRuntime func(context.Context) error) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.Serve(listener) }()
 
@@ -307,16 +307,28 @@ func serve(ctx context.Context, httpServer *http.Server, listener net.Listener, 
 		logger.log("info", "server_shutdown_started", map[string]any{"timeout_ms": shutdownTimeout.Milliseconds()})
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		err := httpServer.Shutdown(shutdownCtx)
-		cancel()
-		metrics.observeShutdown(errors.Is(err, context.DeadlineExceeded))
 		if err != nil {
+			cancel()
+			metrics.observeShutdown(errors.Is(err, context.DeadlineExceeded))
 			logger.log("error", "server_shutdown_failed", map[string]any{"reason": "drain_failure"})
 			return err
 		}
 		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.log("error", "server_shutdown_failed", map[string]any{"reason": "serve_failure"})
+			cancel()
+			metrics.observeShutdown(false)
 			return err
 		}
+		if shutdownRuntime != nil {
+			if err := shutdownRuntime(shutdownCtx); err != nil {
+				cancel()
+				metrics.observeShutdown(errors.Is(err, context.DeadlineExceeded))
+				logger.log("error", "server_shutdown_failed", map[string]any{"reason": "runtime_failure"})
+				return err
+			}
+		}
+		cancel()
+		metrics.observeShutdown(false)
 		logger.log("info", "server_stopped", map[string]any{"reason": "shutdown"})
 		return nil
 	}
@@ -346,7 +358,7 @@ func main() {
 	srv.logger.log("info", "server_started", map[string]any{"address": httpServer.Addr})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := serve(ctx, httpServer, listener, srv.logger, srv.metrics, gracefulShutdownTimeout); err != nil {
+	if err := serve(ctx, httpServer, listener, srv.logger, srv.metrics, gracefulShutdownTimeout, srv.v2.Shutdown); err != nil {
 		srv.logger.log("error", "server_stopped", map[string]any{"reason": "shutdown_failure"})
 		os.Exit(1)
 	}

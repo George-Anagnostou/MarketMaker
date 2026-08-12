@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -35,16 +36,21 @@ var uuidPattern = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-
 
 type exchangeService struct {
 	mu             sync.Mutex
+	shutdownMu     sync.Mutex
+	shutdownDone   bool
+	shutdownErr    error
 	root           string
 	entries        map[string]*exchangeEntry
 	lookupScenario func(string) (scenario.Definition, bool)
 	newSeed        func() (uint64, error)
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
+	newSequencer   func(realtime.Config) (*realtime.Sequencer, error)
 }
 
 type exchangeEntry struct {
 	mu             sync.Mutex
+	sequencerMu    sync.Mutex
 	engine         *exchange.Engine
 	log            *eventlog.Log
 	commands       map[string]eventlog.Record
@@ -58,13 +64,16 @@ type exchangeEntry struct {
 	realTime       *realTimeState
 	generator      *realtime.Generator
 	realtimeExec   *realtime.ExchangeExecutor
+	replay         realTimeReplaySummary
+	sequencer      *realtime.Sequencer
+	newSequencer   func(realtime.Config) (*realtime.Sequencer, error)
 	storageFailed  bool
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
 }
 
 func newExchangeService(root string) *exchangeService {
-	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get, newSeed: randomSeed, syncLog: syncEventLog}
+	return &exchangeService{root: root, entries: make(map[string]*exchangeEntry), lookupScenario: scenario.Get, newSeed: randomSeed, syncLog: syncEventLog, newSequencer: realtime.NewConfigured}
 }
 
 func syncEventLog(log *eventlog.Log) error { return log.Sync() }
@@ -558,23 +567,45 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 		return realtime.Outcome{Disposition: realtime.DispositionFail, Err: err}
 	}
 	if prior, ok := entry.commands[action.ID]; ok {
-		if prior.Action == nil || !reflect.DeepEqual(*prior.Action, durable) {
-			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New("action id has a different payload")}
-		}
-		if prior.Rejection != nil {
-			return realtime.Outcome{Disposition: realtime.DispositionReject, Err: errors.New(prior.Rejection.Message)}
-		}
-		disposition := realtime.DispositionContinue
-		if prior.Result.State.IsOver {
-			disposition = realtime.DispositionComplete
-		}
-		return realtime.Outcome{Result: prior.Result, Disposition: disposition}
+		execution := replayRealTimeRecord(action, durable, prior)
+		return realtime.Outcome{Result: execution.Result, Disposition: execution.Disposition, Err: execution.Err}
 	}
-	outcome := entry.realtimeExec.Execute(action, elapsed)
+	previousLifecycle := entry.realTime.Lifecycle
+	outcome := realtime.Outcome{Result: exchange.Result{State: entry.engine.State()}, Disposition: realtime.DispositionContinue}
+	switch action.Kind {
+	case realtime.ActionStartSession:
+		payload, ok := action.Payload.(realtime.StartSessionPayload)
+		if !ok {
+			return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("start action has an invalid payload")}
+		}
+		outcome = entry.realtimeExec.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask}}, elapsed)
+	case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
+	default:
+		outcome = entry.realtimeExec.Execute(action, elapsed)
+	}
 	if outcome.Disposition == realtime.DispositionFail {
 		return outcome
 	}
-	record := eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: uint64(len(entry.commands) + 1), Action: &durable, ElapsedNanoseconds: int64(elapsed)}
+	lifecycle := previousLifecycle
+	switch action.Kind {
+	case realtime.ActionStartSession:
+		if outcome.Disposition != realtime.DispositionReject {
+			lifecycle = game.LifecycleCountdown
+		}
+	case realtime.ActionCountdownComplete:
+		lifecycle = game.LifecycleRunning
+	case realtime.ActionPauseSession:
+		lifecycle = game.LifecyclePaused
+	case realtime.ActionResumeSession:
+		lifecycle = game.LifecycleRunning
+	default:
+		if outcome.Disposition != realtime.DispositionReject {
+			if result, ok := outcome.Result.(exchange.Result); ok && result.State.IsOver {
+				lifecycle = game.LifecycleCompleted
+			}
+		}
+	}
+	record := eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: uint64(len(entry.commands) + 1), Action: &durable, ElapsedNanoseconds: int64(elapsed), Lifecycle: lifecycle}
 	if outcome.Disposition == realtime.DispositionReject {
 		record.Result = exchange.Result{State: entry.engine.State()}
 		record.Rejection = &eventlog.ActionRejection{Code: eventlog.RejectionCodeCommandRejected, Message: outcome.Err.Error()}
@@ -597,14 +628,205 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 	}
 	entry.metrics.observeEventLogAppend(appendOutcome, time.Since(appendStarted))
 	if err != nil {
-		if recoverErr := entry.recover(); recoverErr != nil {
-			entry.storageFailed = true
-		}
+		_ = entry.recover()
+		// Recovery may replace the generator while the current sequencer still
+		// owns the old one. Fence this process and require a clean reload.
+		entry.storageFailed = true
 		return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("real-time action was not committed")}
 	}
 	entry.commands[action.ID] = record
 	entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
+	entry.realTime.Lifecycle = lifecycle
+	entry.replay = realTimeReplaySummary{LastElapsed: elapsed, Lifecycle: lifecycle, DurableRecords: uint64(len(entry.commands)), GeneratorCommitted: entry.generator.Snapshot().Committed}
 	return outcome
+}
+
+func replayRealTimeRecord(action realtime.Action, durable realtime.DurableAction, record eventlog.Record) realtime.Execution {
+	canonical := action
+	if record.Action != nil {
+		if decoded, err := record.Action.Decode(); err == nil {
+			canonical = decoded
+		}
+	}
+	execution := realtime.Execution{Sequence: record.Version, Elapsed: time.Duration(record.ElapsedNanoseconds), Action: canonical, Result: record.Result, Disposition: realtime.DispositionContinue}
+	if record.Action == nil || !reflect.DeepEqual(*record.Action, durable) {
+		execution.Result = nil
+		execution.Disposition = realtime.DispositionReject
+		execution.Err = errors.New("action id has a different payload")
+	} else if record.Rejection != nil {
+		execution.Disposition = realtime.DispositionReject
+		execution.Err = errors.New(record.Rejection.Message)
+	} else if record.Lifecycle == game.LifecycleCompleted && action.Kind != realtime.ActionStartSession && action.Kind != realtime.ActionCountdownComplete && action.Kind != realtime.ActionPauseSession && action.Kind != realtime.ActionResumeSession {
+		execution.Disposition = realtime.DispositionComplete
+	}
+	return execution
+}
+
+func (entry *exchangeEntry) replayRealTimeAction(action realtime.Action) (realtime.Execution, bool) {
+	durable, err := realtime.EncodeAction(action)
+	if err != nil {
+		return realtime.Execution{}, false
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	record, ok := entry.commands[action.ID]
+	if !ok {
+		return realtime.Execution{}, false
+	}
+	return replayRealTimeRecord(action, durable, record), true
+}
+
+func (entry *exchangeEntry) ensureRealTimeSequencer() (*realtime.Sequencer, error) {
+	entry.sequencerMu.Lock()
+	defer entry.sequencerMu.Unlock()
+
+	entry.mu.Lock()
+	if entry.mode != game.PlayModeRealTime || entry.realTime == nil || entry.generator == nil || entry.realtimeExec == nil {
+		entry.mu.Unlock()
+		return nil, errors.New("game is not configured for real-time sequencing")
+	}
+	if entry.sequencer != nil {
+		sequencer := entry.sequencer
+		entry.mu.Unlock()
+		return sequencer, nil
+	}
+	checkpoint := realtime.Checkpoint{
+		Elapsed:       entry.replay.LastElapsed,
+		NextScheduled: entry.replay.GeneratorCommitted,
+		Sequence:      entry.replay.DurableRecords,
+	}
+	switch entry.realTime.Lifecycle {
+	case game.LifecyclePreparing:
+		checkpoint.Status = realtime.StatusPreparing
+	case game.LifecyclePaused:
+		checkpoint.Status = realtime.StatusPaused
+	case game.LifecycleCompleted:
+		checkpoint.Status = realtime.StatusCompleted
+	default:
+		err := fmt.Errorf("cannot restore active lifecycle %q", entry.realTime.Lifecycle)
+		entry.mu.Unlock()
+		return nil, err
+	}
+	factory := entry.newSequencer
+	if factory == nil {
+		factory = realtime.NewConfigured
+	}
+	countdown := time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond
+	generator := entry.generator
+	entry.mu.Unlock()
+
+	sequencer, err := factory(realtime.Config{
+		Schedule:     generator,
+		Executor:     entry.executeRealTimeAction,
+		ReplayLookup: entry.replayRealTimeAction,
+		Countdown:    countdown,
+		CountdownAction: func(start realtime.Action) realtime.Action {
+			return realtime.Action{ID: realtime.SystemActionIDPrefix + "countdown_complete/" + start.ID, Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+		},
+		Checkpoint:       checkpoint,
+		DurableLifecycle: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	entry.mu.Lock()
+	entry.sequencer = sequencer
+	entry.mu.Unlock()
+	return sequencer, nil
+}
+
+func (entry *exchangeEntry) startRealTime(ctx context.Context, id string, bid, ask fixed.Price) (realtime.Execution, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return realtime.Execution{}, err
+	}
+	return sequencer.StartAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: bid, Ask: ask}})
+}
+
+func (entry *exchangeEntry) updateRealTimeQuote(ctx context.Context, id string, bid, ask fixed.Price) (realtime.Execution, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return realtime.Execution{}, err
+	}
+	return sequencer.Submit(ctx, realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: bid, Ask: ask}})
+}
+
+func (entry *exchangeEntry) pauseRealTime(ctx context.Context, id string) (realtime.Execution, error) {
+	return entry.pauseRealTimeWithSource(ctx, id, realtime.SourceParticipant, realtime.PauseReasonPlayer)
+}
+
+func (entry *exchangeEntry) systemPauseRealTime(ctx context.Context, id string, reason realtime.PauseReason) (realtime.Execution, error) {
+	return entry.pauseRealTimeWithSource(ctx, id, realtime.SourceSystem, reason)
+}
+
+func (entry *exchangeEntry) pauseRealTimeWithSource(ctx context.Context, id string, source realtime.Source, reason realtime.PauseReason) (realtime.Execution, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return realtime.Execution{}, err
+	}
+	return sequencer.PauseAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionPauseSession, Source: source, Payload: realtime.PauseSessionPayload{Reason: reason}})
+}
+
+func (entry *exchangeEntry) resumeRealTime(ctx context.Context, id string) (realtime.Execution, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return realtime.Execution{}, err
+	}
+	return sequencer.ResumeAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionResumeSession, Source: realtime.SourceParticipant})
+}
+
+func (s *exchangeService) Shutdown(ctx context.Context) error {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	if s.shutdownDone {
+		return s.shutdownErr
+	}
+
+	s.mu.Lock()
+	entries := make([]*exchangeEntry, 0, len(s.entries))
+	for _, entry := range s.entries {
+		entries = append(entries, entry)
+	}
+	s.mu.Unlock()
+
+	var shutdownErr error
+	for _, entry := range entries {
+		entry.mu.Lock()
+		sequencer := entry.sequencer
+		entry.mu.Unlock()
+		if sequencer == nil {
+			continue
+		}
+		snapshot, err := sequencer.Snapshot(ctx)
+		if err != nil {
+			if errors.Is(err, realtime.ErrClosed) {
+				if _, closeErr := sequencer.Shutdown(ctx); closeErr != nil {
+					shutdownErr = errors.Join(shutdownErr, closeErr)
+				}
+				continue
+			}
+			shutdownErr = errors.Join(shutdownErr, err)
+			continue
+		}
+		if snapshot.Status == realtime.StatusRunning || snapshot.Status == realtime.StatusCountdown {
+			id := fmt.Sprintf("%sshutdown_pause/%d", realtime.SystemActionIDPrefix, snapshot.Sequence+1)
+			if _, err := entry.systemPauseRealTime(ctx, id, realtime.PauseReasonShutdown); err != nil {
+				latest, snapshotErr := sequencer.Snapshot(ctx)
+				if snapshotErr != nil || latest.Status != realtime.StatusCompleted {
+					shutdownErr = errors.Join(shutdownErr, err, snapshotErr)
+					continue
+				}
+			}
+		}
+		if _, err := sequencer.Shutdown(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+		}
+	}
+	if shutdownErr == nil {
+		s.shutdownDone = true
+	}
+	s.shutdownErr = shutdownErr
+	return shutdownErr
 }
 
 func canonicalUintQuery(query url.Values, name string) (uint64, bool, error) {
@@ -702,7 +924,7 @@ func (s *exchangeService) createOrLoadMode(id, createCommandID, scenarioID strin
 	if err != nil {
 		return nil, false, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, mode: mode, realTime: realTimeStateFromMeta(log.Meta()), syncLog: s.syncLog, metrics: s.metrics}
+	entry := &exchangeEntry{engine: engine, log: log, commands: make(map[string]eventlog.Record), startingEquity: engine.State().Equity, scenario: &snapshot, mode: mode, realTime: realTimeStateFromMeta(log.Meta()), syncLog: s.syncLog, metrics: s.metrics, newSequencer: s.newSequencer}
 	if mode == game.PlayModeRealTime {
 		entry.generator, entry.realtimeExec, err = newRealtimeRuntime(log.Meta(), engine)
 		if err != nil {
@@ -788,6 +1010,17 @@ func (s *exchangeService) loadLocked(id string) (*exchangeEntry, error) {
 	}
 	entry.syncLog = s.syncLog
 	entry.metrics = s.metrics
+	entry.newSequencer = s.newSequencer
+	if entry.mode == game.PlayModeRealTime && (entry.realTime.Lifecycle == game.LifecycleRunning || entry.realTime.Lifecycle == game.LifecycleCountdown) {
+		recoveryID := fmt.Sprintf("%srecovery_pause/%d", realtime.SystemActionIDPrefix, entry.replay.DurableRecords)
+		outcome := entry.executeRealTimeAction(realtime.Action{ID: recoveryID, Kind: realtime.ActionPauseSession, Source: realtime.SourceSystem, Payload: realtime.PauseSessionPayload{Reason: realtime.PauseReasonRecovery}}, entry.replay.LastElapsed)
+		if outcome.Disposition != realtime.DispositionContinue {
+			if outcome.Err != nil {
+				return nil, fmt.Errorf("persist real-time recovery pause: %w", outcome.Err)
+			}
+			return nil, errors.New("persist real-time recovery pause: action did not continue")
+		}
+	}
 	s.entries[id] = entry
 	return entry, nil
 }
@@ -823,6 +1056,7 @@ func (entry *exchangeEntry) recover() (err error) {
 	entry.realTime = rebuilt.realTime
 	entry.generator = rebuilt.generator
 	entry.realtimeExec = rebuilt.realtimeExec
+	entry.replay = rebuilt.replay
 	entry.storageFailed = false
 	return nil
 }
@@ -834,9 +1068,10 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	var commands map[string]eventlog.Record
 	var generator *realtime.Generator
 	var realtimeExec *realtime.ExchangeExecutor
+	var replay realTimeReplaySummary
 	var err error
 	if mode == game.PlayModeRealTime {
-		engine, generator, realtimeExec, commands, err = replayRealTimeRecords(meta, records)
+		engine, generator, realtimeExec, commands, replay, err = replayRealTimeRecords(meta, records)
 	} else {
 		engine, commands, err = replayRecords(meta.Config, records)
 	}
@@ -847,7 +1082,10 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	if err != nil {
 		return nil, err
 	}
-	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario, mode: mode, realTime: realTimeStateFromMeta(meta), generator: generator, realtimeExec: realtimeExec}
+	entry := &exchangeEntry{engine: engine, log: log, commands: commands, startingEquity: startingEquity, scenario: meta.Scenario, mode: mode, realTime: realTimeStateFromMeta(meta), generator: generator, realtimeExec: realtimeExec, replay: replay}
+	if mode == game.PlayModeRealTime {
+		entry.realTime.Lifecycle = replay.Lifecycle
+	}
 	for _, record := range records {
 		entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 		if record.Command.Type == exchange.CommandSubmitQuote {
@@ -939,59 +1177,88 @@ func newRealtimeRuntime(meta eventlog.Meta, engine *exchange.Engine) (*realtime.
 	return generator, executor, nil
 }
 
-func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exchange.Engine, *realtime.Generator, *realtime.ExchangeExecutor, map[string]eventlog.Record, error) {
+type realTimeReplaySummary struct {
+	LastElapsed        time.Duration
+	Lifecycle          game.LifecycleState
+	DurableRecords     uint64
+	GeneratorCommitted uint64
+}
+
+func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exchange.Engine, *realtime.Generator, *realtime.ExchangeExecutor, map[string]eventlog.Record, realTimeReplaySummary, error) {
 	engine, err := exchange.New(meta.Config)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, realTimeReplaySummary{}, err
 	}
 	generator, executor, err := newRealtimeRuntime(meta, engine)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, realTimeReplaySummary{}, err
 	}
 	actions := make(map[string]eventlog.Record, len(records))
 	lastElapsed := time.Duration(0)
+	lifecycle := game.LifecyclePreparing
+	if meta.RealTime != nil {
+		lifecycle = meta.RealTime.Lifecycle
+	}
 	for _, record := range records {
 		action, err := record.Action.Decode()
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("decode real-time action at record %d: %w", record.Version, err)
+			return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("decode real-time action at record %d: %w", record.Version, err)
 		}
 		elapsed := time.Duration(record.ElapsedNanoseconds)
 		if elapsed < lastElapsed {
-			return nil, nil, nil, nil, fmt.Errorf("real-time action moved backward at record %d", record.Version)
+			return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("real-time action moved backward at record %d", record.Version)
 		}
 		var scheduled realtime.ScheduledAction
-		if action.Source == realtime.SourceSystem {
+		generated := action.Kind == realtime.ActionCustomerArrival || action.Kind == realtime.ActionMarkMove || action.Kind == realtime.ActionCarryCharge || action.Kind == realtime.ActionTimeExpired
+		if generated {
 			var ok bool
 			scheduled, ok, err = generator.Next()
 			if err != nil || !ok || scheduled.Due != elapsed || !reflect.DeepEqual(scheduled.Action, action) {
-				return nil, nil, nil, nil, fmt.Errorf("system action does not match generator at record %d", record.Version)
+				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("system action does not match generator at record %d", record.Version)
 			}
-		} else if next, ok, nextErr := generator.Next(); nextErr != nil || ok && next.Due <= elapsed {
-			return nil, nil, nil, nil, fmt.Errorf("participant action bypassed due system work at record %d", record.Version)
+		} else if action.Kind == realtime.ActionUpdateQuote || action.Kind == realtime.ActionPauseSession || action.Kind == realtime.ActionResumeSession {
+			if next, ok, nextErr := generator.Next(); nextErr != nil || ok && next.Due <= elapsed {
+				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("external action bypassed due system work at record %d", record.Version)
+			}
 		}
-		outcome := executor.Execute(action, elapsed)
+		outcome := realtime.Outcome{Result: exchange.Result{State: engine.State()}, Disposition: realtime.DispositionContinue}
+		switch action.Kind {
+		case realtime.ActionStartSession:
+			payload, ok := action.Payload.(realtime.StartSessionPayload)
+			if !ok {
+				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("start action has invalid payload at record %d", record.Version)
+			}
+			outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask}}, elapsed)
+		case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
+		default:
+			outcome = executor.Execute(action, elapsed)
+		}
 		if record.Rejection != nil {
 			if record.Rejection.Code != eventlog.RejectionCodeCommandRejected || outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || outcome.Err.Error() != record.Rejection.Message || !durableResultsEqual(record.Result, exchange.Result{State: engine.State()}) {
-				return nil, nil, nil, nil, fmt.Errorf("rejected action mismatch at record %d", record.Version)
+				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("rejected action mismatch at record %d", record.Version)
 			}
 		} else {
 			result, ok := outcome.Result.(exchange.Result)
-			for index := range result.Events {
-				result.Events[index].CommandID = action.ID
+			if ok {
+				for index := range result.Events {
+					result.Events[index].CommandID = action.ID
+				}
 			}
 			if !ok || outcome.Err != nil || outcome.Disposition != realtime.DispositionContinue && outcome.Disposition != realtime.DispositionComplete || !durableResultsEqual(result, record.Result) {
-				return nil, nil, nil, nil, fmt.Errorf("accepted action mismatch at record %d", record.Version)
+				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("accepted action mismatch at record %d", record.Version)
 			}
-			if action.Source == realtime.SourceSystem {
+			if generated {
 				if err := generator.Commit(scheduled); err != nil {
-					return nil, nil, nil, nil, fmt.Errorf("advance generator at record %d: %w", record.Version, err)
+					return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("advance generator at record %d: %w", record.Version, err)
 				}
 			}
 		}
 		actions[action.ID] = record
 		lastElapsed = elapsed
+		lifecycle = record.Lifecycle
 	}
-	return engine, generator, executor, actions, nil
+	summary := realTimeReplaySummary{LastElapsed: lastElapsed, Lifecycle: lifecycle, DurableRecords: uint64(len(records)), GeneratorCommitted: generator.Snapshot().Committed}
+	return engine, generator, executor, actions, summary, nil
 }
 
 func durableResultsEqual(left, right exchange.Result) bool {
