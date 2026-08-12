@@ -5,7 +5,42 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+
+	"market-maker/internal/fixed"
 )
+
+const (
+	ActionStartSession      = "start_session"
+	ActionCountdownComplete = "countdown_complete"
+	ActionPauseSession      = "pause_session"
+	ActionResumeSession     = "resume_session"
+)
+
+type StartSessionPayload struct {
+	Bid fixed.Price `json:"bid"`
+	Ask fixed.Price `json:"ask"`
+}
+
+type PauseReason string
+
+const (
+	PauseReasonPlayer   PauseReason = "player"
+	PauseReasonShutdown PauseReason = "shutdown"
+	PauseReasonRecovery PauseReason = "recovery"
+)
+
+func (r PauseReason) Validate() error {
+	switch r {
+	case PauseReasonPlayer, PauseReasonShutdown, PauseReasonRecovery:
+		return nil
+	default:
+		return errors.New("invalid pause reason")
+	}
+}
+
+type PauseSessionPayload struct {
+	Reason PauseReason `json:"reason"`
+}
 
 type DurableAction struct {
 	ID      string          `json:"id"`
@@ -36,11 +71,40 @@ func EncodeAction(action Action) (DurableAction, error) {
 }
 
 func (a DurableAction) Decode() (Action, error) {
+	if a.Source != SourceSystem && a.Source != SourceParticipant {
+		return Action{}, errors.New("invalid action source")
+	}
 	action := Action{ID: a.ID, Kind: a.Kind, Source: a.Source}
 	if err := validateAction(action, a.Source); err != nil {
 		return Action{}, err
 	}
 	switch a.Kind {
+	case ActionStartSession:
+		if a.Source != SourceParticipant {
+			return Action{}, errors.New("start action must come from a participant")
+		}
+		var payload StartSessionPayload
+		if err := decodeActionPayload(a.Payload, &payload, "bid", "ask"); err != nil {
+			return Action{}, err
+		}
+		action.Payload = payload
+	case ActionCountdownComplete:
+		if a.Source != SourceSystem || len(a.Payload) != 0 {
+			return Action{}, errors.New("countdown action is invalid")
+		}
+	case ActionPauseSession:
+		var payload PauseSessionPayload
+		if err := decodeActionPayload(a.Payload, &payload, "reason"); err != nil {
+			return Action{}, err
+		}
+		if err := validateDurablePauseSourceReason(a.Source, payload.Reason); err != nil {
+			return Action{}, err
+		}
+		action.Payload = payload
+	case ActionResumeSession:
+		if a.Source != SourceParticipant || len(a.Payload) != 0 {
+			return Action{}, errors.New("resume action is invalid")
+		}
 	case ActionUpdateQuote:
 		if a.Source != SourceParticipant {
 			return Action{}, errors.New("quote action must come from a participant")
@@ -80,6 +144,29 @@ func (a DurableAction) Decode() (Action, error) {
 
 func validatePayloadType(action Action) error {
 	switch action.Kind {
+	case ActionStartSession:
+		if action.Source != SourceParticipant {
+			return errors.New("start action must come from a participant")
+		}
+		if _, ok := action.Payload.(StartSessionPayload); !ok {
+			return errors.New("invalid start action payload")
+		}
+	case ActionCountdownComplete:
+		if action.Source != SourceSystem || action.Payload != nil {
+			return errors.New("countdown action is invalid")
+		}
+	case ActionPauseSession:
+		payload, ok := action.Payload.(PauseSessionPayload)
+		if !ok {
+			return errors.New("invalid pause action payload")
+		}
+		if err := validateDurablePauseSourceReason(action.Source, payload.Reason); err != nil {
+			return err
+		}
+	case ActionResumeSession:
+		if action.Source != SourceParticipant || action.Payload != nil {
+			return errors.New("resume action is invalid")
+		}
 	case ActionUpdateQuote:
 		if action.Source != SourceParticipant {
 			return errors.New("quote action must come from a participant")
@@ -107,6 +194,25 @@ func validatePayloadType(action Action) error {
 		}
 	default:
 		return errors.New("unsupported durable action kind")
+	}
+	return nil
+}
+
+func validateDurablePauseSourceReason(source Source, reason PauseReason) error {
+	if err := reason.Validate(); err != nil {
+		return err
+	}
+	switch source {
+	case SourceParticipant:
+		if reason != PauseReasonPlayer {
+			return errors.New("participant pause must use player reason")
+		}
+	case SourceSystem:
+		if reason != PauseReasonShutdown && reason != PauseReasonRecovery {
+			return errors.New("system pause must use shutdown or recovery reason")
+		}
+	default:
+		return errors.New("invalid action source")
 	}
 	return nil
 }

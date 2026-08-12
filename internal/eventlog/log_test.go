@@ -493,36 +493,50 @@ func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	start, err := realtime.EncodeAction(realtime.Action{ID: "start-1", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	countdown, err := realtime.EncodeAction(realtime.Action{ID: "system/countdown-1", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
+		t.Fatal(err)
+	}
 	quote, err := realtime.EncodeAction(realtime.Action{ID: "quote-1", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	accepted, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &quote, ElapsedNanoseconds: int64(time.Second), Result: exchange.Result{State: exchange.State{Version: 1}}})
-	if err != nil {
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &quote, ElapsedNanoseconds: int64(3 * time.Second), Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: exchange.State{Version: 1}}}); err != nil {
 		t.Fatal(err)
 	}
 	mark, err := realtime.EncodeAction(realtime.Action{ID: "mark-1", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &mark, ElapsedNanoseconds: int64(2 * time.Second), Result: exchange.Result{State: exchange.State{Version: 2}}}); err != nil {
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &mark, ElapsedNanoseconds: int64(4 * time.Second), Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: exchange.State{Version: 2}}}); err != nil {
 		t.Fatal(err)
 	}
 	rejectedAction, err := realtime.EncodeAction(realtime.Action{ID: "quote-2", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "101"), Ask: price(t, "99")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &rejectedAction, ElapsedNanoseconds: int64(3 * time.Second), Result: exchange.Result{State: exchange.State{Version: 2}}, Rejection: &ActionRejection{Code: "command_rejected", Message: "crossed quote"}}); err != nil {
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 5, Action: &rejectedAction, ElapsedNanoseconds: int64(5 * time.Second), Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: exchange.State{Version: 2}}, Rejection: &ActionRejection{Code: "command_rejected", Message: "crossed quote"}}); err != nil {
 		t.Fatal(err)
 	}
 	if accepted.Schema != RealTimeSchemaVersion || accepted.MetadataChecksum != log.Meta().Checksum {
 		t.Fatalf("accepted=%+v", accepted)
 	}
 	reopened, records, err := Open(root, "game-1")
-	if err != nil || len(records) != 3 || reopened.Meta().Schema != RealTimeSchemaVersion || records[2].Rejection == nil || records[2].Result.State.Version != 2 {
+	if err != nil || len(records) != 5 || reopened.Meta().Schema != RealTimeSchemaVersion || records[4].Rejection == nil || records[4].Result.State.Version != 2 || reopened.lifecycle != game.LifecycleRunning || reopened.lastElapsedNanoseconds != int64(5*time.Second) {
 		t.Fatalf("records=%+v err=%v", records, err)
 	}
-	if _, err := reopened.Append(Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &rejectedAction, ElapsedNanoseconds: int64(4 * time.Second), Rejection: &ActionRejection{Code: "again", Message: "again"}}); err == nil {
+	if _, err := reopened.Append(Record{Schema: RealTimeSchemaVersion, Version: 6, Action: &rejectedAction, ElapsedNanoseconds: int64(6 * time.Second), Lifecycle: game.LifecycleRunning, Rejection: &ActionRejection{Code: "again", Message: "again"}}); err == nil {
 		t.Fatal("duplicate rejected action id accepted")
 	}
 	if got := independentMetadataChecksum(t, log.Meta(), "market-maker/eventlog/meta/v5\x00"); got != log.Meta().Checksum {
@@ -545,8 +559,11 @@ func TestRealTimeRecordValidation(t *testing.T) {
 	}
 	system, _ := realtime.EncodeAction(realtime.Action{ID: "system", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}})
 	participant, _ := realtime.EncodeAction(realtime.Action{ID: "participant", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	start, _ := realtime.EncodeAction(realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	tests := map[string]Record{
 		"missing action":     {Schema: RealTimeSchemaVersion, Version: 1},
+		"missing lifecycle":  {Schema: RealTimeSchemaVersion, Version: 1, Action: &start},
+		"wrong lifecycle":    {Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleRunning},
 		"negative elapsed":   {Schema: RealTimeSchemaVersion, Version: 1, Action: &system, ElapsedNanoseconds: -1},
 		"system rejection":   {Schema: RealTimeSchemaVersion, Version: 1, Action: &system, Rejection: &ActionRejection{Code: "bad", Message: "bad"}},
 		"empty rejection":    {Schema: RealTimeSchemaVersion, Version: 1, Action: &participant, Rejection: &ActionRejection{}},
@@ -556,6 +573,189 @@ func TestRealTimeRecordValidation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := newLog(t).Append(record); err == nil {
 				t.Fatal("invalid record accepted")
+			}
+		})
+	}
+}
+
+func TestRealTimeLifecycleTransitions(t *testing.T) {
+	log := newRealTimeTestLog(t)
+	state := exchange.State{Version: 7}
+
+	rejectedStart := durableTestAction(t, realtime.Action{ID: "start-rejected", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "101"), Ask: price(t, "99")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &rejectedStart, Lifecycle: game.LifecyclePreparing, Result: exchange.Result{State: state}, Rejection: &ActionRejection{Code: RejectionCodeCommandRejected, Message: "crossed quote"}}); err != nil {
+		t.Fatalf("rejected start: %v", err)
+	}
+	start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &start, Lifecycle: game.LifecycleCountdown, Result: exchange.Result{State: state}}); err != nil {
+		t.Fatalf("accepted start: %v", err)
+	}
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &countdown, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: state}}); err != nil {
+		t.Fatalf("countdown completion: %v", err)
+	}
+	pause := durableTestAction(t, realtime.Action{ID: "pause", Kind: realtime.ActionPauseSession, Source: realtime.SourceParticipant, Payload: realtime.PauseSessionPayload{Reason: realtime.PauseReasonPlayer}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &pause, ElapsedNanoseconds: 3, Lifecycle: game.LifecyclePaused, Result: exchange.Result{State: state}}); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	resume := durableTestAction(t, realtime.Action{ID: "resume", Kind: realtime.ActionResumeSession, Source: realtime.SourceParticipant})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 5, Action: &resume, ElapsedNanoseconds: 4, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: state}}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 6, Action: &quote, ElapsedNanoseconds: 5, Lifecycle: game.LifecycleCompleted, Result: exchange.Result{State: exchange.State{IsOver: true}}}); err != nil {
+		t.Fatalf("completing quote: %v", err)
+	}
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 7, Action: &quote, ElapsedNanoseconds: 6, Lifecycle: game.LifecycleCompleted}); err == nil {
+		t.Fatal("record after completion accepted")
+	}
+
+	_, records, err := Open(filepath.Dir(log.Path()), "game-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{0, 1, 2, 3, 4} {
+		if records[index].Result.State != state {
+			t.Fatalf("lifecycle-only record %d changed exchange state: %+v", index+1, records[index].Result.State)
+		}
+	}
+}
+
+func TestPauseDuringCountdownAndSourceReasonGrammar(t *testing.T) {
+	log := newRealTimeTestLog(t)
+	start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+		t.Fatal(err)
+	}
+	badPause := realtime.DurableAction{ID: "system/bad-pause", Kind: realtime.ActionPauseSession, Source: realtime.SourceSystem, Payload: json.RawMessage(`{"reason":"player"}`)}
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &badPause, Lifecycle: game.LifecyclePaused}); err == nil {
+		t.Fatal("system pause with player reason accepted")
+	}
+	pause := durableTestAction(t, realtime.Action{ID: "system/pause", Kind: realtime.ActionPauseSession, Source: realtime.SourceSystem, Payload: realtime.PauseSessionPayload{Reason: realtime.PauseReasonRecovery}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &pause, Lifecycle: game.LifecyclePaused}); err != nil {
+		t.Fatalf("countdown pause: %v", err)
+	}
+}
+
+func TestCountdownLifecycleRejectsMarketElapsedTime(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		prepare   func(*testing.T, *Log)
+		action    realtime.Action
+		lifecycle game.LifecycleState
+	}{
+		{name: "start", action: realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}}, lifecycle: game.LifecycleCountdown},
+		{name: "complete", prepare: func(t *testing.T, log *Log) {
+			start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+				t.Fatal(err)
+			}
+		}, action: realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}, lifecycle: game.LifecycleRunning},
+		{name: "pause", prepare: func(t *testing.T, log *Log) {
+			start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+				t.Fatal(err)
+			}
+		}, action: realtime.Action{ID: "system/pause", Kind: realtime.ActionPauseSession, Source: realtime.SourceSystem, Payload: realtime.PauseSessionPayload{Reason: realtime.PauseReasonRecovery}}, lifecycle: game.LifecyclePaused},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			log := newRealTimeTestLog(t)
+			if test.prepare != nil {
+				test.prepare(t, log)
+			}
+			action := durableTestAction(t, test.action)
+			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: log.nextVersion, Action: &action, ElapsedNanoseconds: 1, Lifecycle: test.lifecycle}); err == nil {
+				t.Fatal("countdown lifecycle accepted nonzero market elapsed time")
+			}
+		})
+	}
+}
+
+func TestRealTimeSystemEventLifecycleOutcomes(t *testing.T) {
+	tests := []struct {
+		name      string
+		action    realtime.Action
+		isOver    bool
+		lifecycle game.LifecycleState
+	}{
+		{name: "customer", action: realtime.Action{ID: "system/customer", Kind: realtime.ActionCustomerArrival, Source: realtime.SourceSystem, Payload: realtime.CustomerArrivalPayload{Buy: true, Quantity: 1, HasUpcomingMark: false}}, lifecycle: game.LifecycleRunning},
+		{name: "mark", action: realtime.Action{ID: "system/mark", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}}, lifecycle: game.LifecycleRunning},
+		{name: "carry", action: realtime.Action{ID: "system/carry", Kind: realtime.ActionCarryCharge, Source: realtime.SourceSystem}, lifecycle: game.LifecycleRunning},
+		{name: "expiry", action: realtime.Action{ID: "system/expiry", Kind: realtime.ActionTimeExpired, Source: realtime.SourceSystem}, isOver: true, lifecycle: game.LifecycleCompleted},
+		{name: "mark completes", action: realtime.Action{ID: "system/mark", Kind: realtime.ActionMarkMove, Source: realtime.SourceSystem, Payload: realtime.MarkMovePayload{BasisPoints: 1}}, isOver: true, lifecycle: game.LifecycleCompleted},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			log := runningRealTimeTestLog(t)
+			action := durableTestAction(t, test.action)
+			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &action, Lifecycle: test.lifecycle, Result: exchange.Result{State: exchange.State{IsOver: test.isOver}}}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	log := runningRealTimeTestLog(t)
+	expiry := durableTestAction(t, realtime.Action{ID: "system/expiry", Kind: realtime.ActionTimeExpired, Source: realtime.SourceSystem})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &expiry, Lifecycle: game.LifecycleRunning}); err == nil {
+		t.Fatal("non-completing time expiry accepted")
+	}
+}
+
+func TestRealTimeRejectsBackwardElapsedAppendAndColdOpen(t *testing.T) {
+	log := newRealTimeTestLog(t)
+	start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+		t.Fatal(err)
+	}
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
+		t.Fatal(err)
+	}
+	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &quote, ElapsedNanoseconds: 2, Lifecycle: game.LifecycleRunning}); err != nil {
+		t.Fatal(err)
+	}
+	pause := durableTestAction(t, realtime.Action{ID: "pause", Kind: realtime.ActionPauseSession, Source: realtime.SourceParticipant, Payload: realtime.PauseSessionPayload{Reason: realtime.PauseReasonPlayer}})
+	backward := Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &pause, ElapsedNanoseconds: 1, Lifecycle: game.LifecyclePaused}
+	if _, err := log.Append(backward); err == nil {
+		t.Fatal("backward elapsed append accepted")
+	}
+	appendFile(t, filepath.Join(log.Path(), "events.jsonl"), encodedRecordLine(t, log, backward))
+	if _, _, err := Open(filepath.Dir(log.Path()), "game-1"); err == nil {
+		t.Fatal("cold open accepted backward elapsed record")
+	}
+}
+
+func TestHistoricalSchemasRejectLifecycle(t *testing.T) {
+	for _, schema := range []int{schema1, schema2, schema3, SchemaVersion} {
+		meta := Meta{Schema: schema, Mode: game.PlayModeTurnBased}
+		if schema <= schema3 {
+			meta.Mode = ""
+		}
+		record := Record{Schema: schema, Version: 1, Command: exchange.Command{ID: "command"}, Lifecycle: game.LifecycleRunning}
+		if _, err := validateRecordInput(record, meta, 1, 0, ""); err == nil {
+			t.Fatalf("schema %d accepted lifecycle", schema)
+		}
+	}
+}
+
+func TestRecoverMatchesAcknowledgedRealTimeProjection(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Log)
+	}{
+		{name: "elapsed", mutate: func(log *Log) { log.lastElapsedNanoseconds++ }},
+		{name: "lifecycle", mutate: func(log *Log) { log.lifecycle = game.LifecycleRunning }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			log := newRealTimeTestLog(t)
+			start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(log)
+			if _, err := log.Recover(); err == nil || !strings.Contains(err.Error(), "does not match active state") {
+				t.Fatalf("Recover error = %v, want projection mismatch", err)
 			}
 		})
 	}
@@ -1468,6 +1668,43 @@ func createLegacyLog(root, gameID string, cfg exchange.Config) (*Log, error) {
 	}
 	log, _, err := Open(root, gameID)
 	return log, err
+}
+
+func newRealTimeTestLog(t *testing.T) *Log {
+	t.Helper()
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	snapshot := definition.Snapshot()
+	log, err := CreateRealTime(t.TempDir(), "game-1", "local", "create-1", definition.Config, &snapshot, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return log
+}
+
+func durableTestAction(t *testing.T, action realtime.Action) realtime.DurableAction {
+	t.Helper()
+	durable, err := realtime.EncodeAction(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return durable
+}
+
+func runningRealTimeTestLog(t *testing.T) *Log {
+	t.Helper()
+	log := newRealTimeTestLog(t)
+	start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+		t.Fatal(err)
+	}
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
+		t.Fatal(err)
+	}
+	return log
 }
 
 func independentMetadataChecksum(t *testing.T, meta Meta, domain string) string {

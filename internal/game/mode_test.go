@@ -16,10 +16,12 @@ func TestPlayModeValidation(t *testing.T) {
 }
 
 func TestLifecycleValidation(t *testing.T) {
-	if err := LifecyclePreparing.Validate(); err != nil {
-		t.Fatal(err)
+	for _, state := range []LifecycleState{LifecyclePreparing, LifecycleCountdown, LifecycleRunning, LifecyclePaused, LifecycleCompleted} {
+		if err := state.Validate(); err != nil {
+			t.Fatalf("valid lifecycle %q rejected: %v", state, err)
+		}
 	}
-	for _, state := range []LifecycleState{"", "running", "other"} {
+	for _, state := range []LifecycleState{"", "other"} {
 		if err := state.Validate(); err == nil {
 			t.Fatalf("invalid lifecycle %q accepted", state)
 		}

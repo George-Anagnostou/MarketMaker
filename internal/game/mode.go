@@ -24,6 +24,10 @@ type LifecycleState string
 
 const (
 	LifecyclePreparing LifecycleState = "preparing"
+	LifecycleCountdown LifecycleState = "countdown"
+	LifecycleRunning   LifecycleState = "running"
+	LifecyclePaused    LifecycleState = "paused"
+	LifecycleCompleted LifecycleState = "completed"
 )
 
 const (
@@ -32,8 +36,10 @@ const (
 )
 
 func (s LifecycleState) Validate() error {
-	if s != LifecyclePreparing {
+	switch s {
+	case LifecyclePreparing, LifecycleCountdown, LifecycleRunning, LifecyclePaused, LifecycleCompleted:
+		return nil
+	default:
 		return fmt.Errorf("unsupported lifecycle state %q", s)
 	}
-	return nil
 }

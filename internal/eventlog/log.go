@@ -70,6 +70,7 @@ type Record struct {
 	Command            exchange.Command        `json:"command"`
 	Action             *realtime.DurableAction `json:"action,omitempty"`
 	ElapsedNanoseconds int64                   `json:"elapsed_nanoseconds,omitempty"`
+	Lifecycle          game.LifecycleState     `json:"lifecycle,omitempty"`
 	Result             exchange.Result         `json:"result"`
 	Rejection          *ActionRejection        `json:"rejection,omitempty"`
 	Coaching           *scenario.Coaching      `json:"coaching,omitempty"`
@@ -84,14 +85,16 @@ type ActionRejection struct {
 const RejectionCodeCommandRejected = "command_rejected"
 
 type Log struct {
-	dir          string
-	meta         Meta
-	mu           sync.Mutex
-	lastChecksum string
-	nextVersion  uint64
-	commandIDs   map[string]struct{}
-	eventsInfo   os.FileInfo
-	eventsSize   int64
+	dir                    string
+	meta                   Meta
+	mu                     sync.Mutex
+	lastChecksum           string
+	nextVersion            uint64
+	commandIDs             map[string]struct{}
+	lastElapsedNanoseconds int64
+	lifecycle              game.LifecycleState
+	eventsInfo             os.FileInfo
+	eventsSize             int64
 }
 
 func Create(root, gameID, ownerID, createCommandID string, cfg exchange.Config, snapshot *scenario.Snapshot) (*Log, error) {
@@ -193,7 +196,7 @@ func createAtWithMode(root, gameID, ownerID, createCommandID string, cfg exchang
 	if !os.SameFile(eventsInfo, publishedInfo) || publishedInfo.Size() != 0 {
 		return nil, errors.New("published event log identity or size changed")
 	}
-	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: map[string]struct{}{createCommandID: {}}, eventsInfo: publishedInfo}, nil
+	return &Log{dir: dir, meta: meta, nextVersion: 1, commandIDs: map[string]struct{}{createCommandID: {}}, lifecycle: initialLifecycle(meta), eventsInfo: publishedInfo}, nil
 }
 
 func Open(root, gameID string) (*Log, []Record, error) {
@@ -207,7 +210,7 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	records, eventsInfo, eventsSize, err := loadRecords(f, meta.Schema, meta.Checksum, meta.CreateCommandID)
+	records, eventsInfo, eventsSize, err := loadRecords(f, meta.Schema, meta.Checksum, meta.CreateCommandID, initialLifecycle(meta))
 	if err != nil {
 		return nil, nil, closeFile(f, err)
 	}
@@ -221,10 +224,14 @@ func Open(root, gameID string) (*Log, []Record, error) {
 	if err := f.Close(); err != nil {
 		return nil, nil, fmt.Errorf("close event log: %w", err)
 	}
-	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records)+1), eventsInfo: eventsInfo, eventsSize: eventsSize}
+	log := &Log{dir: dir, meta: meta, nextVersion: uint64(len(records) + 1), commandIDs: make(map[string]struct{}, len(records)+1), lifecycle: initialLifecycle(meta), eventsInfo: eventsInfo, eventsSize: eventsSize}
 	log.commandIDs[meta.CreateCommandID] = struct{}{}
 	if len(records) > 0 {
 		log.lastChecksum = records[len(records)-1].Checksum
+		if meta.Schema == RealTimeSchemaVersion {
+			log.lastElapsedNanoseconds = records[len(records)-1].ElapsedNanoseconds
+			log.lifecycle = records[len(records)-1].Lifecycle
+		}
 	}
 	for _, record := range records {
 		log.commandIDs[recordID(record)] = struct{}{}
@@ -323,8 +330,8 @@ func validateMeta(meta Meta) error {
 		if meta.RealTime.LifecycleVersion != game.LifecycleVersion || meta.RealTime.GeneratorVersion != game.GeneratorVersion || meta.Scenario.RealTime.GeneratorVersion != meta.RealTime.GeneratorVersion || meta.RealTime.Seed == 0 {
 			return errors.New("unsupported real-time lifecycle, generator version, or seed")
 		}
-		if err := meta.RealTime.Lifecycle.Validate(); err != nil {
-			return err
+		if meta.RealTime.Lifecycle != game.LifecyclePreparing {
+			return errors.New("real-time game must initially be preparing")
 		}
 		if err := scenario.ValidateRealTimeConfig(meta.Config, meta.Scenario.RealTime); err != nil {
 			return fmt.Errorf("invalid real-time scenario config: %w", err)
@@ -346,7 +353,7 @@ func (l *Log) Append(record Record) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	id, err := validateRecordInput(record, l.meta, l.nextVersion)
+	id, err := validateRecordInput(record, l.meta, l.nextVersion, l.lastElapsedNanoseconds, l.lifecycle)
 	if err != nil {
 		return Record{}, errors.New("invalid event record")
 	}
@@ -409,16 +416,20 @@ func (l *Log) Append(record Record) (Record, error) {
 	}
 	l.lastChecksum, l.nextVersion = record.Checksum, record.Version+1
 	l.commandIDs[id] = struct{}{}
+	if record.Schema == RealTimeSchemaVersion {
+		l.lastElapsedNanoseconds = record.ElapsedNanoseconds
+		l.lifecycle = record.Lifecycle
+	}
 	l.eventsSize = newSize
 	return record, nil
 }
 
-func validateRecordInput(record Record, meta Meta, version uint64) (string, error) {
+func validateRecordInput(record Record, meta Meta, version uint64, lastElapsedNanoseconds int64, lifecycle game.LifecycleState) (string, error) {
 	if record.Version != version || record.Schema != meta.Schema && record.Schema != SchemaVersion && record.Schema != RealTimeSchemaVersion {
 		return "", errors.New("invalid record version or schema")
 	}
 	if meta.EffectiveMode() == game.PlayModeRealTime {
-		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < 0 {
+		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < lastElapsedNanoseconds {
 			return "", errors.New("invalid real-time record")
 		}
 		action, err := record.Action.Decode()
@@ -430,12 +441,83 @@ func validateRecordInput(record Record, meta Meta, version uint64) (string, erro
 				return "", errors.New("invalid durable rejection")
 			}
 		}
+		if err := validateLifecycleTransition(lifecycle, action, record); err != nil {
+			return "", err
+		}
 		return action.ID, nil
 	}
-	if record.Command.ID == "" || record.Action != nil || record.ElapsedNanoseconds != 0 || record.Rejection != nil {
+	if record.Command.ID == "" || record.Action != nil || record.ElapsedNanoseconds != 0 || record.Lifecycle != "" || record.Rejection != nil {
 		return "", errors.New("invalid turn-based record")
 	}
 	return record.Command.ID, nil
+}
+
+func initialLifecycle(meta Meta) game.LifecycleState {
+	if meta.Schema == RealTimeSchemaVersion && meta.RealTime != nil {
+		return meta.RealTime.Lifecycle
+	}
+	return ""
+}
+
+func validateLifecycleTransition(previous game.LifecycleState, action realtime.Action, record Record) error {
+	if previous == game.LifecycleCompleted {
+		return errors.New("event recorded after lifecycle completed")
+	}
+	if (action.Kind == realtime.ActionStartSession || action.Kind == realtime.ActionCountdownComplete || action.Kind == realtime.ActionPauseSession && previous == game.LifecycleCountdown) && record.ElapsedNanoseconds != 0 {
+		return errors.New("countdown lifecycle cannot advance market time")
+	}
+	want := previous
+	switch action.Kind {
+	case realtime.ActionStartSession:
+		if previous != game.LifecyclePreparing || action.Source != realtime.SourceParticipant {
+			return errors.New("invalid start lifecycle transition")
+		}
+		if record.Rejection == nil {
+			want = game.LifecycleCountdown
+		}
+	case realtime.ActionCountdownComplete:
+		if previous != game.LifecycleCountdown || action.Source != realtime.SourceSystem || record.Rejection != nil {
+			return errors.New("invalid countdown lifecycle transition")
+		}
+		want = game.LifecycleRunning
+	case realtime.ActionPauseSession:
+		payload, ok := action.Payload.(realtime.PauseSessionPayload)
+		if !ok || previous != game.LifecycleRunning && previous != game.LifecycleCountdown || record.Rejection != nil {
+			return errors.New("invalid pause lifecycle transition")
+		}
+		if action.Source == realtime.SourceParticipant && payload.Reason != realtime.PauseReasonPlayer || action.Source == realtime.SourceSystem && payload.Reason != realtime.PauseReasonShutdown && payload.Reason != realtime.PauseReasonRecovery {
+			return errors.New("pause source does not match reason")
+		}
+		want = game.LifecyclePaused
+	case realtime.ActionResumeSession:
+		if previous != game.LifecyclePaused || action.Source != realtime.SourceParticipant || record.Rejection != nil {
+			return errors.New("invalid resume lifecycle transition")
+		}
+		want = game.LifecycleRunning
+	case realtime.ActionUpdateQuote:
+		if previous != game.LifecycleRunning || action.Source != realtime.SourceParticipant {
+			return errors.New("quote outside running lifecycle")
+		}
+		if record.Rejection == nil && record.Result.State.IsOver {
+			want = game.LifecycleCompleted
+		}
+	case realtime.ActionCustomerArrival, realtime.ActionMarkMove, realtime.ActionCarryCharge, realtime.ActionTimeExpired:
+		if previous != game.LifecycleRunning || action.Source != realtime.SourceSystem || record.Rejection != nil {
+			return errors.New("system event outside running lifecycle")
+		}
+		if record.Result.State.IsOver {
+			want = game.LifecycleCompleted
+		}
+		if action.Kind == realtime.ActionTimeExpired && want != game.LifecycleCompleted {
+			return errors.New("time expiry must complete lifecycle")
+		}
+	default:
+		return errors.New("unsupported lifecycle action")
+	}
+	if err := record.Lifecycle.Validate(); err != nil || record.Lifecycle != want {
+		return errors.New("record has invalid resulting lifecycle")
+	}
+	return nil
 }
 
 func recordID(record Record) string {
@@ -525,8 +607,14 @@ func (l *Log) Recover() ([]Record, error) {
 	l.nextVersion = uint64(len(records) + 1)
 	l.commandIDs = make(map[string]struct{}, len(records)+1)
 	l.commandIDs[l.meta.CreateCommandID] = struct{}{}
+	l.lastElapsedNanoseconds = 0
+	l.lifecycle = initialLifecycle(l.meta)
 	if len(records) > 0 {
 		l.lastChecksum = records[len(records)-1].Checksum
+		if l.meta.Schema == RealTimeSchemaVersion {
+			l.lastElapsedNanoseconds = records[len(records)-1].ElapsedNanoseconds
+			l.lifecycle = records[len(records)-1].Lifecycle
+		}
 	}
 	for _, record := range records {
 		l.commandIDs[recordID(record)] = struct{}{}
@@ -536,7 +624,7 @@ func (l *Log) Recover() ([]Record, error) {
 	return records, nil
 }
 
-func loadRecords(f *os.File, schema int, expectedMetadataChecksum, createCommandID string) ([]Record, os.FileInfo, int64, error) {
+func loadRecords(f *os.File, schema int, expectedMetadataChecksum, createCommandID string, lifecycle game.LifecycleState) ([]Record, os.FileInfo, int64, error) {
 	info, err := f.Stat()
 	if err != nil {
 		return nil, nil, 0, err
@@ -555,7 +643,7 @@ func loadRecords(f *os.File, schema int, expectedMetadataChecksum, createCommand
 		}
 		data = data[:size]
 	}
-	records, err := parseRecords(data, schema, expectedMetadataChecksum, createCommandID)
+	records, err := parseRecords(data, schema, expectedMetadataChecksum, createCommandID, lifecycle)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -569,10 +657,11 @@ func loadRecords(f *os.File, schema int, expectedMetadataChecksum, createCommand
 	return records, finalInfo, finalInfo.Size(), nil
 }
 
-func parseRecords(data []byte, schema int, expectedMetadataChecksum, createCommandID string) ([]Record, error) {
+func parseRecords(data []byte, schema int, expectedMetadataChecksum, createCommandID string, lifecycle game.LifecycleState) ([]Record, error) {
 	lines := bytes.Split(data, []byte("\n"))
 	records := make([]Record, 0, len(lines))
 	previousChecksum := ""
+	lastElapsedNanoseconds := int64(0)
 	commandIDs := make(map[string]struct{})
 	if schema == RealTimeSchemaVersion {
 		commandIDs[createCommandID] = struct{}{}
@@ -586,11 +675,15 @@ func parseRecords(data []byte, schema int, expectedMetadataChecksum, createComma
 		if err := decodeStrictJSON(line, &record); err != nil {
 			return nil, fmt.Errorf("decode event record %d: %w", i+1, err)
 		}
-		if err := validateRecord(record, schema, expectedMetadataChecksum, uint64(len(records)+1), previousChecksum, commandIDs); err != nil {
+		if err := validateRecord(record, schema, expectedMetadataChecksum, uint64(len(records)+1), previousChecksum, commandIDs, lastElapsedNanoseconds, lifecycle); err != nil {
 			return nil, fmt.Errorf("event record %d: %w", i+1, err)
 		}
 		records = append(records, record)
 		previousChecksum = record.Checksum
+		if schema == RealTimeSchemaVersion {
+			lastElapsedNanoseconds = record.ElapsedNanoseconds
+			lifecycle = record.Lifecycle
+		}
 		commandIDs[recordID(record)] = struct{}{}
 	}
 	return records, nil
@@ -604,7 +697,7 @@ func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
 	if len(prefix) > 0 && prefix[len(prefix)-1] != '\n' {
 		return nil, 0, errors.New("acknowledged event log boundary is not newline-terminated")
 	}
-	records, err := parseRecords(prefix, l.meta.Schema, l.meta.Checksum, l.meta.CreateCommandID)
+	records, err := parseRecords(prefix, l.meta.Schema, l.meta.Checksum, l.meta.CreateCommandID, initialLifecycle(l.meta))
 	if err != nil {
 		return nil, 0, fmt.Errorf("validate acknowledged event log prefix: %w", err)
 	}
@@ -618,6 +711,8 @@ func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
 	}
 	previousChecksum := l.lastChecksum
 	nextVersion := l.nextVersion
+	lastElapsedNanoseconds := l.lastElapsedNanoseconds
+	lifecycle := l.lifecycle
 	validSize := l.eventsSize
 	suffix := data[int(l.eventsSize):]
 	for offset := 0; offset < len(suffix); {
@@ -634,12 +729,16 @@ func (l *Log) recoverData(f *os.File, data []byte) ([]Record, int64, error) {
 		if err := decodeStrictJSON(line, &record); err != nil {
 			break
 		}
-		if err := validateRecord(record, l.meta.Schema, l.meta.Checksum, nextVersion, previousChecksum, commandIDs); err != nil {
+		if err := validateRecord(record, l.meta.Schema, l.meta.Checksum, nextVersion, previousChecksum, commandIDs, lastElapsedNanoseconds, lifecycle); err != nil {
 			break
 		}
 		records = append(records, record)
 		commandIDs[recordID(record)] = struct{}{}
 		previousChecksum = record.Checksum
+		if l.meta.Schema == RealTimeSchemaVersion {
+			lastElapsedNanoseconds = record.ElapsedNanoseconds
+			lifecycle = record.Lifecycle
+		}
 		nextVersion++
 		offset = lineEnd + 1
 		validSize = l.eventsSize + int64(offset)
@@ -663,6 +762,15 @@ func (l *Log) matchesAcknowledgedRecords(records []Record) bool {
 	if l.lastChecksum != lastChecksum {
 		return false
 	}
+	lastElapsedNanoseconds := int64(0)
+	lifecycle := initialLifecycle(l.meta)
+	if len(records) > 0 && l.meta.Schema == RealTimeSchemaVersion {
+		lastElapsedNanoseconds = records[len(records)-1].ElapsedNanoseconds
+		lifecycle = records[len(records)-1].Lifecycle
+	}
+	if l.lastElapsedNanoseconds != lastElapsedNanoseconds || l.lifecycle != lifecycle {
+		return false
+	}
 	commandIDs := make(map[string]struct{}, len(records)+1)
 	commandIDs[l.meta.CreateCommandID] = struct{}{}
 	for _, record := range records {
@@ -679,20 +787,23 @@ func (l *Log) matchesAcknowledgedRecords(records []Record) bool {
 	return true
 }
 
-func validateRecord(record Record, schema int, expectedMetadataChecksum string, version uint64, previousChecksum string, commandIDs map[string]struct{}) error {
+func validateRecord(record Record, schema int, expectedMetadataChecksum string, version uint64, previousChecksum string, commandIDs map[string]struct{}, lastElapsedNanoseconds int64, lifecycle game.LifecycleState) error {
 	id := recordID(record)
 	if record.Schema != schema || record.Version != version || id == "" || record.PreviousChecksum != previousChecksum {
 		return errors.New("invalid event record")
 	}
 	if schema == RealTimeSchemaVersion {
-		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < 0 {
+		if record.Action == nil || record.Command != (exchange.Command{}) || record.ElapsedNanoseconds < lastElapsedNanoseconds {
 			return errors.New("invalid real-time event record")
 		}
 		action, err := record.Action.Decode()
 		if err != nil || record.Rejection != nil && (action.Source != realtime.SourceParticipant || record.Rejection.Code != RejectionCodeCommandRejected || record.Rejection.Message == "") {
 			return errors.New("invalid real-time action or rejection")
 		}
-	} else if record.Action != nil || record.Rejection != nil || record.ElapsedNanoseconds != 0 || record.Command.ID == "" {
+		if err := validateLifecycleTransition(lifecycle, action, record); err != nil {
+			return err
+		}
+	} else if record.Action != nil || record.Rejection != nil || record.ElapsedNanoseconds != 0 || record.Lifecycle != "" || record.Command.ID == "" {
 		return errors.New("invalid turn-based event record")
 	}
 	switch schema {
