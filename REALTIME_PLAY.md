@@ -348,6 +348,13 @@ No coaching overlay interrupts the running session.
 
 ## Implementation Roadmap
 
+Implementation through the internal Phase 4 lifecycle boundary is complete on
+the real-time feature branch: schema 5 persists lifecycle actions, the live
+sequencer runs countdown and deterministic market activity, interrupted active
+solo games recover paused without counting downtime, and graceful shutdown
+durably pauses loaded active games. HTTP commands, SSE, disconnect grace, and
+browser controls remain deferred to Phase 5 and later.
+
 ### Phase 0: Specification And Compatibility Baseline
 
 1. Review and approve this specification.
