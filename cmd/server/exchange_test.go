@@ -425,6 +425,82 @@ func TestRealTimeControllerPublishesCommittedStateAndReplacesStaleStream(t *test
 	}
 }
 
+func TestParseStreamCursorRequiresCanonicalUnsignedInteger(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  uint64
+		valid bool
+	}{
+		{name: "missing", valid: true},
+		{name: "zero", value: "0", valid: true},
+		{name: "positive", value: "42", want: 42, valid: true},
+		{name: "negative", value: "-1"},
+		{name: "leading zero", value: "042"},
+		{name: "fraction", value: "4.2"},
+		{name: "space", value: " 4"},
+		{name: "overflow", value: "18446744073709551616"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseStreamCursor(test.value)
+			if test.valid {
+				if err != nil || got != test.want {
+					t.Fatalf("cursor=%d err=%v", got, err)
+				}
+			} else if err == nil {
+				t.Fatalf("cursor=%d was accepted", got)
+			}
+		})
+	}
+}
+
+func TestRealTimeStreamHandoffBackfillsCommittedActionBoundaries(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledgement realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	entry.mu.Lock()
+	current := entry.replay.DurableRecords
+	entry.mu.Unlock()
+	if current < 2 {
+		t.Fatalf("durable actions=%d", current)
+	}
+	subscriber, snapshot, backfill, err := entry.streamHandoff(testGameID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { subscriber.close(); entry.disconnectController(subscriber) }()
+	if snapshot.Sequence != 1 || len(backfill) != int(current-1) {
+		t.Fatalf("snapshot=%+v backfill=%d current=%d", snapshot, len(backfill), current)
+	}
+	for index, message := range backfill {
+		want := uint64(index) + 2
+		if message.Sequence != want || message.Event != "state" {
+			t.Fatalf("index=%d message=%+v", index, message)
+		}
+	}
+	if _, _, _, err := entry.streamHandoff(testGameID, current+1); err == nil {
+		t.Fatal("future cursor was accepted")
+	}
+}
+
 func getRealTimeState(t *testing.T, server *httptest.Server) exchangeStateResponse {
 	t.Helper()
 	resp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)

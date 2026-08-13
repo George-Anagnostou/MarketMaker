@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,53 @@ type controllerState struct {
 	graceTimer      *time.Timer
 	graceGeneration uint64
 	lastError       error
+}
+
+func parseStreamCursor(value string) (uint64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	if strings.TrimSpace(value) != value {
+		return 0, errors.New("Last-Event-ID must be a canonical unsigned integer")
+	}
+	cursor, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(cursor, 10) != value {
+		return 0, errors.New("Last-Event-ID must be a canonical unsigned integer")
+	}
+	return cursor, nil
+}
+
+func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubscriber, streamMessage, []streamMessage, error) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.mode != game.PlayModeRealTime || entry.realTime == nil || entry.storageFailed {
+		return nil, streamMessage{}, nil, errors.New("real-time stream is unavailable")
+	}
+	current := entry.replay.DurableRecords
+	if cursor > current {
+		return nil, streamMessage{}, nil, errors.New("Last-Event-ID is beyond the durable action boundary")
+	}
+	entry.controller.nextGeneration++
+	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration}
+	if entry.controller.active != nil {
+		entry.controller.active.close()
+	}
+	entry.controller.active = subscriber
+	entry.metrics.observeStreamConnected()
+	if entry.controller.graceTimer != nil {
+		entry.controller.graceTimer.Stop()
+		entry.controller.graceTimer = nil
+	}
+
+	state := entry.realTimeStateResponseLocked(id)
+	snapshot := streamMessage{Sequence: cursor, Event: "snapshot", Data: state}
+	backfill := make([]streamMessage, 0, current-cursor+1)
+	if cursor < current {
+		for sequence := cursor + 1; sequence <= current; sequence++ {
+			backfill = append(backfill, streamMessageForState(sequence, state))
+		}
+	}
+	return subscriber, snapshot, backfill, nil
 }
 
 func (entry *exchangeEntry) connectController() (*streamSubscriber, error) {
@@ -152,16 +201,18 @@ func (s *exchangeService) handleExchangeStream(w http.ResponseWriter, r *http.Re
 		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
 		return
 	}
-	entry.mu.Lock()
-	if entry.mode != game.PlayModeRealTime || entry.storageFailed {
-		entry.mu.Unlock()
-		writeAPIError(w, http.StatusConflict, "stream_unavailable", "real-time stream is unavailable")
+	cursor, err := parseStreamCursor(r.Header.Get("Last-Event-ID"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_cursor", err.Error())
 		return
 	}
-	entry.mu.Unlock()
-	subscriber, err := entry.connectController()
+	subscriber, snapshot, backfill, err := entry.streamHandoff(id, cursor)
 	if err != nil {
-		writeAPIError(w, http.StatusConflict, "stream_unavailable", err.Error())
+		status := http.StatusConflict
+		if strings.Contains(err.Error(), "beyond") {
+			status = http.StatusBadRequest
+		}
+		writeAPIError(w, status, "invalid_cursor", err.Error())
 		return
 	}
 	defer func() { subscriber.close(); entry.disconnectController(subscriber) }()
@@ -170,12 +221,13 @@ func (s *exchangeService) handleExchangeStream(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	state, err := entry.realTimeStateResponse(r.Context(), id)
-	if err != nil {
+	if err := writeSSE(w, snapshot); err != nil {
 		return
 	}
-	if err := writeSSE(w, streamMessage{Sequence: state.EventsThrough, Event: "snapshot", Data: state}); err != nil {
-		return
+	for _, message := range backfill {
+		if err := writeSSE(w, message); err != nil {
+			return
+		}
 	}
 
 	heartbeat := time.NewTicker(streamHeartbeatPeriod)
