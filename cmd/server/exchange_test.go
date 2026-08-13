@@ -501,6 +501,51 @@ func TestRealTimeStreamHandoffBackfillsCommittedActionBoundaries(t *testing.T) {
 	}
 }
 
+func TestRealTimeStreamRejectsInvalidAndFutureCursors(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	for _, value := range []string{"042", "-1", "1.5", " 1"} {
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/api/v2/games/"+testGameID+"/stream", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Last-Event-ID", value)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var apiErr apiError
+		if err := json.NewDecoder(response.Body).Decode(&apiErr); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest || apiErr.Error.Code != "invalid_cursor" {
+			t.Fatalf("cursor=%q status=%d error=%+v", value, response.StatusCode, apiErr)
+		}
+	}
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/v2/games/"+testGameID+"/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Last-Event-ID", "1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("future cursor status=%d", response.StatusCode)
+	}
+}
+
 func getRealTimeState(t *testing.T, server *httptest.Server) exchangeStateResponse {
 	t.Helper()
 	resp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)
