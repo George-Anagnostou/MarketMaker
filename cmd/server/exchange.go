@@ -120,6 +120,28 @@ type exchangeCommandRequest struct {
 	Ask             json.RawMessage `json:"ask"`
 }
 
+type realTimeCommandRequest struct {
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	Bid              json.RawMessage `json:"bid"`
+	Ask              json.RawMessage `json:"ask"`
+	ExpectedRevision *uint64         `json:"expected_quote_revision"`
+}
+
+func (req realTimeCommandRequest) prices() (fixed.Price, fixed.Price, error) {
+	if len(req.Bid) == 0 || len(req.Ask) == 0 {
+		return 0, 0, errors.New("bid and ask are required")
+	}
+	var bid, ask fixed.Price
+	if err := json.Unmarshal(req.Bid, &bid); err != nil {
+		return 0, 0, fmt.Errorf("invalid bid: %w", err)
+	}
+	if err := json.Unmarshal(req.Ask, &ask); err != nil {
+		return 0, 0, fmt.Errorf("invalid ask: %w", err)
+	}
+	return bid, ask, nil
+}
+
 func (req exchangeCommandRequest) command() (exchange.Command, error) {
 	if req.ExpectedVersion == nil {
 		return exchange.Command{}, errors.New("expected_version is required")
@@ -167,6 +189,14 @@ type exchangeResponse struct {
 	RealTime *realTimeState     `json:"real_time,omitempty"`
 }
 
+type realTimeCommandResponse struct {
+	GameID   string          `json:"game_id"`
+	Sequence uint64          `json:"sequence"`
+	Elapsed  int64           `json:"elapsed_ms"`
+	Command  commandResponse `json:"command"`
+	Mode     game.PlayMode   `json:"mode"`
+}
+
 type exchangeStateResponse struct {
 	GameID         string             `json:"game_id"`
 	Version        uint64             `json:"version"`
@@ -182,7 +212,25 @@ type exchangeStateResponse struct {
 }
 
 type realTimeState struct {
-	Lifecycle game.LifecycleState `json:"lifecycle"`
+	Lifecycle       game.LifecycleState `json:"lifecycle"`
+	DurationMillis  int64               `json:"duration_ms"`
+	ElapsedMillis   int64               `json:"elapsed_ms"`
+	RemainingMillis int64               `json:"remaining_ms"`
+	QuoteRevision   uint64              `json:"quote_revision"`
+	BidOrderID      *uint64             `json:"bid_order_id,omitempty"`
+	AskOrderID      *uint64             `json:"ask_order_id,omitempty"`
+	Depth           exchange.Depth      `json:"depth"`
+	RecentTrades    []realTimeTrade     `json:"recent_trades"`
+	ActionsThrough  uint64              `json:"actions_through"`
+	EventsThrough   uint64              `json:"events_through"`
+}
+
+type realTimeTrade struct {
+	EventSequence uint64        `json:"event_sequence"`
+	TradeID       uint64        `json:"trade_id"`
+	Side          exchange.Side `json:"side"`
+	Price         fixed.Price   `json:"price"`
+	Quantity      fixed.Qty     `json:"quantity"`
 }
 
 type latestTurn struct {
@@ -270,6 +318,9 @@ func (s *exchangeService) handleGames(w http.ResponseWriter, r *http.Request) {
 		}
 		state, coaching, recap = initial.State(), nil, nil
 	}
+	if mode == game.PlayModeRealTime {
+		realTime = initialRealTimeState(snapshot)
+	}
 	entry.mu.Unlock()
 	status := http.StatusCreated
 	if !created {
@@ -317,7 +368,7 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
-			s.handleExchangeState(w, parts[0], entry)
+			s.handleExchangeStateRequest(w, r, parts[0], entry)
 			return
 		}
 		w.Header().Set("Allow", http.MethodGet)
@@ -342,6 +393,26 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *exchangeService) handleExchangeState(w http.ResponseWriter, id string, entry *exchangeEntry) {
+	s.handleExchangeStateRequest(w, &http.Request{Method: http.MethodGet}, id, entry)
+}
+
+func (s *exchangeService) handleExchangeStateRequest(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry) {
+	entry.mu.Lock()
+	mode, storageFailed := entry.mode, entry.storageFailed
+	entry.mu.Unlock()
+	if mode == game.PlayModeRealTime {
+		if storageFailed {
+			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
+			return
+		}
+		response, err := entry.realTimeStateResponse(r.Context(), id)
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "could not read real-time game state")
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
 	entry.mu.Lock()
 	if entry.storageFailed {
 		entry.mu.Unlock()
@@ -371,10 +442,6 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "game storage is unavailable")
 		return
 	}
-	if mode == game.PlayModeRealTime {
-		writeAPIError(w, http.StatusConflict, "command_unavailable_for_mode", "real-time commands are not available yet")
-		return
-	}
 	data, err := readJSONRequest(w, r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -388,6 +455,14 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		return
 	}
 	commandType = kind.Type
+	if mode == game.PlayModeRealTime {
+		outcome = s.handleRealTimeCommand(w, r, id, entry, data, kind.Type)
+		return
+	}
+	if kind.Type == realtime.ActionStartSession || kind.Type == realtime.ActionUpdateQuote || kind.Type == realtime.ActionPauseSession || kind.Type == realtime.ActionResumeSession {
+		writeAPIError(w, http.StatusConflict, "command_unavailable_for_mode", "command is not available in turn-based mode")
+		return
+	}
 	if kind.Type != exchange.CommandSubmitQuote && kind.Type != exchange.CommandQuit {
 		writeAPIError(w, http.StatusForbidden, "venue_command_unavailable", "account commands require authenticated venue access")
 		return
@@ -494,6 +569,101 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 	outcome = "accepted"
 }
 
+func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.Request, id string, entry *exchangeEntry, data []byte, kind string) string {
+	if entry.log.Meta().Schema != eventlog.RealTimeSchemaVersion {
+		writeAPIError(w, http.StatusConflict, "command_unavailable_for_schema", "real-time commands require a current-schema game")
+		return "rejected"
+	}
+	if kind != realtime.ActionStartSession && kind != realtime.ActionUpdateQuote && kind != realtime.ActionPauseSession && kind != realtime.ActionResumeSession && kind != realtime.ActionQuitSession {
+		writeAPIError(w, http.StatusConflict, "command_unavailable_for_mode", "command is not available in real-time mode")
+		return "rejected"
+	}
+	var req realTimeCommandRequest
+	if err := decodeStrictJSON(data, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return "rejected"
+	}
+	if !validUUID(req.ID) {
+		writeAPIError(w, http.StatusBadRequest, "invalid_id", "command id must be a UUID")
+		return "rejected"
+	}
+	req.ID = strings.ToLower(req.ID)
+	var execution realtime.Execution
+	var err error
+	switch kind {
+	case realtime.ActionStartSession:
+		if req.ExpectedRevision != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", "start_session does not accept expected_quote_revision")
+			return "rejected"
+		}
+		bid, ask, parseErr := req.prices()
+		if parseErr != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", parseErr.Error())
+			return "rejected"
+		}
+		execution, err = entry.startRealTime(r.Context(), req.ID, bid, ask)
+	case realtime.ActionUpdateQuote:
+		if req.ExpectedRevision == nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", "expected_quote_revision is required")
+			return "rejected"
+		}
+		bid, ask, parseErr := req.prices()
+		if parseErr != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", parseErr.Error())
+			return "rejected"
+		}
+		execution, err = entry.updateRealTimeQuote(r.Context(), req.ID, bid, ask, *req.ExpectedRevision)
+	case realtime.ActionPauseSession, realtime.ActionResumeSession, realtime.ActionQuitSession:
+		if len(req.Bid) != 0 || len(req.Ask) != 0 || req.ExpectedRevision != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", kind+" does not accept quote fields")
+			return "rejected"
+		}
+		if kind == realtime.ActionPauseSession {
+			execution, err = entry.pauseRealTime(r.Context(), req.ID)
+		} else if kind == realtime.ActionResumeSession {
+			execution, err = entry.resumeRealTime(r.Context(), req.ID)
+		} else {
+			execution, err = entry.quitRealTime(r.Context(), req.ID)
+		}
+	}
+	if err != nil {
+		if entry.realTimeActionCommitted(req.ID, execution) {
+			writeJSON(w, http.StatusOK, realTimeAcknowledgement(id, req.ID, kind, execution))
+			if execution.Replayed {
+				return "replayed"
+			}
+			return "accepted"
+		}
+		switch {
+		case errors.Is(err, realtime.ErrActionConflict):
+			writeAPIError(w, http.StatusConflict, "idempotency_key_reused", "command id has a different payload")
+		case errors.Is(err, realtime.ErrQuoteRevisionConflict) || entry.realTimeRejectionCode(req.ID) == eventlog.RejectionCodeQuoteRevisionConflict:
+			writeAPIError(w, http.StatusConflict, "quote_revision_conflict", "expected_quote_revision does not match the live quote")
+		case errors.Is(err, realtime.ErrInvalidState):
+			writeAPIError(w, http.StatusConflict, "lifecycle_conflict", "command is not available in the current lifecycle")
+		case execution.Disposition == realtime.DispositionReject:
+			writeAPIError(w, http.StatusConflict, "command_rejected", err.Error())
+		default:
+			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command was not committed")
+			return "storage_failure"
+		}
+		return "rejected"
+	}
+	if _, ok := execution.Result.(exchange.Result); !ok {
+		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command result is unavailable")
+		return "storage_failure"
+	}
+	writeJSON(w, http.StatusOK, realTimeAcknowledgement(id, req.ID, kind, execution))
+	if execution.Replayed {
+		return "replayed"
+	}
+	return "accepted"
+}
+
+func realTimeAcknowledgement(gameID, commandID, kind string, execution realtime.Execution) realTimeCommandResponse {
+	return realTimeCommandResponse{GameID: gameID, Sequence: execution.Sequence, Elapsed: execution.Elapsed.Milliseconds(), Command: commandResponse{ID: commandID, Type: kind, Replayed: execution.Replayed}, Mode: game.PlayModeRealTime}
+}
+
 func (s *exchangeService) handleExchangeEvents(w http.ResponseWriter, r *http.Request, entry *exchangeEntry) {
 	after := uint64(0)
 	query, err := url.ParseQuery(r.URL.RawQuery)
@@ -584,7 +754,8 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 		if !ok {
 			return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("start action has an invalid payload")}
 		}
-		outcome = entry.realtimeExec.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask}}, elapsed)
+		revision := entry.realtimeExec.QuoteRevision()
+		outcome = entry.realtimeExec.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
 	case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
 	default:
 		outcome = entry.realtimeExec.Execute(action, elapsed)
@@ -611,10 +782,14 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 			}
 		}
 	}
-	record := eventlog.Record{Schema: eventlog.RealTimeSchemaVersion, Version: uint64(len(entry.commands) + 1), Action: &durable, ElapsedNanoseconds: int64(elapsed), Lifecycle: lifecycle}
+	record := eventlog.Record{Schema: entry.log.Meta().Schema, Version: uint64(len(entry.commands) + 1), Action: &durable, ElapsedNanoseconds: int64(elapsed), Lifecycle: lifecycle}
 	if outcome.Disposition == realtime.DispositionReject {
 		record.Result = exchange.Result{State: entry.engine.State()}
-		record.Rejection = &eventlog.ActionRejection{Code: eventlog.RejectionCodeCommandRejected, Message: outcome.Err.Error()}
+		code := eventlog.RejectionCodeCommandRejected
+		if errors.Is(outcome.Err, realtime.ErrQuoteRevisionConflict) {
+			code = eventlog.RejectionCodeQuoteRevisionConflict
+		}
+		record.Rejection = &eventlog.ActionRejection{Code: code, Message: outcome.Err.Error()}
 	} else {
 		result, ok := outcome.Result.(exchange.Result)
 		if !ok {
@@ -658,7 +833,7 @@ func replayRealTimeRecord(action realtime.Action, durable realtime.DurableAction
 	if record.Action == nil || !reflect.DeepEqual(*record.Action, durable) {
 		execution.Result = nil
 		execution.Disposition = realtime.DispositionReject
-		execution.Err = errors.New("action id has a different payload")
+		execution.Err = realtime.ErrActionConflict
 	} else if record.Rejection != nil {
 		execution.Disposition = realtime.DispositionReject
 		execution.Err = errors.New(record.Rejection.Message)
@@ -762,12 +937,13 @@ func (entry *exchangeEntry) startRealTime(ctx context.Context, id string, bid, a
 	return sequencer.StartAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: bid, Ask: ask}})
 }
 
-func (entry *exchangeEntry) updateRealTimeQuote(ctx context.Context, id string, bid, ask fixed.Price) (realtime.Execution, error) {
+func (entry *exchangeEntry) updateRealTimeQuote(ctx context.Context, id string, bid, ask fixed.Price, expectedRevision uint64) (realtime.Execution, error) {
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
 	}
-	return sequencer.Submit(ctx, realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: bid, Ask: ask}})
+	payload := realtime.UpdateQuotePayload{Bid: bid, Ask: ask, ExpectedRevision: &expectedRevision}
+	return sequencer.Submit(ctx, realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: payload})
 }
 
 func (entry *exchangeEntry) pauseRealTime(ctx context.Context, id string) (realtime.Execution, error) {
@@ -792,6 +968,113 @@ func (entry *exchangeEntry) resumeRealTime(ctx context.Context, id string) (real
 		return realtime.Execution{}, err
 	}
 	return sequencer.ResumeAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionResumeSession, Source: realtime.SourceParticipant})
+}
+
+func (entry *exchangeEntry) quitRealTime(ctx context.Context, id string) (realtime.Execution, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return realtime.Execution{}, err
+	}
+	return sequencer.CompleteAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionQuitSession, Source: realtime.SourceParticipant})
+}
+
+func (entry *exchangeEntry) realTimeStateResponse(ctx context.Context, id string) (exchangeStateResponse, error) {
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		return exchangeStateResponse{}, err
+	}
+	view, err := sequencer.View(ctx, func() any {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		return entry.realTimeStateResponseLocked(id)
+	})
+	if err != nil {
+		return exchangeStateResponse{}, err
+	}
+	response, ok := view.Value.(exchangeStateResponse)
+	if !ok {
+		return exchangeStateResponse{}, errors.New("real-time state projector returned an invalid response")
+	}
+	response.RealTime.ElapsedMillis = view.Snapshot.Elapsed.Milliseconds()
+	response.RealTime.RemainingMillis = max(response.RealTime.DurationMillis-response.RealTime.ElapsedMillis, 0)
+	return response, nil
+}
+
+func (entry *exchangeEntry) realTimeStateResponseLocked(id string) exchangeStateResponse {
+	state := entry.engine.State()
+	projection := entry.canonicalRealTimeStateLocked(entry.replay.LastElapsed)
+	return exchangeStateResponse{GameID: id, Version: state.Version, StartingEquity: entry.startingEquity, EventsThrough: entry.eventsThrough, State: state, Scenario: entry.scenario, Mode: entry.mode, RealTime: projection}
+}
+
+func (entry *exchangeEntry) realTimeRejectionCode(id string) string {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if record := entry.commands[id]; record.Rejection != nil {
+		return record.Rejection.Code
+	}
+	return ""
+}
+
+func (entry *exchangeEntry) realTimeActionCommitted(id string, execution realtime.Execution) bool {
+	if execution.Disposition != realtime.DispositionContinue && execution.Disposition != realtime.DispositionComplete {
+		return false
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	record, ok := entry.commands[id]
+	return ok && record.Version == execution.Sequence && record.Rejection == nil
+}
+
+func initialRealTimeState(snapshot *scenario.Snapshot) *realTimeState {
+	if snapshot == nil || snapshot.RealTime == nil {
+		return nil
+	}
+	duration := int64(snapshot.RealTime.DurationMilliseconds)
+	return &realTimeState{Lifecycle: game.LifecyclePreparing, DurationMillis: duration, RemainingMillis: duration, Depth: exchange.Depth{Bids: []exchange.DepthLevel{}, Asks: []exchange.DepthLevel{}}, RecentTrades: []realTimeTrade{}}
+}
+
+func (entry *exchangeEntry) canonicalRealTimeStateLocked(elapsed time.Duration) *realTimeState {
+	durationMillis := int64(entry.scenario.RealTime.DurationMilliseconds)
+	projection := &realTimeState{
+		Lifecycle: entry.realTime.Lifecycle, DurationMillis: durationMillis,
+		ElapsedMillis: elapsed.Milliseconds(), RemainingMillis: max(durationMillis-elapsed.Milliseconds(), 0),
+		QuoteRevision: entry.realtimeExec.QuoteRevision(), Depth: entry.engine.Depth(5, exchange.PlayerAccount),
+		ActionsThrough: entry.replay.DurableRecords, EventsThrough: entry.eventsThrough,
+		RecentTrades: entry.recentRealTimeTradesLocked(20),
+	}
+	for _, order := range entry.engine.OpenOrders(exchange.PlayerAccount) {
+		id := order.ID
+		if order.Side == exchange.Buy {
+			projection.BidOrderID = &id
+		} else if order.Side == exchange.Sell {
+			projection.AskOrderID = &id
+		}
+	}
+	return projection
+}
+
+func (entry *exchangeEntry) recentRealTimeTradesLocked(limit int) []realTimeTrade {
+	events := make([]exchange.Event, 0)
+	for _, record := range entry.commands {
+		for _, event := range record.Result.Events {
+			if event.Type == "trade" && event.Trade != nil {
+				events = append(events, event)
+			}
+		}
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].Sequence < events[j].Sequence })
+	if len(events) > limit {
+		events = events[len(events)-limit:]
+	}
+	trades := make([]realTimeTrade, len(events))
+	for index, event := range events {
+		side := exchange.Sell
+		if event.Trade.BuyerID == exchange.PlayerAccount {
+			side = exchange.Buy
+		}
+		trades[index] = realTimeTrade{EventSequence: event.Sequence, TradeID: event.Trade.ID, Side: side, Price: event.Trade.Price, Quantity: event.Trade.Quantity}
+	}
+	return trades
 }
 
 func (s *exchangeService) Shutdown(ctx context.Context) error {
@@ -1239,7 +1522,7 @@ func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exch
 			if err != nil || !ok || scheduled.Due != elapsed || !reflect.DeepEqual(scheduled.Action, action) {
 				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("system action does not match generator at record %d", record.Version)
 			}
-		} else if action.Kind == realtime.ActionUpdateQuote || action.Kind == realtime.ActionPauseSession || action.Kind == realtime.ActionResumeSession {
+		} else if action.Kind == realtime.ActionUpdateQuote || action.Kind == realtime.ActionPauseSession || action.Kind == realtime.ActionResumeSession || action.Kind == realtime.ActionQuitSession {
 			if next, ok, nextErr := generator.Next(); nextErr != nil || ok && next.Due <= elapsed {
 				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("external action bypassed due system work at record %d", record.Version)
 			}
@@ -1251,13 +1534,14 @@ func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exch
 			if !ok {
 				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("start action has invalid payload at record %d", record.Version)
 			}
-			outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask}}, elapsed)
+			revision := executor.QuoteRevision()
+			outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
 		case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
 		default:
 			outcome = executor.Execute(action, elapsed)
 		}
 		if record.Rejection != nil {
-			if record.Rejection.Code != eventlog.RejectionCodeCommandRejected || outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || outcome.Err.Error() != record.Rejection.Message || !durableResultsEqual(record.Result, exchange.Result{State: engine.State()}) {
+			if record.Rejection.Code != eventlog.RejectionCodeCommandRejected && record.Rejection.Code != eventlog.RejectionCodeQuoteRevisionConflict || outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || outcome.Err.Error() != record.Rejection.Message || !durableResultsEqual(record.Result, exchange.Result{State: engine.State()}) {
 				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("rejected action mismatch at record %d", record.Version)
 			}
 		} else {

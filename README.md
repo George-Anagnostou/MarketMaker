@@ -68,7 +68,7 @@ Execution edge values player fills against the opening mark, inventory mark P&L 
 
 All mutating v2 requests are versioned and idempotent. IDs are UUIDs.
 
-The public command endpoint currently supports the turn-based mode only. Real-time games can be created and recovered as an internal foundation, but their start, quote, pause, resume, and quit commands remain deferred until the real-time HTTP/SSE slice is implemented.
+The public command endpoint supports turn-based commands and the focused real-time HTTP command slice. Real-time streaming and browser controls remain deferred.
 
 ```text
 POST /api/v2/games
@@ -77,6 +77,8 @@ GET  /api/v2/games/{game_id}
 POST /api/v2/games/{game_id}/commands
 GET  /api/v2/games/{game_id}/events?after={sequence}&through={sequence}
 ```
+
+Real-time games use `start_session`, `update_quote`, `pause_session`, `resume_session`, and `quit`. Quote updates include `expected_quote_revision` instead of the turn-based global version precondition. Successful mutations return a durable acknowledgement with action sequence and logical elapsed time; clients read canonical state with `GET`. Canonical state includes authoritative lifecycle/time, live quote revision and order IDs, shallow depth, recent trades, and durable action/event boundaries. Commands remain idempotent by UUID; retries return the original acknowledgement and stale quote revisions return `409`.
 
 The server owns the lesson catalog. Fetch the available scenario snapshots, then create a game with a client-generated `game_id`, `command_id`, and a catalog `scenario_id`:
 
@@ -106,9 +108,9 @@ Retrying the same command returns its original result without advancing the mark
 
 `GET /api/v2/games/{game_id}/events` is the read-only, durable game audit. Each event has a global sequence, originating command ID, type, and relevant order, trade, mark, or terminal-state details. Fetch the state first, then use its `events_through` value for every paginated event request. Cursors use canonical unsigned integers, for example `?after=42&through=42`, so a client can rebuild one stable chronological history even while later commands arrive. This is intentionally an event audit for a single local game, not a separate ledger-reporting API or a database-backed account history.
 
-Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. New games are atomically published from a staging directory, and schema-3 records are bound to a checksummed metadata snapshot. Scenario snapshots, simulation configuration, coaching, recaps, scorecards, and P&L attribution are durable parts of that history. Existing schema-1 and schema-2 games remain replayable and appendable; a partial final write is ignored.
+Each accepted command and result is appended and `fsync`ed to a per-game JSONL log. New games are atomically published from a staging directory, and current records are bound to a checksummed metadata snapshot. Scenario snapshots, simulation configuration, coaching, recaps, scorecards, and P&L attribution are durable parts of that history. Historical schemas remain readable under their original contracts; a partial final write is ignored.
 
-Event schemas are append-only wire formats: a new persisted field requires a new schema version rather than silently changing checksum preimages. Each schema retains its checksum domain, and schema 3 is used for new games.
+Event schemas are append-only wire formats: a new persisted field requires a new schema version rather than silently changing checksum preimages. Each schema retains its checksum domain. New turn-based games use schema 4 and new real-time games use schema 6; historical schemas remain readable.
 
 The JSONL store is local-first and single-process. Production multi-instance hosting is deferred to PostgreSQL, where transactional optimistic concurrency or row locking will serialize game mutations.
 

@@ -240,6 +240,18 @@ type State struct {
 	BestAsk  fixed.Price `json:"best_ask"`
 }
 
+type DepthLevel struct {
+	Price         fixed.Price `json:"price"`
+	Quantity      fixed.Qty   `json:"quantity"`
+	OrderCount    int         `json:"order_count"`
+	OwnedQuantity fixed.Qty   `json:"owned_quantity"`
+}
+
+type Depth struct {
+	Bids []DepthLevel `json:"bids"`
+	Asks []DepthLevel `json:"asks"`
+}
+
 type Result struct {
 	State   State         `json:"state"`
 	Summary Summary       `json:"summary"`
@@ -397,6 +409,28 @@ func (e *Engine) OpenOrders(accountID string) []Order {
 		result[i] = fromBookOrder(orders[i])
 	}
 	return result
+}
+
+func (e *Engine) Depth(levels int, owner string) Depth {
+	if levels < 0 {
+		levels = 0
+	}
+	owned := make(map[Side]map[fixed.Price]fixed.Qty, 2)
+	owned[Buy], owned[Sell] = make(map[fixed.Price]fixed.Qty), make(map[fixed.Price]fixed.Qty)
+	for _, order := range e.OpenOrders(owner) {
+		owned[order.Side][order.Price] += order.Remaining
+	}
+	project := func(source []orderbook.Level, side Side) []DepthLevel {
+		if len(source) > levels {
+			source = source[:levels]
+		}
+		result := make([]DepthLevel, len(source))
+		for index, level := range source {
+			result[index] = DepthLevel{Price: level.Price, Quantity: level.Quantity, OrderCount: level.OrderCount, OwnedQuantity: owned[side][level.Price]}
+		}
+		return result
+	}
+	return Depth{Bids: project(e.book.Bids(), Buy), Asks: project(e.book.Asks(), Sell)}
 }
 
 func (e *Engine) Account(accountID string) (AccountState, bool) {
@@ -804,6 +838,23 @@ func (e *Engine) ExpireTradingDay() (Result, error) {
 			return Result{State: candidate.State()}, err
 		}
 		events = append(events, candidate.endSession(TimeExpired))
+		candidate.version++
+		return Result{State: candidate.State(), Events: events}, nil
+	})
+}
+
+// QuitRealTime completes a solo session and releases its live quote without
+// changing the historical turn-based quit contract.
+func (e *Engine) QuitRealTime() (Result, error) {
+	return e.transact(func(candidate *Engine) (Result, error) {
+		if candidate.isOver {
+			return Result{State: candidate.State()}, errors.New("game is over")
+		}
+		events := candidate.cancelAccountOrders(PlayerAccount)
+		if err := candidate.reconcileReservations(); err != nil {
+			return Result{State: candidate.State()}, err
+		}
+		events = append(events, candidate.endSession(PlayerQuit))
 		candidate.version++
 		return Result{State: candidate.State(), Events: events}, nil
 	})

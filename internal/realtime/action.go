@@ -14,6 +14,7 @@ const (
 	ActionCountdownComplete = "countdown_complete"
 	ActionPauseSession      = "pause_session"
 	ActionResumeSession     = "resume_session"
+	ActionQuitSession       = "quit"
 )
 
 type StartSessionPayload struct {
@@ -105,6 +106,10 @@ func (a DurableAction) Decode() (Action, error) {
 		if a.Source != SourceParticipant || len(a.Payload) != 0 {
 			return Action{}, errors.New("resume action is invalid")
 		}
+	case ActionQuitSession:
+		if a.Source != SourceParticipant || len(a.Payload) != 0 {
+			return Action{}, errors.New("quit action is invalid")
+		}
 	case ActionUpdateQuote:
 		if a.Source != SourceParticipant {
 			return Action{}, errors.New("quote action must come from a participant")
@@ -166,6 +171,10 @@ func validatePayloadType(action Action) error {
 	case ActionResumeSession:
 		if action.Source != SourceParticipant || action.Payload != nil {
 			return errors.New("resume action is invalid")
+		}
+	case ActionQuitSession:
+		if action.Source != SourceParticipant || action.Payload != nil {
+			return errors.New("quit action is invalid")
 		}
 	case ActionUpdateQuote:
 		if action.Source != SourceParticipant {
