@@ -535,7 +535,7 @@ func validateLifecycleTransition(previous game.LifecycleState, action realtime.A
 		if !ok || previous != game.LifecycleRunning && previous != game.LifecycleCountdown || record.Rejection != nil {
 			return errors.New("invalid pause lifecycle transition")
 		}
-		if action.Source == realtime.SourceParticipant && payload.Reason != realtime.PauseReasonPlayer || action.Source == realtime.SourceSystem && payload.Reason != realtime.PauseReasonShutdown && payload.Reason != realtime.PauseReasonRecovery {
+		if action.Source == realtime.SourceParticipant && payload.Reason != realtime.PauseReasonPlayer || action.Source == realtime.SourceSystem && payload.Reason != realtime.PauseReasonShutdown && payload.Reason != realtime.PauseReasonRecovery && payload.Reason != realtime.PauseReasonDisconnect {
 			return errors.New("pause source does not match reason")
 		}
 		want = game.LifecyclePaused

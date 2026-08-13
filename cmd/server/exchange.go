@@ -71,6 +71,7 @@ type exchangeEntry struct {
 	storageFailed  bool
 	syncLog        func(*eventlog.Log) error
 	metrics        *metrics
+	controller     controllerState
 }
 
 func newExchangeService(root string) *exchangeService {
@@ -212,17 +213,18 @@ type exchangeStateResponse struct {
 }
 
 type realTimeState struct {
-	Lifecycle       game.LifecycleState `json:"lifecycle"`
-	DurationMillis  int64               `json:"duration_ms"`
-	ElapsedMillis   int64               `json:"elapsed_ms"`
-	RemainingMillis int64               `json:"remaining_ms"`
-	QuoteRevision   uint64              `json:"quote_revision"`
-	BidOrderID      *uint64             `json:"bid_order_id,omitempty"`
-	AskOrderID      *uint64             `json:"ask_order_id,omitempty"`
-	Depth           exchange.Depth      `json:"depth"`
-	RecentTrades    []realTimeTrade     `json:"recent_trades"`
-	ActionsThrough  uint64              `json:"actions_through"`
-	EventsThrough   uint64              `json:"events_through"`
+	Lifecycle       game.LifecycleState  `json:"lifecycle"`
+	PauseReason     realtime.PauseReason `json:"pause_reason,omitempty"`
+	DurationMillis  int64                `json:"duration_ms"`
+	ElapsedMillis   int64                `json:"elapsed_ms"`
+	RemainingMillis int64                `json:"remaining_ms"`
+	QuoteRevision   uint64               `json:"quote_revision"`
+	BidOrderID      *uint64              `json:"bid_order_id,omitempty"`
+	AskOrderID      *uint64              `json:"ask_order_id,omitempty"`
+	Depth           exchange.Depth       `json:"depth"`
+	RecentTrades    []realTimeTrade      `json:"recent_trades"`
+	ActionsThrough  uint64               `json:"actions_through"`
+	EventsThrough   uint64               `json:"events_through"`
 }
 
 type realTimeTrade struct {
@@ -352,7 +354,7 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_id", "game_id must be a UUID")
 		return
 	}
-	if len(parts) > 2 || (len(parts) == 2 && parts[1] != "commands" && parts[1] != "events") {
+	if len(parts) > 2 || (len(parts) == 2 && parts[1] != "commands" && parts[1] != "events" && parts[1] != "stream") {
 		writeAPIError(w, http.StatusNotFound, "not_found", "game endpoint not found")
 		return
 	}
@@ -382,6 +384,10 @@ func (s *exchangeService) handleGame(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Allow", http.MethodPost)
 		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+		return
+	}
+	if parts[1] == "stream" {
+		s.handleExchangeStream(w, r, parts[0], entry)
 		return
 	}
 	if r.Method == http.MethodGet {
@@ -848,7 +854,15 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 	entry.commands[action.ID] = record
 	entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
 	entry.realTime.Lifecycle = lifecycle
+	if action.Kind == realtime.ActionPauseSession {
+		if payload, ok := action.Payload.(realtime.PauseSessionPayload); ok {
+			entry.realTime.PauseReason = payload.Reason
+		}
+	}
 	entry.replay = realTimeReplaySummary{LastElapsed: elapsed, Lifecycle: lifecycle, DurableRecords: uint64(len(entry.commands)), GeneratorCommitted: entry.generator.Snapshot().Committed}
+	if state := entry.realTimeStateResponseLocked(entry.log.Meta().GameID); state.RealTime != nil {
+		entry.publishStreamLocked(streamMessageForState(record.Version, state))
+	}
 	return outcome
 }
 
@@ -1109,6 +1123,7 @@ func (entry *exchangeEntry) canonicalRealTimeStateLocked(elapsed time.Duration) 
 	durationMillis := int64(entry.scenario.RealTime.DurationMilliseconds)
 	projection := &realTimeState{
 		Lifecycle: entry.realTime.Lifecycle, DurationMillis: durationMillis,
+		PauseReason:   entry.realTime.PauseReason,
 		ElapsedMillis: elapsed.Milliseconds(), RemainingMillis: max(durationMillis-elapsed.Milliseconds(), 0),
 		QuoteRevision: entry.realtimeExec.QuoteRevision(), Depth: entry.engine.Depth(5, exchange.PlayerAccount),
 		ActionsThrough: entry.replay.DurableRecords, EventsThrough: entry.eventsThrough,
@@ -1474,6 +1489,13 @@ func rebuildExchangeEntry(log *eventlog.Log, records []eventlog.Record) (*exchan
 	}
 	for _, record := range records {
 		entry.eventsThrough = resultEventsThrough(record.Result, entry.eventsThrough)
+		if record.Action != nil && record.Action.Kind == realtime.ActionPauseSession {
+			if action, decodeErr := record.Action.Decode(); decodeErr == nil {
+				if payload, ok := action.Payload.(realtime.PauseSessionPayload); ok {
+					entry.realTime.PauseReason = payload.Reason
+				}
+			}
+		}
 		if record.Command.Type == exchange.CommandSubmitQuote {
 			entry.latestTurn = &latestTurn{Turn: record.Result.State.Turn, Summary: record.Result.Summary, Coaching: record.Coaching}
 		}

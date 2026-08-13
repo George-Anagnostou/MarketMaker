@@ -30,14 +30,15 @@ type CountdownCompletePayload struct {
 type PauseReason string
 
 const (
-	PauseReasonPlayer   PauseReason = "player"
-	PauseReasonShutdown PauseReason = "shutdown"
-	PauseReasonRecovery PauseReason = "recovery"
+	PauseReasonPlayer     PauseReason = "player"
+	PauseReasonShutdown   PauseReason = "shutdown"
+	PauseReasonRecovery   PauseReason = "recovery"
+	PauseReasonDisconnect PauseReason = "disconnect_grace_expired"
 )
 
 func (r PauseReason) Validate() error {
 	switch r {
-	case PauseReasonPlayer, PauseReasonShutdown, PauseReasonRecovery:
+	case PauseReasonPlayer, PauseReasonShutdown, PauseReasonRecovery, PauseReasonDisconnect:
 		return nil
 	default:
 		return errors.New("invalid pause reason")
@@ -234,7 +235,7 @@ func validateDurablePauseSourceReason(source Source, reason PauseReason) error {
 			return errors.New("participant pause must use player reason")
 		}
 	case SourceSystem:
-		if reason != PauseReasonShutdown && reason != PauseReasonRecovery {
+		if reason != PauseReasonShutdown && reason != PauseReasonRecovery && reason != PauseReasonDisconnect {
 			return errors.New("system pause must use shutdown or recovery reason")
 		}
 	default:

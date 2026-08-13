@@ -40,6 +40,34 @@ type metrics struct {
 	httpPanics       uint64
 	shutdowns        uint64
 	shutdownTimeouts uint64
+	streamConnected  uint64
+	streamClosed     uint64
+	streamAutoPauses uint64
+}
+
+func (m *metrics) observeStreamConnected() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.streamConnected++
+	m.mu.Unlock()
+}
+func (m *metrics) observeStreamClosed() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.streamClosed++
+	m.mu.Unlock()
+}
+func (m *metrics) observeStreamAutoPause() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.streamAutoPauses++
+	m.mu.Unlock()
 }
 
 func newMetrics() *metrics {
@@ -212,6 +240,12 @@ func (m *metrics) prometheus() []byte {
 	output.WriteString("mmg_server_shutdowns_total " + strconv.FormatUint(m.shutdowns, 10) + "\n")
 	output.WriteString("# HELP mmg_server_shutdown_timeouts_total Graceful shutdown attempts that reached their deadline.\n# TYPE mmg_server_shutdown_timeouts_total counter\n")
 	output.WriteString("mmg_server_shutdown_timeouts_total " + strconv.FormatUint(m.shutdownTimeouts, 10) + "\n")
+	output.WriteString("# HELP mmg_realtime_stream_connections_total Real-time controller streams opened.\n# TYPE mmg_realtime_stream_connections_total counter\n")
+	output.WriteString("mmg_realtime_stream_connections_total " + strconv.FormatUint(m.streamConnected, 10) + "\n")
+	output.WriteString("# HELP mmg_realtime_stream_closes_total Real-time controller streams closed.\n# TYPE mmg_realtime_stream_closes_total counter\n")
+	output.WriteString("mmg_realtime_stream_closes_total " + strconv.FormatUint(m.streamClosed, 10) + "\n")
+	output.WriteString("# HELP mmg_realtime_disconnect_auto_pauses_total Real-time sessions paused after disconnect grace expiry.\n# TYPE mmg_realtime_disconnect_auto_pauses_total counter\n")
+	output.WriteString("mmg_realtime_disconnect_auto_pauses_total " + strconv.FormatUint(m.streamAutoPauses, 10) + "\n")
 	return []byte(output.String())
 }
 

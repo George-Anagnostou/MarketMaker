@@ -286,7 +286,7 @@ func routeTemplate(path string) string {
 		switch {
 		case len(parts) == 4:
 			return "/api/v2/games/{game_id}"
-		case len(parts) == 5 && (parts[4] == "commands" || parts[4] == "events"):
+		case len(parts) == 5 && (parts[4] == "commands" || parts[4] == "events" || parts[4] == "stream"):
 			return "/api/v2/games/{game_id}/" + parts[4]
 		}
 	}
@@ -346,9 +346,11 @@ func main() {
 		Handler:           srv.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ErrorLog:          log.New(jsonLogWriter{logger: srv.logger}, "", 0),
+		// SSE controller streams are intentionally long-lived; handlers still
+		// bound request parsing with ReadTimeout and emit heartbeats themselves.
+		WriteTimeout: 0,
+		IdleTimeout:  60 * time.Second,
+		ErrorLog:     log.New(jsonLogWriter{logger: srv.logger}, "", 0),
 	}
 	listener, err := net.Listen("tcp", httpServer.Addr)
 	if err != nil {

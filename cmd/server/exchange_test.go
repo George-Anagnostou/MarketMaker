@@ -307,6 +307,124 @@ func TestV2RealTimeCountdownPauseResumeActivatesOpeningQuote(t *testing.T) {
 	}
 }
 
+func TestV2RealTimeStreamReconnectCancelsDisconnectGrace(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledgement realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+
+	first, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.disconnectController(first)
+	second, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { second.close(); entry.disconnectController(second) }()
+	time.Sleep(10 * time.Millisecond)
+	entry.mu.Lock()
+	if entry.controller.graceTimer != nil || entry.realTime.Lifecycle != game.LifecycleRunning {
+		entry.mu.Unlock()
+		t.Fatalf("reconnect did not cancel grace: %+v", entry.controller)
+	}
+	entry.mu.Unlock()
+}
+
+func TestV2RealTimeDisconnectGraceAutoPausesDurably(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledgement realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	controller, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.disconnectController(controller)
+	time.Sleep(disconnectGracePeriod + 100*time.Millisecond)
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecyclePaused })
+	entry.mu.Lock()
+	if entry.realTime.PauseReason != realtime.PauseReasonDisconnect {
+		entry.mu.Unlock()
+		t.Fatalf("pause reason=%q", entry.realTime.PauseReason)
+	}
+	found := false
+	for _, record := range entry.commands {
+		if record.Action != nil && record.Action.Kind == realtime.ActionPauseSession {
+			decoded, decodeErr := record.Action.Decode()
+			if decodeErr == nil {
+				if payload, ok := decoded.Payload.(realtime.PauseSessionPayload); ok && payload.Reason == realtime.PauseReasonDisconnect {
+					found = true
+				}
+			}
+		}
+	}
+	entry.mu.Unlock()
+	if !found {
+		t.Fatal("disconnect pause was not durable")
+	}
+}
+
+func TestRealTimeControllerPublishesCommittedStateAndReplacesStaleStream(t *testing.T) {
+	entry := &exchangeEntry{mode: game.PlayModeRealTime, realTime: &realTimeState{Lifecycle: game.LifecycleRunning}, metrics: newMetrics()}
+	first, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { second.close(); entry.disconnectController(second) }()
+	select {
+	case <-first.done:
+	case <-time.After(time.Second):
+		t.Fatal("old controller was not closed")
+	}
+	entry.publishStream(streamMessage{Sequence: 7, Event: "state", Data: map[string]string{"status": "running"}})
+	select {
+	case message := <-second.ch:
+		if message.Sequence != 7 || message.Event != "state" {
+			t.Fatalf("message=%+v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("committed state was not published")
+	}
+}
+
 func getRealTimeState(t *testing.T, server *httptest.Server) exchangeStateResponse {
 	t.Helper()
 	resp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)

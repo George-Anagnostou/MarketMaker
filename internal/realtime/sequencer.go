@@ -624,7 +624,7 @@ func validatePauseSourceReason(action Action) error {
 	if action.Source == SourceParticipant && payload.Reason != PauseReasonPlayer {
 		return errors.New("participant pause reason must be player")
 	}
-	if action.Source == SourceSystem && payload.Reason != PauseReasonShutdown && payload.Reason != PauseReasonRecovery {
+	if action.Source == SourceSystem && payload.Reason != PauseReasonShutdown && payload.Reason != PauseReasonRecovery && payload.Reason != PauseReasonDisconnect {
 		return errors.New("system pause reason must be shutdown or recovery")
 	}
 	return nil
