@@ -90,7 +90,7 @@ The server owns the lesson catalog. Fetch the available scenario snapshots, then
 }
 ```
 
-Each response includes the persisted scenario snapshot. Quote outcomes also include concise coaching, and terminal sessions include a recap. Submit a quote with an idempotency key and the last observed version:
+Each turn-based response includes the persisted scenario snapshot. Turn-based quote outcomes also include concise coaching, and terminal sessions include a recap. Real-time mutations return a durable acknowledgement; read their canonical state with `GET`. Submit a quote with an idempotency key and the last observed version:
 
 ```json
 {

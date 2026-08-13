@@ -288,13 +288,19 @@ func TestV2RealTimeCountdownPauseResumeActivatesOpeningQuote(t *testing.T) {
 	}
 	resp.Body.Close()
 	var acknowledgement realTimeCommandResponse
-	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement)
-	postRealTimeCommand(t, server, `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`, &acknowledgement)
+	if status := postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("start status=%d response=%+v", status, acknowledgement)
+	}
+	if status := postRealTimeCommand(t, server, `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("pause status=%d response=%+v", status, acknowledgement)
+	}
 	paused := getRealTimeState(t, server)
 	if paused.RealTime.Lifecycle != game.LifecyclePaused || paused.RealTime.QuoteRevision != 0 || paused.State.BestBid != 0 || paused.State.BestAsk != 0 {
 		t.Fatalf("paused=%+v", paused)
 	}
-	postRealTimeCommand(t, server, `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`, &acknowledgement)
+	if status := postRealTimeCommand(t, server, `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("resume status=%d response=%+v", status, acknowledgement)
+	}
 	running := getRealTimeState(t, server)
 	if running.RealTime.Lifecycle != game.LifecycleRunning || running.RealTime.QuoteRevision != 1 || running.State.BestBid != fixed.Price(995_000) || running.State.BestAsk != fixed.Price(1_005_000) || running.RealTime.BidOrderID == nil || running.RealTime.AskOrderID == nil {
 		t.Fatalf("running=%+v", running)
