@@ -501,7 +501,7 @@ func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	countdown, err := realtime.EncodeAction(realtime.Action{ID: "system/countdown-1", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown, err := realtime.EncodeAction(realtime.Action{ID: "system/countdown-1", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestRealTimeLifecycleTransitions(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &start, Lifecycle: game.LifecycleCountdown, Result: exchange.Result{State: state}}); err != nil {
 		t.Fatalf("accepted start: %v", err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &countdown, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: state}}); err != nil {
 		t.Fatalf("countdown completion: %v", err)
 	}
@@ -653,7 +653,7 @@ func TestCountdownLifecycleRejectsMarketElapsedTime(t *testing.T) {
 			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 				t.Fatal(err)
 			}
-		}, action: realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}, lifecycle: game.LifecycleRunning},
+		}, action: realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}}, lifecycle: game.LifecycleRunning},
 		{name: "pause", prepare: func(t *testing.T, log *Log) {
 			start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
@@ -710,7 +710,7 @@ func TestRealTimeRejectsBackwardElapsedAppendAndColdOpen(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 		t.Fatal(err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}
@@ -1759,7 +1759,7 @@ func runningRealTimeTestLog(t *testing.T) *Log {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 		t.Fatal(err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}

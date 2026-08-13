@@ -466,6 +466,9 @@ func validateRecordInput(record Record, meta Meta, version uint64, lastElapsedNa
 
 func validateRealTimeSchemaAction(schema int, action realtime.Action) error {
 	if schema == realTimeSchema5 {
+		if action.Kind == realtime.ActionCountdownComplete && action.Payload != nil {
+			return errors.New("countdown payload is not supported by real-time schema 5")
+		}
 		if action.Kind == realtime.ActionQuitSession {
 			return errors.New("quit is not supported by real-time schema 5")
 		}
@@ -477,6 +480,11 @@ func validateRealTimeSchemaAction(schema int, action realtime.Action) error {
 			return errors.New("quote revision is not supported by real-time schema 5")
 		}
 		return nil
+	}
+	if schema == RealTimeSchemaVersion && action.Kind == realtime.ActionCountdownComplete {
+		if _, ok := action.Payload.(realtime.CountdownCompletePayload); !ok {
+			return errors.New("countdown quote is required by real-time schema 6")
+		}
 	}
 	if schema == RealTimeSchemaVersion && action.Kind == realtime.ActionUpdateQuote {
 		payload, ok := action.Payload.(realtime.UpdateQuotePayload)

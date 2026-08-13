@@ -22,6 +22,11 @@ type StartSessionPayload struct {
 	Ask fixed.Price `json:"ask"`
 }
 
+type CountdownCompletePayload struct {
+	Bid fixed.Price `json:"bid"`
+	Ask fixed.Price `json:"ask"`
+}
+
 type PauseReason string
 
 const (
@@ -90,8 +95,15 @@ func (a DurableAction) Decode() (Action, error) {
 		}
 		action.Payload = payload
 	case ActionCountdownComplete:
-		if a.Source != SourceSystem || len(a.Payload) != 0 {
+		if a.Source != SourceSystem {
 			return Action{}, errors.New("countdown action is invalid")
+		}
+		if len(a.Payload) != 0 {
+			var payload CountdownCompletePayload
+			if err := decodeActionPayload(a.Payload, &payload, "bid", "ask"); err != nil {
+				return Action{}, err
+			}
+			action.Payload = payload
 		}
 	case ActionPauseSession:
 		var payload PauseSessionPayload
@@ -157,8 +169,13 @@ func validatePayloadType(action Action) error {
 			return errors.New("invalid start action payload")
 		}
 	case ActionCountdownComplete:
-		if action.Source != SourceSystem || action.Payload != nil {
+		if action.Source != SourceSystem {
 			return errors.New("countdown action is invalid")
+		}
+		if action.Payload != nil {
+			if _, ok := action.Payload.(CountdownCompletePayload); !ok {
+				return errors.New("invalid countdown action payload")
+			}
 		}
 	case ActionPauseSession:
 		payload, ok := action.Payload.(PauseSessionPayload)

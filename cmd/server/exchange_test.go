@@ -182,6 +182,10 @@ func TestV2RealTimeHTTPCommandsAndState(t *testing.T) {
 	if status := postRealTimeCommand(t, server, startBody, &started); status != http.StatusOK || started.Command.Replayed || started.Sequence != 1 || started.Elapsed != 0 {
 		t.Fatalf("start status/state=%+v", started)
 	}
+	countdownState := getRealTimeState(t, server)
+	if countdownState.RealTime.Lifecycle != game.LifecycleCountdown || countdownState.RealTime.QuoteRevision != 0 || countdownState.RealTime.BidOrderID != nil || countdownState.RealTime.AskOrderID != nil || len(countdownState.RealTime.Depth.Bids) != 0 || len(countdownState.RealTime.Depth.Asks) != 0 {
+		t.Fatalf("opening quote became live during countdown: %+v", countdownState)
+	}
 	var replayed realTimeCommandResponse
 	if status := postRealTimeCommand(t, server, startBody, &replayed); status != http.StatusOK || !replayed.Command.Replayed || replayed.Sequence != started.Sequence || replayed.Elapsed != started.Elapsed {
 		t.Fatalf("replay status=%d response=%+v", status, replayed)
@@ -267,6 +271,33 @@ func TestV2RealTimeHTTPCommandsAndState(t *testing.T) {
 	}
 	if completed.RealTime.Lifecycle != game.LifecycleCompleted || !completed.State.IsOver || completed.State.Reason != exchange.PlayerQuit || completed.RealTime.BidOrderID != nil || completed.RealTime.AskOrderID != nil {
 		t.Fatalf("completed=%+v", completed)
+	}
+}
+
+func TestV2RealTimeCountdownPauseResumeActivatesOpeningQuote(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledgement realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement)
+	postRealTimeCommand(t, server, `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`, &acknowledgement)
+	paused := getRealTimeState(t, server)
+	if paused.RealTime.Lifecycle != game.LifecyclePaused || paused.RealTime.QuoteRevision != 0 || paused.State.BestBid != 0 || paused.State.BestAsk != 0 {
+		t.Fatalf("paused=%+v", paused)
+	}
+	postRealTimeCommand(t, server, `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`, &acknowledgement)
+	running := getRealTimeState(t, server)
+	if running.RealTime.Lifecycle != game.LifecycleRunning || running.RealTime.QuoteRevision != 1 || running.State.BestBid != fixed.Price(995_000) || running.State.BestAsk != fixed.Price(1_005_000) || running.RealTime.BidOrderID == nil || running.RealTime.AskOrderID == nil {
+		t.Fatalf("running=%+v", running)
 	}
 }
 
@@ -386,6 +417,10 @@ func TestV2RealTimeCommandValidationAndModeGating(t *testing.T) {
 	}{
 		{`{"id":"` + testQuoteID + `","type":"update_quote","bid":"99.5000","ask":"100.5000"}`, "invalid_request"},
 		{`{"id":"` + testQuoteID + `","type":"pause_session","bid":"99.5000"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"pause_session","expected_quote_revision":null}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"update_quote","expected_quote_revision":null,"bid":"99.5000","ask":"100.5000"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":null}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `"}`, "invalid_request"},
 		{`{"id":"` + testQuoteID + `","type":"submit_quote","expected_version":0,"bid":"99.5000","ask":"100.5000"}`, "command_unavailable_for_mode"},
 	} {
 		var apiErr apiError
@@ -566,6 +601,9 @@ func TestV2RealTimeAcknowledgesCommitBeforeTimerFailure(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("failed runtime state status=%d", resp.StatusCode)
+	}
+	if service.storageHealthy() {
+		t.Fatal("failed runtime remained ready")
 	}
 }
 
@@ -945,7 +983,7 @@ func TestRealTimeColdLoadNormalizesActiveLifecycle(t *testing.T) {
 			}
 			wantElapsed := time.Duration(0)
 			if lifecycle == game.LifecycleRunning {
-				countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+				countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 				if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 					t.Fatalf("countdown=%+v", outcome)
 				}
@@ -1058,9 +1096,19 @@ func TestRealTimeCompletedReplaySurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond)
-	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := sequencer.View(t.Context(), func() any { return nil })
+	if err != nil || view.Snapshot.Status != realtime.StatusRunning {
+		t.Fatalf("countdown view=%+v err=%v", view, err)
+	}
 	clock.Advance(time.Duration(entry.scenario.RealTime.DurationMilliseconds) * time.Millisecond)
-	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleCompleted })
+	view, err = sequencer.View(t.Context(), func() any { return nil })
+	if err != nil || view.Snapshot.Status != realtime.StatusCompleted {
+		t.Fatalf("view=%+v err=%v", view, err)
+	}
 	closeRealTimeSequencer(t, entry)
 
 	restarted := newExchangeService(root)
@@ -1226,7 +1274,7 @@ func TestRealTimeActionsAndRejectionsReplayExactly(t *testing.T) {
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}
@@ -1292,7 +1340,7 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}
@@ -1346,7 +1394,7 @@ func TestRealTimeRecoveryRetainsSystemActionAndTruncatesPartialSuffix(t *testing
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}

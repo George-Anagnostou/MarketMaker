@@ -665,6 +665,13 @@ func (e *Engine) UpdateQuote(bid, ask fixed.Price, quantity fixed.Qty) (Result, 
 	})
 }
 
+func (e *Engine) ValidateRealTimeQuote(bid, ask fixed.Price, quantity fixed.Qty) error {
+	if !quantity.Positive() || quantity > e.cfg.MaxOrderQty {
+		return errors.New("quote quantity exceeds configured limits")
+	}
+	return e.validatePlayerQuote(bid, ask, quantity)
+}
+
 type CustomerArrival struct {
 	Side         Side
 	Quantity     fixed.Qty

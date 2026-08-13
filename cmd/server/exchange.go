@@ -125,7 +125,7 @@ type realTimeCommandRequest struct {
 	Type             string          `json:"type"`
 	Bid              json.RawMessage `json:"bid"`
 	Ask              json.RawMessage `json:"ask"`
-	ExpectedRevision *uint64         `json:"expected_quote_revision"`
+	ExpectedRevision json.RawMessage `json:"expected_quote_revision"`
 }
 
 func (req realTimeCommandRequest) prices() (fixed.Price, fixed.Price, error) {
@@ -454,6 +454,10 @@ func (s *exchangeService) handleExchangeCommand(w http.ResponseWriter, r *http.R
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if kind.Type == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "command type is required")
+		return
+	}
 	commandType = kind.Type
 	if mode == game.PlayModeRealTime {
 		outcome = s.handleRealTimeCommand(w, r, id, entry, data, kind.Type)
@@ -592,7 +596,7 @@ func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.R
 	var err error
 	switch kind {
 	case realtime.ActionStartSession:
-		if req.ExpectedRevision != nil {
+		if len(req.ExpectedRevision) != 0 {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request", "start_session does not accept expected_quote_revision")
 			return "rejected"
 		}
@@ -603,8 +607,13 @@ func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.R
 		}
 		execution, err = entry.startRealTime(r.Context(), req.ID, bid, ask)
 	case realtime.ActionUpdateQuote:
-		if req.ExpectedRevision == nil {
+		if len(req.ExpectedRevision) == 0 {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request", "expected_quote_revision is required")
+			return "rejected"
+		}
+		var expectedRevision uint64
+		if bytes.Equal(bytes.TrimSpace(req.ExpectedRevision), []byte("null")) || json.Unmarshal(req.ExpectedRevision, &expectedRevision) != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", "expected_quote_revision must be an unsigned integer")
 			return "rejected"
 		}
 		bid, ask, parseErr := req.prices()
@@ -612,9 +621,9 @@ func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.R
 			writeAPIError(w, http.StatusBadRequest, "invalid_request", parseErr.Error())
 			return "rejected"
 		}
-		execution, err = entry.updateRealTimeQuote(r.Context(), req.ID, bid, ask, *req.ExpectedRevision)
+		execution, err = entry.updateRealTimeQuote(r.Context(), req.ID, bid, ask, expectedRevision)
 	case realtime.ActionPauseSession, realtime.ActionResumeSession, realtime.ActionQuitSession:
-		if len(req.Bid) != 0 || len(req.Ask) != 0 || req.ExpectedRevision != nil {
+		if len(req.Bid) != 0 || len(req.Ask) != 0 || len(req.ExpectedRevision) != 0 {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request", kind+" does not accept quote fields")
 			return "rejected"
 		}
@@ -627,6 +636,10 @@ func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.R
 		}
 	}
 	if err != nil {
+		metricOutcome := "rejected"
+		if execution.Replayed {
+			metricOutcome = "replayed"
+		}
 		if entry.realTimeActionCommitted(req.ID, execution) {
 			writeJSON(w, http.StatusOK, realTimeAcknowledgement(id, req.ID, kind, execution))
 			if execution.Replayed {
@@ -647,7 +660,7 @@ func (s *exchangeService) handleRealTimeCommand(w http.ResponseWriter, r *http.R
 			writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command was not committed")
 			return "storage_failure"
 		}
-		return "rejected"
+		return metricOutcome
 	}
 	if _, ok := execution.Result.(exchange.Result); !ok {
 		writeAPIError(w, http.StatusInternalServerError, "storage_failure", "command result is unavailable")
@@ -754,9 +767,26 @@ func (entry *exchangeEntry) executeRealTimeAction(action realtime.Action, elapse
 		if !ok {
 			return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("start action has an invalid payload")}
 		}
+		if err := entry.engine.ValidateRealTimeQuote(payload.Bid, payload.Ask, entry.scenario.RealTime.QuoteQuantity); err != nil {
+			outcome = realtime.Outcome{Result: exchange.Result{State: entry.engine.State()}, Disposition: realtime.DispositionReject, Err: err}
+		}
+	case realtime.ActionCountdownComplete:
+		payload, ok := action.Payload.(realtime.CountdownCompletePayload)
+		if !ok {
+			return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("countdown action has an invalid payload")}
+		}
 		revision := entry.realtimeExec.QuoteRevision()
 		outcome = entry.realtimeExec.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
-	case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
+	case realtime.ActionPauseSession:
+	case realtime.ActionResumeSession:
+		if entry.realtimeExec.QuoteRevision() == 0 {
+			payload, ok := openingQuoteFromRecords(entry.commands)
+			if !ok {
+				return realtime.Outcome{Disposition: realtime.DispositionFail, Err: errors.New("staged opening quote is unavailable")}
+			}
+			revision := entry.realtimeExec.QuoteRevision()
+			outcome = entry.realtimeExec.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
+		}
 	default:
 		outcome = entry.realtimeExec.Execute(action, elapsed)
 	}
@@ -843,6 +873,21 @@ func replayRealTimeRecord(action realtime.Action, durable realtime.DurableAction
 	return execution
 }
 
+func openingQuoteFromRecords(records map[string]eventlog.Record) (realtime.StartSessionPayload, bool) {
+	for _, record := range records {
+		if record.Rejection != nil || record.Action == nil || record.Action.Kind != realtime.ActionStartSession {
+			continue
+		}
+		action, err := record.Action.Decode()
+		if err != nil {
+			return realtime.StartSessionPayload{}, false
+		}
+		payload, ok := action.Payload.(realtime.StartSessionPayload)
+		return payload, ok
+	}
+	return realtime.StartSessionPayload{}, false
+}
+
 func (entry *exchangeEntry) replayRealTimeAction(action realtime.Action) (realtime.Execution, bool) {
 	durable, err := realtime.EncodeAction(action)
 	if err != nil {
@@ -903,7 +948,8 @@ func (entry *exchangeEntry) ensureRealTimeSequencer() (*realtime.Sequencer, erro
 		ReplayLookup: entry.replayRealTimeAction,
 		Countdown:    countdown,
 		CountdownAction: func(start realtime.Action) realtime.Action {
-			return realtime.Action{ID: realtime.SystemActionIDPrefix + "countdown_complete/" + start.ID, Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+			payload := start.Payload.(realtime.StartSessionPayload)
+			return realtime.Action{ID: realtime.SystemActionIDPrefix + "countdown_complete/" + start.ID, Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: payload.Bid, Ask: payload.Ask}}
 		},
 		Checkpoint:       checkpoint,
 		DurableLifecycle: true,
@@ -1083,7 +1129,7 @@ func (entry *exchangeEntry) recentRealTimeTradesLocked(limit int) []realTimeTrad
 	events := make([]exchange.Event, 0)
 	for _, record := range entry.commands {
 		for _, event := range record.Result.Events {
-			if event.Type == "trade" && event.Trade != nil {
+			if event.Type == "trade" && event.Trade != nil && (event.Trade.BuyerID == exchange.PlayerAccount || event.Trade.SellerID == exchange.PlayerAccount) {
 				events = append(events, event)
 			}
 		}
@@ -1092,13 +1138,15 @@ func (entry *exchangeEntry) recentRealTimeTradesLocked(limit int) []realTimeTrad
 	if len(events) > limit {
 		events = events[len(events)-limit:]
 	}
-	trades := make([]realTimeTrade, len(events))
-	for index, event := range events {
-		side := exchange.Sell
+	trades := make([]realTimeTrade, 0, len(events))
+	for _, event := range events {
+		var side exchange.Side
 		if event.Trade.BuyerID == exchange.PlayerAccount {
 			side = exchange.Buy
+		} else if event.Trade.SellerID == exchange.PlayerAccount {
+			side = exchange.Sell
 		}
-		trades[index] = realTimeTrade{EventSequence: event.Sequence, TradeID: event.Trade.ID, Side: side, Price: event.Trade.Price, Quantity: event.Trade.Quantity}
+		trades = append(trades, realTimeTrade{EventSequence: event.Sequence, TradeID: event.Trade.ID, Side: side, Price: event.Trade.Price, Quantity: event.Trade.Quantity})
 	}
 	return trades
 }
@@ -1308,10 +1356,16 @@ func (s *exchangeService) storageHealthy() bool {
 	s.mu.Unlock()
 	for _, entry := range entries {
 		entry.mu.Lock()
-		failed := entry.storageFailed
+		failed, sequencer := entry.storageFailed, entry.sequencer
 		entry.mu.Unlock()
 		if failed {
 			return false
+		}
+		if sequencer != nil {
+			snapshot, err := sequencer.Snapshot(context.Background())
+			if err != nil || snapshot.Status == realtime.StatusFailed {
+				return false
+			}
 		}
 	}
 	return true
@@ -1560,9 +1614,32 @@ func replayRealTimeRecords(meta eventlog.Meta, records []eventlog.Record) (*exch
 			if !ok {
 				return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("start action has invalid payload at record %d", record.Version)
 			}
-			revision := executor.QuoteRevision()
-			outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
-		case realtime.ActionCountdownComplete, realtime.ActionPauseSession, realtime.ActionResumeSession:
+			if meta.Schema == eventlog.RealTimeSchemaVersion {
+				if err := engine.ValidateRealTimeQuote(payload.Bid, payload.Ask, meta.Scenario.RealTime.QuoteQuantity); err != nil {
+					outcome = realtime.Outcome{Result: exchange.Result{State: engine.State()}, Disposition: realtime.DispositionReject, Err: err}
+				}
+			} else {
+				outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask}}, elapsed)
+			}
+		case realtime.ActionCountdownComplete:
+			if meta.Schema == eventlog.RealTimeSchemaVersion {
+				payload, ok := action.Payload.(realtime.CountdownCompletePayload)
+				if !ok {
+					return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("countdown action has invalid payload at record %d", record.Version)
+				}
+				revision := executor.QuoteRevision()
+				outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
+			}
+		case realtime.ActionPauseSession:
+		case realtime.ActionResumeSession:
+			if executor.QuoteRevision() == 0 {
+				payload, ok := openingQuoteFromRecords(actions)
+				if !ok {
+					return nil, nil, nil, nil, realTimeReplaySummary{}, fmt.Errorf("staged opening quote is unavailable at record %d", record.Version)
+				}
+				revision := executor.QuoteRevision()
+				outcome = executor.Execute(realtime.Action{ID: action.ID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: payload.Bid, Ask: payload.Ask, ExpectedRevision: &revision}}, elapsed)
+			}
 		default:
 			outcome = executor.Execute(action, elapsed)
 		}

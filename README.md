@@ -78,7 +78,7 @@ POST /api/v2/games/{game_id}/commands
 GET  /api/v2/games/{game_id}/events?after={sequence}&through={sequence}
 ```
 
-Real-time games use `start_session`, `update_quote`, `pause_session`, `resume_session`, and `quit`. Quote updates include `expected_quote_revision` instead of the turn-based global version precondition. Successful mutations return a durable acknowledgement with action sequence and logical elapsed time; clients read canonical state with `GET`. Canonical state includes authoritative lifecycle/time, live quote revision and order IDs, shallow depth, recent trades, and durable action/event boundaries. Commands remain idempotent by UUID; retries return the original acknowledgement and stale quote revisions return `409`.
+Real-time games use `start_session`, `update_quote`, `pause_session`, `resume_session`, and `quit`. The opening quote is staged during countdown and becomes live at logical time zero. Quote updates include `expected_quote_revision` instead of the turn-based global version precondition. Successful mutations return a durable acknowledgement with action sequence and logical elapsed time; clients read canonical state with `GET`. Canonical state includes authoritative lifecycle/time, live quote revision and order IDs, shallow depth, recent trades, and durable action/event boundaries. Commands remain idempotent by UUID; retries return the original acknowledgement and stale quote revisions return `409`.
 
 The server owns the lesson catalog. Fetch the available scenario snapshots, then create a game with a client-generated `game_id`, `command_id`, and a catalog `scenario_id`:
 
