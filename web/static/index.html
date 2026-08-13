@@ -510,6 +510,31 @@ function syncQuoteControls() {
   $('play-again').disabled = Boolean(pendingCommand) || startingSession || restoring || unresolved;
   $('review-history').disabled = Boolean(pendingCommand) || startingSession || restoring;
 }
+function setConnectionState(state, message) {
+  const element = $('connection-status');
+  element.hidden = !message;
+  element.dataset.state = state;
+  element.textContent = message || '';
+}
+function closeRealtimeStream() {
+  if (stream) { stream.close(); stream = null; }
+}
+function openRealtimeStream() {
+  if (!realtimeMode || !gameId || isOver || typeof EventSource === 'undefined') return;
+  closeRealtimeStream();
+  stream = new EventSource(`/api/v2/games/${gameId}/stream`);
+  stream.onopen = () => setConnectionState('connected', 'Connected.');
+  const synchronize = event => {
+    const sequence = Number(event.lastEventId || 0);
+    if (sequence && sequence <= lastStreamSequence) return;
+    if (sequence) lastStreamSequence = sequence;
+    hydrateGameWithoutFocus(gameId);
+  };
+  stream.onmessage = synchronize;
+  stream.addEventListener('snapshot', synchronize);
+  stream.addEventListener('state', synchronize);
+  stream.onerror = () => setConnectionState('reconnecting', 'Connection lost. Reconnecting and synchronizing state…');
+}
 
 function setState(state, summary, recap) {
   const equity = state.equity;

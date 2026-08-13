@@ -32,6 +32,8 @@ type streamSubscriber struct {
 	done       chan struct{}
 	once       sync.Once
 	generation uint64
+	ready      bool
+	pending    []streamMessage
 }
 
 func (s *streamSubscriber) close() {
@@ -71,7 +73,7 @@ func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubs
 		return nil, streamMessage{}, nil, errors.New("Last-Event-ID is beyond the durable action boundary")
 	}
 	entry.controller.nextGeneration++
-	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration}
+	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration, ready: false}
 	if entry.controller.active != nil {
 		entry.controller.active.close()
 	}
@@ -90,7 +92,23 @@ func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubs
 			backfill = append(backfill, streamMessageForState(sequence, state))
 		}
 	}
+	subscriber.pending = backfill
 	return subscriber, snapshot, backfill, nil
+}
+
+func (entry *exchangeEntry) drainPendingControllerMessages(subscriber *streamSubscriber) ([]streamMessage, bool) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.controller.active != subscriber {
+		return nil, true
+	}
+	pending := subscriber.pending
+	subscriber.pending = nil
+	if len(pending) == 0 {
+		subscriber.ready = true
+		return nil, true
+	}
+	return pending, false
 }
 
 func (entry *exchangeEntry) connectController() (*streamSubscriber, error) {
@@ -100,7 +118,7 @@ func (entry *exchangeEntry) connectController() (*streamSubscriber, error) {
 		return nil, errors.New("controller stream requires a real-time game")
 	}
 	entry.controller.nextGeneration++
-	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration}
+	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration, ready: true}
 	if entry.controller.active != nil {
 		entry.controller.active.close()
 	}
@@ -158,6 +176,10 @@ func (entry *exchangeEntry) publishStreamLocked(message streamMessage) {
 	if entry.controller.active == nil {
 		return
 	}
+	if !entry.controller.active.ready {
+		entry.controller.active.pending = append(entry.controller.active.pending, message)
+		return
+	}
 	select {
 	case entry.controller.active.ch <- message:
 	default:
@@ -206,7 +228,7 @@ func (s *exchangeService) handleExchangeStream(w http.ResponseWriter, r *http.Re
 		writeAPIError(w, http.StatusBadRequest, "invalid_cursor", err.Error())
 		return
 	}
-	subscriber, snapshot, backfill, err := entry.streamHandoff(id, cursor)
+	subscriber, snapshot, _, err := entry.streamHandoff(id, cursor)
 	if err != nil {
 		status := http.StatusConflict
 		if strings.Contains(err.Error(), "beyond") {
@@ -224,9 +246,15 @@ func (s *exchangeService) handleExchangeStream(w http.ResponseWriter, r *http.Re
 	if err := writeSSE(w, snapshot); err != nil {
 		return
 	}
-	for _, message := range backfill {
-		if err := writeSSE(w, message); err != nil {
-			return
+	for {
+		pending, ready := entry.drainPendingControllerMessages(subscriber)
+		for _, message := range pending {
+			if err := writeSSE(w, message); err != nil {
+				return
+			}
+		}
+		if ready {
+			break
 		}
 	}
 
