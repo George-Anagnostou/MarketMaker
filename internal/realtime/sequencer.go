@@ -1134,6 +1134,12 @@ func (s *Sequencer) run() {
 				stopTimer()
 				req.reply <- response{execution: execution, snapshot: snapshot(req.received)}
 			case DispositionReject:
+				if status == StatusRunning {
+					if err := armTimer(); err != nil {
+						req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+						return false
+					}
+				}
 				req.reply <- response{execution: execution, err: execution.Err}
 			case DispositionContinue, DispositionFail:
 				cause := execution.Err
@@ -1151,9 +1157,7 @@ func (s *Sequencer) run() {
 					return false
 				}
 				if status == StatusRunning {
-					elapsed = target
-					anchor = req.received
-					if err := armTimerAt(req.received); err != nil {
+					if err := armTimer(); err != nil {
 						req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
 						return false
 					}

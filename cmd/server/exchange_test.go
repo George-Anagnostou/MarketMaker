@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,6 +45,11 @@ type serverManualTimer struct {
 	stopped bool
 	fired   bool
 }
+
+type nilTimerClock struct{ now time.Time }
+
+func (c nilTimerClock) Now() time.Time                      { return c.now }
+func (nilTimerClock) NewTimer(time.Duration) realtime.Timer { return nil }
 
 func newServerManualClock() *serverManualClock {
 	return &serverManualClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), timers: make(map[*serverManualTimer]struct{})}
@@ -387,6 +393,179 @@ func TestV2RealTimeCommandValidationAndModeGating(t *testing.T) {
 		if status < 400 || apiErr.Error.Code != test.code {
 			t.Fatalf("body=%s status=%d error=%+v", test.body, status, apiErr)
 		}
+	}
+}
+
+func TestV2RealTimeCreateIDConflictDoesNotConsumeSequence(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	conflictBody := `{"id":"` + testCreateID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	var conflict apiError
+	if status := postRealTimeCommand(t, server, conflictBody, &conflict); status != http.StatusConflict || conflict.Error.Code != "idempotency_key_reused" {
+		t.Fatalf("conflict status=%d response=%+v", status, conflict)
+	}
+	validBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	var accepted realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, validBody, &accepted); status != http.StatusOK || accepted.Sequence != 1 {
+		t.Fatalf("accepted status=%d response=%+v", status, accepted)
+	}
+	var replayed realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, validBody, &replayed); status != http.StatusOK || !replayed.Command.Replayed || replayed.Sequence != 1 {
+		t.Fatalf("replayed status=%d response=%+v", status, replayed)
+	}
+}
+
+func TestV2RealTimeConcurrentQuoteRevisionAndReads(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var started realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &started)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+
+	type commandResult struct {
+		status int
+		body   []byte
+	}
+	commandBodies := []string{
+		`{"id":"55555555-5555-4555-8555-555555555555","type":"update_quote","expected_quote_revision":1,"bid":"99.6000","ask":"100.4000"}`,
+		`{"id":"66666666-6666-4666-8666-666666666666","type":"update_quote","expected_quote_revision":1,"bid":"99.7000","ask":"100.3000"}`,
+	}
+	results := make(chan commandResult, len(commandBodies))
+	for _, body := range commandBodies {
+		go func() {
+			response, requestErr := http.Post(server.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(body))
+			if requestErr != nil {
+				results <- commandResult{status: 0, body: []byte(requestErr.Error())}
+				return
+			}
+			defer response.Body.Close()
+			data, _ := io.ReadAll(response.Body)
+			results <- commandResult{status: response.StatusCode, body: data}
+		}()
+	}
+	statuses := map[int]int{}
+	for range commandBodies {
+		result := <-results
+		statuses[result.status]++
+		if result.status != http.StatusOK && result.status != http.StatusConflict {
+			t.Fatalf("unexpected command result: status=%d body=%s", result.status, result.body)
+		}
+	}
+	if statuses[http.StatusOK] != 1 || statuses[http.StatusConflict] != 1 {
+		t.Fatalf("statuses=%v", statuses)
+	}
+	state := getRealTimeState(t, server)
+	if state.RealTime.QuoteRevision != 2 || state.RealTime.ActionsThrough != 4 {
+		t.Fatalf("state=%+v", state)
+	}
+	validQuote := state.State.BestBid == fixed.Price(996_000) && state.State.BestAsk == fixed.Price(1_004_000) || state.State.BestBid == fixed.Price(997_000) && state.State.BestAsk == fixed.Price(1_003_000)
+	if !validQuote {
+		t.Fatalf("mixed quote state=%+v", state.State)
+	}
+}
+
+func TestV2RealTimeConcurrentDuplicateCommandExecutesOnce(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	startBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	const workers = 12
+	type result struct {
+		status int
+		body   realTimeCommandResponse
+	}
+	results := make(chan result, workers)
+	for range workers {
+		go func() {
+			response, requestErr := http.Post(server.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(startBody))
+			if requestErr != nil {
+				results <- result{}
+				return
+			}
+			defer response.Body.Close()
+			var body realTimeCommandResponse
+			_ = json.NewDecoder(response.Body).Decode(&body)
+			results <- result{status: response.StatusCode, body: body}
+		}()
+	}
+	nonReplayed := 0
+	for range workers {
+		result := <-results
+		if result.status != http.StatusOK || result.body.Sequence != 1 {
+			t.Fatalf("result=%+v", result)
+		}
+		if !result.body.Command.Replayed {
+			nonReplayed++
+		}
+	}
+	if nonReplayed != 1 {
+		t.Fatalf("non-replayed responses=%d", nonReplayed)
+	}
+	_, records, err := eventlog.Open(service.root, testGameID)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%d err=%v", len(records), err)
+	}
+}
+
+func TestV2RealTimeAcknowledgesCommitBeforeTimerFailure(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSequencer = func(config realtime.Config) (*realtime.Sequencer, error) {
+		config.Clock = nilTimerClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+		return realtime.NewConfigured(config)
+	}
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledged realTimeCommandResponse
+	startBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	if status := postRealTimeCommand(t, server, startBody, &acknowledged); status != http.StatusOK || acknowledged.Sequence != 1 {
+		t.Fatalf("acknowledgement status=%d response=%+v", status, acknowledged)
+	}
+	_, records, err := eventlog.Open(service.root, testGameID)
+	if err != nil || len(records) != 1 || records[0].Action.ID != testQuoteID {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+	resp, err = http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("failed runtime state status=%d", resp.StatusCode)
 	}
 }
 

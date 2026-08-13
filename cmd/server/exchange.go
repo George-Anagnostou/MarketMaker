@@ -930,6 +930,9 @@ func (entry *exchangeEntry) ensureRealTimeSequencer() (*realtime.Sequencer, erro
 }
 
 func (entry *exchangeEntry) startRealTime(ctx context.Context, id string, bid, ask fixed.Price) (realtime.Execution, error) {
+	if err := entry.validateParticipantActionID(id); err != nil {
+		return realtime.Execution{}, err
+	}
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
@@ -938,6 +941,9 @@ func (entry *exchangeEntry) startRealTime(ctx context.Context, id string, bid, a
 }
 
 func (entry *exchangeEntry) updateRealTimeQuote(ctx context.Context, id string, bid, ask fixed.Price, expectedRevision uint64) (realtime.Execution, error) {
+	if err := entry.validateParticipantActionID(id); err != nil {
+		return realtime.Execution{}, err
+	}
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
@@ -955,6 +961,11 @@ func (entry *exchangeEntry) systemPauseRealTime(ctx context.Context, id string, 
 }
 
 func (entry *exchangeEntry) pauseRealTimeWithSource(ctx context.Context, id string, source realtime.Source, reason realtime.PauseReason) (realtime.Execution, error) {
+	if source == realtime.SourceParticipant {
+		if err := entry.validateParticipantActionID(id); err != nil {
+			return realtime.Execution{}, err
+		}
+	}
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
@@ -963,6 +974,9 @@ func (entry *exchangeEntry) pauseRealTimeWithSource(ctx context.Context, id stri
 }
 
 func (entry *exchangeEntry) resumeRealTime(ctx context.Context, id string) (realtime.Execution, error) {
+	if err := entry.validateParticipantActionID(id); err != nil {
+		return realtime.Execution{}, err
+	}
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
@@ -971,11 +985,23 @@ func (entry *exchangeEntry) resumeRealTime(ctx context.Context, id string) (real
 }
 
 func (entry *exchangeEntry) quitRealTime(ctx context.Context, id string) (realtime.Execution, error) {
+	if err := entry.validateParticipantActionID(id); err != nil {
+		return realtime.Execution{}, err
+	}
 	sequencer, err := entry.ensureRealTimeSequencer()
 	if err != nil {
 		return realtime.Execution{}, err
 	}
 	return sequencer.CompleteAction(ctx, realtime.Action{ID: id, Kind: realtime.ActionQuitSession, Source: realtime.SourceParticipant})
+}
+
+func (entry *exchangeEntry) validateParticipantActionID(id string) error {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if id == entry.log.Meta().CreateCommandID {
+		return realtime.ErrActionConflict
+	}
+	return nil
 }
 
 func (entry *exchangeEntry) realTimeStateResponse(ctx context.Context, id string) (exchangeStateResponse, error) {
