@@ -151,3 +151,27 @@ func TestExchangeExecutorRejectsParticipantErrorsAndFencesSystemErrors(t *testin
 		t.Fatal("unrepresentable carry rate accepted")
 	}
 }
+
+func TestExchangeExecutorTracksQuoteRevisionAndQuits(t *testing.T) {
+	engine, err := exchange.New(realtimeExchangeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewExchangeExecutor(engine, ExchangeExecutorConfig{QuoteQuantity: fixed.Qty(100_000), CarryPerUnit: fixed.Price(10_000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := executor.Execute(Action{ID: "first", Kind: ActionUpdateQuote, Source: SourceParticipant, Payload: UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000), ExpectedRevision: revisionPointer(0)}}, 0)
+	if first.Err != nil || executor.QuoteRevision() != 1 {
+		t.Fatalf("first=%+v revision=%d", first, executor.QuoteRevision())
+	}
+	stale := executor.Execute(Action{ID: "stale", Kind: ActionUpdateQuote, Source: SourceParticipant, Payload: UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000), ExpectedRevision: revisionPointer(0)}}, 0)
+	if !errors.Is(stale.Err, ErrQuoteRevisionConflict) || executor.QuoteRevision() != 1 || engine.State().BestBid != fixed.Price(990_000) {
+		t.Fatalf("stale=%+v revision=%d state=%+v", stale, executor.QuoteRevision(), engine.State())
+	}
+	quit := executor.Execute(Action{ID: "quit", Kind: ActionQuitSession, Source: SourceParticipant}, 0)
+	result, ok := quit.Result.(exchange.Result)
+	if !ok || quit.Err != nil || quit.Disposition != DispositionComplete || !result.State.IsOver || result.State.Reason != exchange.PlayerQuit || result.State.BestBid != 0 || result.State.BestAsk != 0 || executor.QuoteRevision() != 1 {
+		t.Fatalf("quit=%+v revision=%d", quit, executor.QuoteRevision())
+	}
+}

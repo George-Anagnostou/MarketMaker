@@ -2,7 +2,7 @@
 
 ## Status
 
-This document is the product specification and implementation roadmap for real-time play. The current branch implements the internal deterministic runtime, durable lifecycle log, replay, recovery, and shutdown foundations. Public real-time commands, SSE, and browser play remain explicitly deferred to Phase 5 and later.
+This document is the product specification and implementation roadmap for real-time play. The current branch implements the internal deterministic runtime, durable lifecycle log, replay, recovery, shutdown foundations, and focused HTTP command/canonical-state slice. SSE, disconnect handling, and browser play remain deferred.
 
 ## Product Direction
 
@@ -58,10 +58,10 @@ preparing -> countdown -> running <-> paused -> completed
 ```
 
 - **Preparing:** The player edits an opening bid and ask. No market time passes.
-- **Countdown:** A start command validates and stages the opening quote, then begins a three-second ready countdown. No customer flow or mark movement occurs during the countdown. Once acknowledged, the countdown is irreversible.
+- **Countdown:** A start command validates and stages the opening quote, then begins a three-second ready countdown. No customer flow or mark movement occurs during the countdown. Once acknowledged, the session cannot return to preparing; it may still be paused or quit.
 - **Running:** The opening quote becomes live at logical time zero. The 90-second logical clock, scheduled customer flow, mark movement, carry charges, and risk evaluation begin.
 - **Paused:** Logical time and all scheduled market activity freeze. Resting orders and account state remain unchanged. Resuming retains the quote.
-- **Completed:** New quote commands are rejected. Resting player orders are cancelled, final equity is marked at the final reference price, and the recap is generated.
+- **Completed:** New quote commands are rejected. Resting player orders are cancelled and final equity is marked at the final reference price. Continuous recap generation is added with the browser slice.
 
 Normal expiry marks open inventory to market; it does not synthesize a liquidation trade. Margin breach, insolvency, explicit quit, and storage failure remain terminal reasons. A completed or failed session cannot resume.
 
@@ -348,12 +348,11 @@ No coaching overlay interrupts the running session.
 
 ## Implementation Roadmap
 
-Implementation through the internal Phase 4 lifecycle boundary is complete on
-the real-time feature branch: schema 5 persists lifecycle actions, the live
-sequencer runs countdown and deterministic market activity, interrupted active
-solo games recover paused without counting downtime, and graceful shutdown
-durably pauses loaded active games. HTTP commands, SSE, disconnect grace, and
-browser controls remain deferred to Phase 5 and later.
+Implementation through the focused Phase 5 HTTP/state boundary is complete:
+schema 6 persists revision-aware actions, the live sequencer runs countdown and
+deterministic market activity, interrupted active solo games recover paused
+without counting downtime, and graceful shutdown durably pauses loaded active
+games. SSE, disconnect grace, and browser controls remain deferred.
 
 ### Phase 0: Specification And Compatibility Baseline
 
@@ -400,11 +399,11 @@ Exit criterion: a headless 90-second First Spread trading day runs under a manua
 3. Build state, quote, depth, tape, chart, and P&L projections. **Deferred to the public API/browser slices.**
 4. Benchmark fsync pacing, file growth, and recovery. **Deferred to hardening.**
 
-Exit criterion: interruption and replay tests pass at every implemented action boundary. The runtime is internally playable under injected clocks; it is not yet exposed as a public real-time API.
+Exit criterion: interruption and replay tests pass at every implemented action boundary. The runtime is internally playable under injected clocks; public transport is added in Phase 5.
 
 ### Phase 5: HTTP Commands And SSE
 
-1. Expose real-time start, update, pause, resume, quit, state, audit, and stream behavior.
+1. Expose real-time start, update, pause, resume, quit, state, and audit behavior. **HTTP commands and canonical state complete; stream deferred.**
 2. Implement cursor handoff, heartbeat, bounded subscribers, backfill, and disconnect grace.
 3. Preserve the current turn-based API path and mode-gate every command.
 4. Add metrics for schedule lateness, queue delay, connected streams, auto-pauses, and dropped slow consumers without unbounded labels.

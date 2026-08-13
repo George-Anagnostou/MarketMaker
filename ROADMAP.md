@@ -2,9 +2,9 @@
 
 ## Current Status
 
-The real-time branch now contains an internal deterministic runtime alongside
-the existing turn-based product. It is not yet a public real-time venue: HTTP
-real-time commands and SSE remain deferred to the next phase.
+The real-time runtime now has a focused public HTTP command and canonical-state
+slice alongside the existing turn-based product. SSE, disconnect grace, and
+browser controls remain deferred to the next phase.
 
 The project now has a coherent local exchange foundation:
 
@@ -19,10 +19,10 @@ The project now has a coherent local exchange foundation:
 
 This is a sound simulation kernel, not yet a shared real-time venue. Known constraints are intentional and should guide the next work:
 
-- The HTTP scenario API intentionally exposes only player quote/quit commands until authenticated account ownership exists. The venue supports multi-account order primitives internally.
+- The HTTP scenario API exposes only mode-specific solo player commands until authenticated account ownership exists. The venue supports multi-account order primitives internally.
 - The book uses deterministic price levels and FIFO queues. It is correct for a single instrument, but it still needs per-instrument sharding and performance profiling before high order counts.
-- Turn-based time advances when a player submits a quote. The internal real-time mode has an independent sequencer and scheduled event queue, but it is not yet exposed through the public API.
-- JSONL storage is single-process and local. New games use atomic directory publication and schema-3 metadata-to-record binding; schema-1 and schema-2 games remain readable and appendable. It still has no compaction snapshots, cross-process lock, or PostgreSQL transaction layer.
+- Turn-based time advances when a player submits a quote. Real-time mode has an independent sequencer and scheduled event queue exposed through focused HTTP commands and canonical state; streaming remains deferred.
+- JSONL storage is single-process and local. New games use atomic directory publication and checksummed metadata-to-record binding; historical schemas remain readable. It still has no compaction snapshots, cross-process lock, or PostgreSQL transaction layer.
 - Risk has a balanced in-memory journal and conservative order-entry checks, but still lacks collateral/borrow models, forced liquidation, and kill switches.
 - The browser restores its durable turn audit, session path, latest coaching, and authoritative P&L attribution after refresh. It validates API envelopes before rendering and pins paginated audit hydration to the authoritative event boundary, but it has no charting or offline replay export.
 - CI checks formatting, vet, dependency-free browser runtime tests, race tests, and builds. The local server has storage-aware readiness, structured JSON request and error logs, bounded graceful shutdown, and local Prometheus metrics. Tracing, packaged static assets, and end-to-end browser testing remain deferred.

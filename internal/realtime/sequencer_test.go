@@ -234,8 +234,118 @@ func resumeAction(id string) Action {
 	return Action{ID: id, Kind: ActionResumeSession, Source: SourceParticipant}
 }
 
+func quitAction(id string) Action {
+	return Action{ID: id, Kind: ActionQuitSession, Source: SourceParticipant}
+}
+
 func countdownAction(start Action) Action {
 	return Action{ID: "system/countdown/" + start.ID, Kind: ActionCountdownComplete, Source: SourceSystem}
+}
+
+func TestSequencerCompleteActionAcrossLifecycles(t *testing.T) {
+	for _, status := range []Status{StatusPreparing, StatusPaused} {
+		t.Run(string(status), func(t *testing.T) {
+			checkpoint := Checkpoint{Status: status}
+			if status == StatusPaused {
+				checkpoint.Elapsed, checkpoint.Sequence = 4*time.Millisecond, 1
+			}
+			sequencer, err := NewConfigured(Config{Schedule: &recordingSchedule{}, Clock: newManualClock(), Checkpoint: checkpoint, Executor: func(action Action, elapsed time.Duration) Outcome {
+				return Outcome{Result: elapsed, Disposition: DispositionComplete}
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sequencer.Close()
+			execution, err := sequencer.CompleteAction(t.Context(), quitAction("quit"))
+			if err != nil || execution.Disposition != DispositionComplete || execution.Elapsed != checkpoint.Elapsed {
+				t.Fatalf("execution=%+v err=%v", execution, err)
+			}
+			snapshot, err := sequencer.Snapshot(t.Context())
+			if err != nil || snapshot.Status != StatusCompleted {
+				t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+			}
+		})
+	}
+}
+
+func TestSequencerCompleteActionDuringCountdown(t *testing.T) {
+	clock := newManualClock()
+	sequencer, err := NewConfigured(Config{
+		Schedule: &recordingSchedule{}, Clock: clock, Countdown: time.Second, CountdownAction: countdownAction,
+		Executor: func(action Action, _ time.Duration) Outcome {
+			if action.Kind == ActionQuitSession {
+				return Outcome{Result: "quit", Disposition: DispositionComplete}
+			}
+			return Outcome{Result: action.ID, Disposition: DispositionContinue}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if execution, err := sequencer.StartAction(t.Context(), startAction("start")); err != nil || execution.Sequence != 1 {
+		t.Fatalf("start=%+v err=%v", execution, err)
+	}
+	quit, err := sequencer.CompleteAction(t.Context(), quitAction("quit"))
+	if err != nil || quit.Elapsed != 0 || quit.Sequence != 2 || quit.Disposition != DispositionComplete {
+		t.Fatalf("quit=%+v err=%v", quit, err)
+	}
+}
+
+func TestSequencerCompleteActionRunsDueWorkAndReplays(t *testing.T) {
+	clock := newManualClock()
+	recorder := &executionRecorder{}
+	schedule := &recordingSchedule{actions: []ScheduledAction{systemAction("due", 5*time.Millisecond)}}
+	sequencer, err := NewWithScheduleAndClock(schedule, func(action Action, elapsed time.Duration) Outcome {
+		if action.Kind == ActionQuitSession {
+			recorder.execute(action, elapsed)
+			return Outcome{Result: "quit-result", Disposition: DispositionComplete}
+		}
+		return recorder.execute(action, elapsed)
+	}, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(7 * time.Millisecond)
+	first, err := sequencer.CompleteAction(t.Context(), quitAction("quit"))
+	if err != nil || first.Elapsed != 7*time.Millisecond || first.Sequence != 2 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	actions, times := recorder.snapshot()
+	if !reflect.DeepEqual(actions, []string{"due", "quit"}) || !reflect.DeepEqual(times, []time.Duration{5 * time.Millisecond, 7 * time.Millisecond}) {
+		t.Fatalf("actions=%v times=%v", actions, times)
+	}
+}
+
+func TestSequencerViewProcessesDueWorkAndHandlesProjectorFailure(t *testing.T) {
+	clock := newManualClock()
+	recorder := &executionRecorder{}
+	sequencer, err := NewWithScheduleAndClock(&recordingSchedule{actions: []ScheduledAction{systemAction("due", 5*time.Millisecond)}}, recorder.execute, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	if err := sequencer.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(7 * time.Millisecond)
+	view, err := sequencer.View(t.Context(), func() any { return "projected" })
+	if err != nil || view.Value != "projected" || view.Snapshot.Elapsed != 7*time.Millisecond || view.Snapshot.Sequence != 1 {
+		t.Fatalf("view=%+v err=%v", view, err)
+	}
+	if actions, _ := recorder.snapshot(); !reflect.DeepEqual(actions, []string{"due"}) {
+		t.Fatalf("actions=%v", actions)
+	}
+	if _, err := sequencer.View(t.Context(), func() any { panic("boom") }); err == nil {
+		t.Fatal("projector panic was not reported")
+	}
+	if snapshot, err := sequencer.Snapshot(t.Context()); err != nil || snapshot.Status != StatusRunning {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
 }
 
 func TestSequencerOrdersDueActionsBeforeParticipantAtSameTime(t *testing.T) {

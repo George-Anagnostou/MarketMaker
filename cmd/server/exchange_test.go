@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,6 +45,11 @@ type serverManualTimer struct {
 	stopped bool
 	fired   bool
 }
+
+type nilTimerClock struct{ now time.Time }
+
+func (c nilTimerClock) Now() time.Time                      { return c.now }
+func (nilTimerClock) NewTimer(time.Duration) realtime.Timer { return nil }
 
 func newServerManualClock() *serverManualClock {
 	return &serverManualClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), timers: make(map[*serverManualTimer]struct{})}
@@ -135,6 +141,476 @@ func closeRealTimeSequencer(t *testing.T, entry *exchangeEntry) {
 		_, _ = entry.systemPauseRealTime(t.Context(), fmt.Sprintf("system/test_pause/%d", snapshot.Sequence), realtime.PauseReasonShutdown)
 	}
 	_, _ = sequencer.Shutdown(t.Context())
+}
+
+func executionsEqualIgnoringReplay(left, right realtime.Execution) bool {
+	left.Replayed, right.Replayed = false, false
+	return reflect.DeepEqual(left, right)
+}
+
+func postRealTimeCommand(t *testing.T, server *httptest.Server, body string, target any) int {
+	t.Helper()
+	resp, err := http.Post(server.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode
+}
+
+func TestV2RealTimeHTTPCommandsAndState(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	startBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	var started realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, startBody, &started); status != http.StatusOK || started.Command.Replayed || started.Sequence != 1 || started.Elapsed != 0 {
+		t.Fatalf("start status/state=%+v", started)
+	}
+	countdownState := getRealTimeState(t, server)
+	if countdownState.RealTime.Lifecycle != game.LifecycleCountdown || countdownState.RealTime.QuoteRevision != 0 || countdownState.RealTime.BidOrderID != nil || countdownState.RealTime.AskOrderID != nil || len(countdownState.RealTime.Depth.Bids) != 0 || len(countdownState.RealTime.Depth.Asks) != 0 {
+		t.Fatalf("opening quote became live during countdown: %+v", countdownState)
+	}
+	var replayed realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, startBody, &replayed); status != http.StatusOK || !replayed.Command.Replayed || replayed.Sequence != started.Sequence || replayed.Elapsed != started.Elapsed {
+		t.Fatalf("replay status=%d response=%+v", status, replayed)
+	}
+
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+
+	updateID := "55555555-5555-4555-8555-555555555555"
+	updateBody := `{"id":"` + updateID + `","type":"update_quote","expected_quote_revision":1,"bid":"99.6000","ask":"100.4000"}`
+	var updated realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, updateBody, &updated); status != http.StatusOK || updated.Sequence < 3 {
+		t.Fatalf("update status=%d response=%+v", status, updated)
+	}
+	staleBody := `{"id":"66666666-6666-4666-8666-666666666666","type":"update_quote","expected_quote_revision":1,"bid":"99.7000","ask":"100.3000"}`
+	var stale apiError
+	if status := postRealTimeCommand(t, server, staleBody, &stale); status != http.StatusConflict || stale.Error.Code != "quote_revision_conflict" {
+		t.Fatalf("stale status=%d response=%+v", status, stale)
+	}
+	var replayedStale apiError
+	if status := postRealTimeCommand(t, server, staleBody, &replayedStale); status != http.StatusConflict || replayedStale.Error.Code != "quote_revision_conflict" {
+		t.Fatalf("replayed stale status=%d response=%+v", status, replayedStale)
+	}
+	conflictingBody := `{"id":"` + updateID + `","type":"update_quote","expected_quote_revision":2,"bid":"99.7000","ask":"100.3000"}`
+	var conflicting apiError
+	if status := postRealTimeCommand(t, server, conflictingBody, &conflicting); status != http.StatusConflict || conflicting.Error.Code != "idempotency_key_reused" {
+		t.Fatalf("conflicting status=%d response=%+v", status, conflicting)
+	}
+
+	var state exchangeStateResponse
+	stateResp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(stateResp.Body).Decode(&state); err != nil {
+		stateResp.Body.Close()
+		t.Fatal(err)
+	}
+	stateResp.Body.Close()
+	if state.RealTime == nil || state.RealTime.Lifecycle != game.LifecycleRunning || state.RealTime.QuoteRevision != 2 || state.RealTime.ActionsThrough < 3 || state.RealTime.EventsThrough != state.EventsThrough || state.RealTime.DurationMillis != 90_000 {
+		t.Fatalf("state=%+v", state)
+	}
+	pauseBody := `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`
+	var paused realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, pauseBody, &paused); status != http.StatusOK {
+		t.Fatalf("pause status=%d response=%+v", status, paused)
+	}
+	pausedState := getRealTimeState(t, server)
+	if pausedState.RealTime.Lifecycle != game.LifecyclePaused || pausedState.RealTime.QuoteRevision != 2 {
+		t.Fatalf("paused state=%+v", pausedState)
+	}
+	clock.Advance(10 * time.Second)
+	frozen := getRealTimeState(t, server)
+	if frozen.RealTime.ElapsedMillis != pausedState.RealTime.ElapsedMillis || frozen.RealTime.RemainingMillis != pausedState.RealTime.RemainingMillis {
+		t.Fatalf("paused clock advanced: before=%+v after=%+v", pausedState.RealTime, frozen.RealTime)
+	}
+	resumeBody := `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`
+	var resumed realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, resumeBody, &resumed); status != http.StatusOK {
+		t.Fatalf("resume status=%d response=%+v", status, resumed)
+	}
+	if running := getRealTimeState(t, server); running.RealTime.Lifecycle != game.LifecycleRunning || running.RealTime.ElapsedMillis != pausedState.RealTime.ElapsedMillis {
+		t.Fatalf("resumed state=%+v", running)
+	}
+
+	quitBody := `{"id":"` + testQuitID + `","type":"quit"}`
+	var quit realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, quitBody, &quit); status != http.StatusOK || quit.Sequence <= updated.Sequence {
+		t.Fatalf("quit status=%d response=%+v", status, quit)
+	}
+	completedResp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer completedResp.Body.Close()
+	var completed exchangeStateResponse
+	if err := json.NewDecoder(completedResp.Body).Decode(&completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed.RealTime.Lifecycle != game.LifecycleCompleted || !completed.State.IsOver || completed.State.Reason != exchange.PlayerQuit || completed.RealTime.BidOrderID != nil || completed.RealTime.AskOrderID != nil {
+		t.Fatalf("completed=%+v", completed)
+	}
+}
+
+func TestV2RealTimeCountdownPauseResumeActivatesOpeningQuote(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledgement realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("start status=%d response=%+v", status, acknowledgement)
+	}
+	if status := postRealTimeCommand(t, server, `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("pause status=%d response=%+v", status, acknowledgement)
+	}
+	paused := getRealTimeState(t, server)
+	if paused.RealTime.Lifecycle != game.LifecyclePaused || paused.RealTime.QuoteRevision != 0 || paused.State.BestBid != 0 || paused.State.BestAsk != 0 {
+		t.Fatalf("paused=%+v", paused)
+	}
+	if status := postRealTimeCommand(t, server, `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`, &acknowledgement); status != http.StatusOK {
+		t.Fatalf("resume status=%d response=%+v", status, acknowledgement)
+	}
+	running := getRealTimeState(t, server)
+	if running.RealTime.Lifecycle != game.LifecycleRunning || running.RealTime.QuoteRevision != 1 || running.State.BestBid != fixed.Price(995_000) || running.State.BestAsk != fixed.Price(1_005_000) || running.RealTime.BidOrderID == nil || running.RealTime.AskOrderID == nil {
+		t.Fatalf("running=%+v", running)
+	}
+}
+
+func getRealTimeState(t *testing.T, server *httptest.Server) exchangeStateResponse {
+	t.Helper()
+	resp, err := http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var state exchangeStateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("state status=%d response=%+v", resp.StatusCode, state)
+	}
+	return state
+}
+
+func TestV2RealTimeStateRejectsFencedStorage(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.mu.Lock()
+	entry.storageFailed = true
+	entry.mu.Unlock()
+	resp, err = http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var apiErr apiError
+	if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusInternalServerError || apiErr.Error.Code != "storage_failure" {
+		t.Fatalf("status=%d error=%+v", resp.StatusCode, apiErr)
+	}
+}
+
+func TestV2RealTimeQuoteRevisionSurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	service := newExchangeService(root)
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledged realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &acknowledged)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	postRealTimeCommand(t, server, `{"id":"55555555-5555-4555-8555-555555555555","type":"update_quote","expected_quote_revision":1,"bid":"99.6000","ask":"100.4000"}`, &acknowledged)
+	postRealTimeCommand(t, server, `{"id":"77777777-7777-4777-8777-777777777777","type":"pause_session"}`, &acknowledged)
+	closeRealTimeSequencer(t, entry)
+	server.Close()
+
+	reloaded := newExchangeService(root)
+	restartClock := newServerManualClock()
+	restartCalls := 0
+	installManualSequencer(reloaded, restartClock, &restartCalls, nil)
+	restartedServer := v2ServerForService(reloaded)
+	defer restartedServer.Close()
+	state := getRealTimeState(t, restartedServer)
+	if state.RealTime.QuoteRevision != 2 || state.RealTime.Lifecycle != game.LifecyclePaused {
+		t.Fatalf("restarted state=%+v", state)
+	}
+	postRealTimeCommand(t, restartedServer, `{"id":"88888888-8888-4888-8888-888888888888","type":"resume_session"}`, &acknowledged)
+	postRealTimeCommand(t, restartedServer, `{"id":"99999999-9999-4999-8999-999999999999","type":"update_quote","expected_quote_revision":2,"bid":"99.7000","ask":"100.3000"}`, &acknowledged)
+	if state = getRealTimeState(t, restartedServer); state.RealTime.QuoteRevision != 3 || state.State.BestBid != fixed.Price(997_000) {
+		t.Fatalf("updated state=%+v", state)
+	}
+	staleBody := `{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab","type":"update_quote","expected_quote_revision":2,"bid":"99.8000","ask":"100.2000"}`
+	var stale apiError
+	if status := postRealTimeCommand(t, restartedServer, staleBody, &stale); status != http.StatusConflict || stale.Error.Code != "quote_revision_conflict" {
+		t.Fatalf("stale status=%d response=%+v", status, stale)
+	}
+	var replayed apiError
+	if status := postRealTimeCommand(t, restartedServer, staleBody, &replayed); status != http.StatusConflict || replayed.Error.Code != "quote_revision_conflict" {
+		t.Fatalf("replayed stale status=%d response=%+v", status, replayed)
+	}
+}
+
+func TestV2RealTimeCommandValidationAndModeGating(t *testing.T) {
+	server := v2Server(t.TempDir())
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	for _, test := range []struct {
+		body string
+		code string
+	}{
+		{`{"id":"` + testQuoteID + `","type":"update_quote","bid":"99.5000","ask":"100.5000"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"pause_session","bid":"99.5000"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"pause_session","expected_quote_revision":null}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"update_quote","expected_quote_revision":null,"bid":"99.5000","ask":"100.5000"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":null}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `"}`, "invalid_request"},
+		{`{"id":"` + testQuoteID + `","type":"submit_quote","expected_version":0,"bid":"99.5000","ask":"100.5000"}`, "command_unavailable_for_mode"},
+	} {
+		var apiErr apiError
+		status := postRealTimeCommand(t, server, test.body, &apiErr)
+		if status < 400 || apiErr.Error.Code != test.code {
+			t.Fatalf("body=%s status=%d error=%+v", test.body, status, apiErr)
+		}
+	}
+}
+
+func TestV2RealTimeCreateIDConflictDoesNotConsumeSequence(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	conflictBody := `{"id":"` + testCreateID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	var conflict apiError
+	if status := postRealTimeCommand(t, server, conflictBody, &conflict); status != http.StatusConflict || conflict.Error.Code != "idempotency_key_reused" {
+		t.Fatalf("conflict status=%d response=%+v", status, conflict)
+	}
+	validBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	var accepted realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, validBody, &accepted); status != http.StatusOK || accepted.Sequence != 1 {
+		t.Fatalf("accepted status=%d response=%+v", status, accepted)
+	}
+	var replayed realTimeCommandResponse
+	if status := postRealTimeCommand(t, server, validBody, &replayed); status != http.StatusOK || !replayed.Command.Replayed || replayed.Sequence != 1 {
+		t.Fatalf("replayed status=%d response=%+v", status, replayed)
+	}
+}
+
+func TestV2RealTimeConcurrentQuoteRevisionAndReads(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSeed = func() (uint64, error) { return 99, nil }
+	clock := newServerManualClock()
+	calls := 0
+	installManualSequencer(service, clock, &calls, nil)
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var started realTimeCommandResponse
+	postRealTimeCommand(t, server, `{"id":"`+testQuoteID+`","type":"start_session","bid":"99.5000","ask":"100.5000"}`, &started)
+	clock.Advance(3 * time.Second)
+	entry, err := service.load(testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+
+	type commandResult struct {
+		status int
+		body   []byte
+	}
+	commandBodies := []string{
+		`{"id":"55555555-5555-4555-8555-555555555555","type":"update_quote","expected_quote_revision":1,"bid":"99.6000","ask":"100.4000"}`,
+		`{"id":"66666666-6666-4666-8666-666666666666","type":"update_quote","expected_quote_revision":1,"bid":"99.7000","ask":"100.3000"}`,
+	}
+	results := make(chan commandResult, len(commandBodies))
+	for _, body := range commandBodies {
+		go func() {
+			response, requestErr := http.Post(server.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(body))
+			if requestErr != nil {
+				results <- commandResult{status: 0, body: []byte(requestErr.Error())}
+				return
+			}
+			defer response.Body.Close()
+			data, _ := io.ReadAll(response.Body)
+			results <- commandResult{status: response.StatusCode, body: data}
+		}()
+	}
+	statuses := map[int]int{}
+	for range commandBodies {
+		result := <-results
+		statuses[result.status]++
+		if result.status != http.StatusOK && result.status != http.StatusConflict {
+			t.Fatalf("unexpected command result: status=%d body=%s", result.status, result.body)
+		}
+	}
+	if statuses[http.StatusOK] != 1 || statuses[http.StatusConflict] != 1 {
+		t.Fatalf("statuses=%v", statuses)
+	}
+	state := getRealTimeState(t, server)
+	if state.RealTime.QuoteRevision != 2 || state.RealTime.ActionsThrough != 4 {
+		t.Fatalf("state=%+v", state)
+	}
+	validQuote := state.State.BestBid == fixed.Price(996_000) && state.State.BestAsk == fixed.Price(1_004_000) || state.State.BestBid == fixed.Price(997_000) && state.State.BestAsk == fixed.Price(1_003_000)
+	if !validQuote {
+		t.Fatalf("mixed quote state=%+v", state.State)
+	}
+}
+
+func TestV2RealTimeConcurrentDuplicateCommandExecutesOnce(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	startBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	const workers = 12
+	type result struct {
+		status int
+		body   realTimeCommandResponse
+	}
+	results := make(chan result, workers)
+	for range workers {
+		go func() {
+			response, requestErr := http.Post(server.URL+"/api/v2/games/"+testGameID+"/commands", "application/json", strings.NewReader(startBody))
+			if requestErr != nil {
+				results <- result{}
+				return
+			}
+			defer response.Body.Close()
+			var body realTimeCommandResponse
+			_ = json.NewDecoder(response.Body).Decode(&body)
+			results <- result{status: response.StatusCode, body: body}
+		}()
+	}
+	nonReplayed := 0
+	for range workers {
+		result := <-results
+		if result.status != http.StatusOK || result.body.Sequence != 1 {
+			t.Fatalf("result=%+v", result)
+		}
+		if !result.body.Command.Replayed {
+			nonReplayed++
+		}
+	}
+	if nonReplayed != 1 {
+		t.Fatalf("non-replayed responses=%d", nonReplayed)
+	}
+	_, records, err := eventlog.Open(service.root, testGameID)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%d err=%v", len(records), err)
+	}
+}
+
+func TestV2RealTimeAcknowledgesCommitBeforeTimerFailure(t *testing.T) {
+	service := newExchangeService(t.TempDir())
+	service.newSequencer = func(config realtime.Config) (*realtime.Sequencer, error) {
+		config.Clock = nilTimerClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+		return realtime.NewConfigured(config)
+	}
+	server := v2ServerForService(service)
+	defer server.Close()
+	createBody := `{"game_id":"` + testGameID + `","command_id":"` + testCreateID + `","scenario_id":"first-spread-v1","mode":"real_time"}`
+	resp, err := http.Post(server.URL+"/api/v2/games", "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	var acknowledged realTimeCommandResponse
+	startBody := `{"id":"` + testQuoteID + `","type":"start_session","bid":"99.5000","ask":"100.5000"}`
+	if status := postRealTimeCommand(t, server, startBody, &acknowledged); status != http.StatusOK || acknowledged.Sequence != 1 {
+		t.Fatalf("acknowledgement status=%d response=%+v", status, acknowledged)
+	}
+	_, records, err := eventlog.Open(service.root, testGameID)
+	if err != nil || len(records) != 1 || records[0].Action.ID != testQuoteID {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+	resp, err = http.Get(server.URL + "/api/v2/games/" + testGameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("failed runtime state status=%d", resp.StatusCode)
+	}
+	if service.storageHealthy() {
+		t.Fatal("failed runtime remained ready")
+	}
 }
 
 func TestExchangeServiceShutdownDurablyPausesRunningGame(t *testing.T) {
@@ -346,7 +822,7 @@ func TestV2CreatesAndRecoversRealTimePreparingGame(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict || rejected.Error.Code != "command_unavailable_for_mode" {
+	if resp.StatusCode != http.StatusBadRequest || rejected.Error.Code != "invalid_request" {
 		t.Fatalf("command status=%d error=%+v", resp.StatusCode, rejected)
 	}
 	_, records, err = eventlog.Open(root, testGameID)
@@ -371,7 +847,7 @@ func TestRealTimeSequencerIsLazyAndOrdersCountdown(t *testing.T) {
 	if err != nil || start.Sequence != 1 || calls != 1 {
 		t.Fatalf("start=%+v calls=%d err=%v", start, calls, err)
 	}
-	if replayed, replayErr := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); replayErr != nil || !reflect.DeepEqual(replayed, start) || calls != 1 {
+	if replayed, replayErr := entry.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000)); replayErr != nil || !replayed.Replayed || !executionsEqualIgnoringReplay(replayed, start) || calls != 1 {
 		t.Fatalf("replayed start=%+v calls=%d err=%v", replayed, calls, replayErr)
 	}
 	countdown := time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond
@@ -513,12 +989,13 @@ func TestRealTimeColdLoadNormalizesActiveLifecycle(t *testing.T) {
 			}
 			wantElapsed := time.Duration(0)
 			if lifecycle == game.LifecycleRunning {
-				countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+				countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 				if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 					t.Fatalf("countdown=%+v", outcome)
 				}
 				wantElapsed = time.Millisecond
-				quote := realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(994_000), Ask: fixed.Price(1_006_000)}}
+				revision := uint64(1)
+				quote := realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(994_000), Ask: fixed.Price(1_006_000), ExpectedRevision: &revision}}
 				if outcome := entry.executeRealTimeAction(quote, wantElapsed); outcome.Disposition != realtime.DispositionContinue {
 					t.Fatalf("quote=%+v", outcome)
 				}
@@ -597,7 +1074,7 @@ func TestRealTimeRestartPausedRestoresExactGeneratorCheckpoint(t *testing.T) {
 	}
 	defer closeRealTimeSequencer(t, loaded)
 	replayedPause, err := loaded.pauseRealTime(t.Context(), "pause")
-	if err != nil || !reflect.DeepEqual(replayedPause, pauseExecution) || restartCalls != 1 {
+	if err != nil || !replayedPause.Replayed || !executionsEqualIgnoringReplay(replayedPause, pauseExecution) || restartCalls != 1 {
 		t.Fatalf("pause replay=%+v calls=%d err=%v", replayedPause, restartCalls, err)
 	}
 	if !reflect.DeepEqual(restoredNext, wantNext) || checkpoint.Status != realtime.StatusPaused || checkpoint.Elapsed != first.Due || checkpoint.NextScheduled != 1 || checkpoint.Sequence != uint64(len(loaded.commands)) {
@@ -625,9 +1102,19 @@ func TestRealTimeCompletedReplaySurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Duration(entry.scenario.RealTime.CountdownMilliseconds) * time.Millisecond)
-	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleRunning })
+	sequencer, err := entry.ensureRealTimeSequencer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := sequencer.View(t.Context(), func() any { return nil })
+	if err != nil || view.Snapshot.Status != realtime.StatusRunning {
+		t.Fatalf("countdown view=%+v err=%v", view, err)
+	}
 	clock.Advance(time.Duration(entry.scenario.RealTime.DurationMilliseconds) * time.Millisecond)
-	waitForRealTime(t, entry, func(entry *exchangeEntry) bool { return entry.realTime.Lifecycle == game.LifecycleCompleted })
+	view, err = sequencer.View(t.Context(), func() any { return nil })
+	if err != nil || view.Snapshot.Status != realtime.StatusCompleted {
+		t.Fatalf("view=%+v err=%v", view, err)
+	}
 	closeRealTimeSequencer(t, entry)
 
 	restarted := newExchangeService(root)
@@ -640,7 +1127,7 @@ func TestRealTimeCompletedReplaySurvivesRestart(t *testing.T) {
 	}
 	defer closeRealTimeSequencer(t, loaded)
 	replayed, err := loaded.startRealTime(t.Context(), "start", fixed.Price(995_000), fixed.Price(1_005_000))
-	if err != nil || !reflect.DeepEqual(replayed, start) || restartCalls != 1 || observed.Checkpoint.Status != realtime.StatusCompleted || observed.Checkpoint.NextScheduled != loaded.replay.GeneratorCommitted {
+	if err != nil || !replayed.Replayed || !executionsEqualIgnoringReplay(replayed, start) || restartCalls != 1 || observed.Checkpoint.Status != realtime.StatusCompleted || observed.Checkpoint.NextScheduled != loaded.replay.GeneratorCommitted {
 		t.Fatalf("replay=%+v start=%+v calls=%d checkpoint=%+v summary=%+v err=%v", replayed, start, restartCalls, observed.Checkpoint, loaded.replay, err)
 	}
 	var expiry eventlog.Record
@@ -793,15 +1280,17 @@ func TestRealTimeActionsAndRejectionsReplayExactly(t *testing.T) {
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}
-	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	revision := uint64(1)
+	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000), ExpectedRevision: &revision}}
 	if outcome := entry.executeRealTimeAction(quote, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("quote=%+v", outcome)
 	}
-	rejected := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000)}}
+	rejectedRevision := uint64(2)
+	rejected := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000), ExpectedRevision: &rejectedRevision}}
 	rejectedOutcome := entry.executeRealTimeAction(rejected, 0)
 	if rejectedOutcome.Disposition != realtime.DispositionReject {
 		t.Fatalf("rejected outcome=%+v", rejectedOutcome)
@@ -846,7 +1335,8 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 	}
 	initialState := entry.engine.State()
 	for _, id := range []string{testCreateID, "system/customer_arrival/1"} {
-		reserved := realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+		revision := uint64(0)
+		reserved := realtime.Action{ID: id, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000), ExpectedRevision: &revision}}
 		outcome := entry.executeRealTimeAction(reserved, 0)
 		if outcome.Disposition != realtime.DispositionReject || outcome.Err == nil || !reflect.DeepEqual(entry.engine.State(), initialState) {
 			t.Fatalf("reserved action id %q outcome=%+v state=%+v", id, outcome, entry.engine.State())
@@ -856,16 +1346,18 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}
-	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
+	revision := uint64(1)
+	quote := realtime.Action{ID: testQuoteID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000), ExpectedRevision: &revision}}
 	accepted := entry.executeRealTimeAction(quote, 0)
 	if accepted.Disposition != realtime.DispositionContinue || accepted.Err != nil {
 		t.Fatalf("accepted=%+v", accepted)
 	}
-	rejectedAction := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000)}}
+	rejectedRevision := uint64(2)
+	rejectedAction := realtime.Action{ID: testQuitID, Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: fixed.Price(1_010_000), Ask: fixed.Price(990_000), ExpectedRevision: &rejectedRevision}}
 	rejected := entry.executeRealTimeAction(rejectedAction, time.Millisecond)
 	if rejected.Disposition != realtime.DispositionReject || rejected.Err == nil {
 		t.Fatalf("rejected=%+v", rejected)
@@ -874,7 +1366,7 @@ func TestRealTimeDurableExecutorRemembersAcceptedAndRejectedActions(t *testing.T
 		t.Fatalf("replayed rejection=%+v", replayed)
 	}
 	conflict := rejectedAction
-	conflict.Payload = realtime.UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000)}
+	conflict.Payload = realtime.UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000), ExpectedRevision: &rejectedRevision}
 	if outcome := entry.executeRealTimeAction(conflict, 2*time.Millisecond); outcome.Disposition != realtime.DispositionReject || !strings.Contains(outcome.Err.Error(), "different payload") {
 		t.Fatalf("conflict=%+v", outcome)
 	}
@@ -908,7 +1400,7 @@ func TestRealTimeRecoveryRetainsSystemActionAndTruncatesPartialSuffix(t *testing
 	if outcome := entry.executeRealTimeAction(start, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("start=%+v", outcome)
 	}
-	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}
+	countdown := realtime.Action{ID: "system/countdown_complete/start", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: fixed.Price(995_000), Ask: fixed.Price(1_005_000)}}
 	if outcome := entry.executeRealTimeAction(countdown, 0); outcome.Disposition != realtime.DispositionContinue {
 		t.Fatalf("countdown=%+v", outcome)
 	}

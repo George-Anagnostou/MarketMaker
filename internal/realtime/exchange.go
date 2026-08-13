@@ -10,9 +10,12 @@ import (
 
 const ActionUpdateQuote = "update_quote"
 
+var ErrQuoteRevisionConflict = errors.New("quote revision conflict")
+
 type UpdateQuotePayload struct {
-	Bid fixed.Price `json:"bid"`
-	Ask fixed.Price `json:"ask"`
+	Bid              fixed.Price `json:"bid"`
+	Ask              fixed.Price `json:"ask"`
+	ExpectedRevision *uint64     `json:"expected_revision,omitempty"`
 }
 
 type ExchangeExecutorConfig struct {
@@ -22,9 +25,12 @@ type ExchangeExecutorConfig struct {
 }
 
 type ExchangeExecutor struct {
-	engine *exchange.Engine
-	config ExchangeExecutorConfig
+	engine        *exchange.Engine
+	config        ExchangeExecutorConfig
+	quoteRevision uint64
 }
+
+func (e *ExchangeExecutor) QuoteRevision() uint64 { return e.quoteRevision }
 
 func NewExchangeExecutor(engine *exchange.Engine, config ExchangeExecutorConfig) (*ExchangeExecutor, error) {
 	if engine == nil {
@@ -51,6 +57,16 @@ func (e *ExchangeExecutor) Execute(action Action, _ time.Duration) Outcome {
 }
 
 func (e *ExchangeExecutor) executeParticipant(action Action) Outcome {
+	if action.Kind == ActionQuitSession {
+		if action.Payload != nil {
+			return Outcome{Disposition: DispositionReject, Err: errors.New("quit does not accept a payload")}
+		}
+		result, err := e.engine.QuitRealTime()
+		if err != nil {
+			return Outcome{Disposition: DispositionReject, Err: err}
+		}
+		return Outcome{Result: result, Disposition: DispositionComplete}
+	}
 	if action.Kind != ActionUpdateQuote {
 		return Outcome{Disposition: DispositionReject, Err: errors.New("unsupported participant action")}
 	}
@@ -58,10 +74,14 @@ func (e *ExchangeExecutor) executeParticipant(action Action) Outcome {
 	if !ok {
 		return Outcome{Disposition: DispositionReject, Err: errors.New("invalid quote payload")}
 	}
+	if payload.ExpectedRevision != nil && *payload.ExpectedRevision != e.quoteRevision {
+		return Outcome{Disposition: DispositionReject, Err: ErrQuoteRevisionConflict}
+	}
 	result, err := e.engine.UpdateQuote(payload.Bid, payload.Ask, e.config.QuoteQuantity)
 	if err != nil {
 		return Outcome{Disposition: DispositionReject, Err: err}
 	}
+	e.quoteRevision++
 	disposition := DispositionContinue
 	if result.State.IsOver {
 		disposition = DispositionComplete

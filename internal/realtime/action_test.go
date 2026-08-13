@@ -15,7 +15,8 @@ func TestDurableActionRoundTrip(t *testing.T) {
 		{ID: "pause-player", Kind: ActionPauseSession, Source: SourceParticipant, Payload: PauseSessionPayload{Reason: PauseReasonPlayer}},
 		{ID: "system/pause", Kind: ActionPauseSession, Source: SourceSystem, Payload: PauseSessionPayload{Reason: PauseReasonShutdown}},
 		{ID: "resume", Kind: ActionResumeSession, Source: SourceParticipant},
-		{ID: "quote", Kind: ActionUpdateQuote, Source: SourceParticipant, Payload: UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000)}},
+		{ID: "quit", Kind: ActionQuitSession, Source: SourceParticipant},
+		{ID: "quote", Kind: ActionUpdateQuote, Source: SourceParticipant, Payload: UpdateQuotePayload{Bid: fixed.Price(990_000), Ask: fixed.Price(1_010_000), ExpectedRevision: revisionPointer(1)}},
 		{ID: "customer", Kind: ActionCustomerArrival, Source: SourceSystem, Payload: CustomerArrivalPayload{Buy: true, Quantity: fixed.Qty(10_000), SlippageBps: 5, InformedDraw: 7, HasUpcomingMark: true, UpcomingMarkMoveBps: 10}},
 		{ID: "mark", Kind: ActionMarkMove, Source: SourceSystem, Payload: MarkMovePayload{BasisPoints: -10}},
 		{ID: "carry", Kind: ActionCarryCharge, Source: SourceSystem},
@@ -67,12 +68,16 @@ func TestDurableActionRejectsMalformedPayloads(t *testing.T) {
 		{ID: "system/pause-player", Kind: ActionPauseSession, Source: SourceSystem, Payload: json.RawMessage(`{"reason":"player"}`)},
 		{ID: "invalid-source", Kind: ActionPauseSession, Source: Source("operator"), Payload: json.RawMessage(`{"reason":"shutdown"}`)},
 		{ID: "resume-system", Kind: ActionResumeSession, Source: SourceSystem},
+		{ID: "quit-system", Kind: ActionQuitSession, Source: SourceSystem},
+		{ID: "quit-payload", Kind: ActionQuitSession, Source: SourceParticipant, Payload: json.RawMessage(`{}`)},
 	} {
 		if _, err := action.Decode(); err == nil {
 			t.Fatalf("malformed action accepted: %+v", action)
 		}
 	}
 }
+
+func revisionPointer(value uint64) *uint64 { return &value }
 
 func TestEncodeActionRejectsPauseSourceReasonMismatch(t *testing.T) {
 	for _, action := range []Action{

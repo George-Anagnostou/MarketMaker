@@ -48,6 +48,7 @@ type Execution struct {
 	Result      any
 	Disposition Disposition
 	Err         error
+	Replayed    bool
 }
 
 type Disposition string
@@ -86,9 +87,10 @@ const (
 )
 
 var (
-	ErrClosed       = errors.New("sequencer is closed")
-	ErrFailed       = errors.New("sequencer has failed")
-	ErrInvalidState = errors.New("sequencer lifecycle transition is invalid")
+	ErrClosed         = errors.New("sequencer is closed")
+	ErrFailed         = errors.New("sequencer has failed")
+	ErrInvalidState   = errors.New("sequencer lifecycle transition is invalid")
+	ErrActionConflict = errors.New("action id has a different payload")
 )
 
 type Snapshot struct {
@@ -113,6 +115,15 @@ type Checkpoint struct {
 // ReplayLookup runs on the sequencer goroutine and must not call back into its
 // Sequencer. The returned Execution is the authoritative original execution.
 type ReplayLookup func(Action) (Execution, bool)
+
+// Projector builds an immutable read model while the sequencer is stopped at
+// an authoritative point on its logical timeline.
+type Projector func() any
+
+type View struct {
+	Snapshot Snapshot
+	Value    any
+}
 
 type Config struct {
 	Schedule     Schedule
@@ -162,6 +173,8 @@ const (
 	requestPauseAction
 	requestResume
 	requestResumeAction
+	requestCompleteAction
+	requestView
 	requestSnapshot
 	requestClose
 )
@@ -170,12 +183,14 @@ type request struct {
 	kind     requestKind
 	received time.Time
 	action   Action
+	project  Projector
 	reply    chan response
 }
 
 type response struct {
 	execution Execution
 	snapshot  Snapshot
+	view      View
 	err       error
 }
 
@@ -459,6 +474,28 @@ func (s *Sequencer) ResumeAction(ctx context.Context, action Action) (Execution,
 		return Execution{}, err
 	}
 	return response.execution, response.err
+}
+
+func (s *Sequencer) CompleteAction(ctx context.Context, action Action) (Execution, error) {
+	if err := validateLifecycleAction(action, ActionQuitSession, false); err != nil {
+		return Execution{}, err
+	}
+	response, err := s.request(ctx, request{kind: requestCompleteAction, action: action})
+	if err != nil {
+		return Execution{}, err
+	}
+	return response.execution, response.err
+}
+
+func (s *Sequencer) View(ctx context.Context, project Projector) (View, error) {
+	if project == nil {
+		return View{}, errors.New("projector is required")
+	}
+	response, err := s.request(ctx, request{kind: requestView, project: project})
+	if err != nil {
+		return View{}, err
+	}
+	return response.view, response.err
 }
 
 func (s *Sequencer) Snapshot(ctx context.Context) (Snapshot, error) {
@@ -868,8 +905,9 @@ func (s *Sequencer) run() {
 	}
 	handleRequest := func(req request) bool {
 		switch req.kind {
-		case requestStartAction, requestPauseAction, requestResumeAction, requestSubmit:
+		case requestStartAction, requestPauseAction, requestResumeAction, requestCompleteAction, requestSubmit:
 			if execution, found := replay(req.action); found {
+				execution.Replayed = true
 				var err error
 				if execution.Disposition == DispositionReject || execution.Disposition == DispositionFail {
 					err = execution.Err
@@ -878,14 +916,14 @@ func (s *Sequencer) run() {
 				return false
 			}
 		}
-		if (req.kind == requestPauseAction || req.kind == requestSubmit) && status == StatusCountdown && !req.received.Before(countdownAnchor.Add(s.countdown)) {
+		if (req.kind == requestPauseAction || req.kind == requestCompleteAction || req.kind == requestSubmit || req.kind == requestView) && status == StatusCountdown && !req.received.Before(countdownAnchor.Add(s.countdown)) {
 			_ = completeCountdown()
 		}
 		if status == StatusFailed && req.kind != requestSnapshot && req.kind != requestClose {
 			req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
 			return false
 		}
-		if status == StatusCompleted && req.kind != requestSnapshot && req.kind != requestClose {
+		if status == StatusCompleted && req.kind != requestSnapshot && req.kind != requestView && req.kind != requestClose {
 			req.reply <- response{snapshot: snapshot(req.received), err: ErrInvalidState}
 			return false
 		}
@@ -1072,6 +1110,75 @@ func (s *Sequencer) run() {
 				fail(elapsed, fmt.Errorf("resume action %q failed: %w", req.action.ID, cause))
 				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
 			}
+		case requestCompleteAction:
+			if status != StatusPreparing && status != StatusCountdown && status != StatusRunning && status != StatusPaused {
+				req.reply <- response{err: ErrInvalidState}
+				return false
+			}
+			target := elapsed
+			if status == StatusRunning {
+				target = logicalAt(req.received)
+				if err := processDue(target); err != nil {
+					req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
+				if status == StatusCompleted {
+					req.reply <- response{snapshot: snapshot(req.received), err: ErrInvalidState}
+					return false
+				}
+			}
+			execution := execute(req.action, target)
+			switch execution.Disposition {
+			case DispositionComplete:
+				elapsed, status = target, StatusCompleted
+				stopTimer()
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received)}
+			case DispositionReject:
+				if status == StatusRunning {
+					if err := armTimer(); err != nil {
+						req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+						return false
+					}
+				}
+				req.reply <- response{execution: execution, err: execution.Err}
+			case DispositionContinue, DispositionFail:
+				cause := execution.Err
+				if cause == nil {
+					cause = errors.New("completion action executor must complete")
+				}
+				fail(target, fmt.Errorf("completion action %q failed: %w", req.action.ID, cause))
+				req.reply <- response{execution: execution, snapshot: snapshot(req.received), err: errors.Join(ErrFailed, failure)}
+			}
+		case requestView:
+			if status == StatusRunning {
+				target := logicalAt(req.received)
+				if err := processDue(target); err != nil {
+					req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+					return false
+				}
+				if status == StatusRunning {
+					if err := armTimer(); err != nil {
+						req.reply <- response{snapshot: snapshot(req.received), err: errors.Join(ErrFailed, err)}
+						return false
+					}
+				}
+			}
+			var value any
+			var projectErr error
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						projectErr = fmt.Errorf("projector panicked: %v", recovered)
+					}
+				}()
+				value = req.project()
+			}()
+			if projectErr != nil {
+				req.reply <- response{snapshot: snapshot(req.received), err: projectErr}
+				return false
+			}
+			view := View{Snapshot: snapshot(req.received), Value: value}
+			req.reply <- response{snapshot: view.Snapshot, view: view}
 		case requestSnapshot:
 			req.reply <- response{snapshot: snapshot(req.received)}
 		case requestClose:

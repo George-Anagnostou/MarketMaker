@@ -94,7 +94,9 @@ func TestSequencerDurableReplayAvoidsExecutorAndPreservesOriginalExecution(t *te
 	}
 	defer sequencer.Close()
 	got, err := sequencer.Submit(context.Background(), Action{ID: "same", Kind: ActionUpdateQuote, Source: SourceParticipant, Payload: "retry"})
-	if err != nil || got != original || called {
+	want := original
+	want.Replayed = true
+	if err != nil || got != want || called {
 		t.Fatalf("replay=%+v err=%v called=%v", got, err, called)
 	}
 }

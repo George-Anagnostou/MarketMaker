@@ -501,14 +501,15 @@ func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	countdown, err := realtime.EncodeAction(realtime.Action{ID: "system/countdown-1", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown, err := realtime.EncodeAction(realtime.Action{ID: "system/countdown-1", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}
-	quote, err := realtime.EncodeAction(realtime.Action{ID: "quote-1", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	revision := uint64(1)
+	quote, err := realtime.EncodeAction(realtime.Action{ID: "quote-1", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101"), ExpectedRevision: &revision}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +523,8 @@ func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 4, Action: &mark, ElapsedNanoseconds: int64(4 * time.Second), Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: exchange.State{Version: 2}}}); err != nil {
 		t.Fatal(err)
 	}
-	rejectedAction, err := realtime.EncodeAction(realtime.Action{ID: "quote-2", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "101"), Ask: price(t, "99")}})
+	rejectedRevision := uint64(2)
+	rejectedAction, err := realtime.EncodeAction(realtime.Action{ID: "quote-2", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "101"), Ask: price(t, "99"), ExpectedRevision: &rejectedRevision}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,10 +541,10 @@ func TestAppendAndOpenRealTimeActionsAndRejections(t *testing.T) {
 	if _, err := reopened.Append(Record{Schema: RealTimeSchemaVersion, Version: 6, Action: &rejectedAction, ElapsedNanoseconds: int64(6 * time.Second), Lifecycle: game.LifecycleRunning, Rejection: &ActionRejection{Code: "again", Message: "again"}}); err == nil {
 		t.Fatal("duplicate rejected action id accepted")
 	}
-	if got := independentMetadataChecksum(t, log.Meta(), "market-maker/eventlog/meta/v5\x00"); got != log.Meta().Checksum {
+	if got := independentMetadataChecksum(t, log.Meta(), "market-maker/eventlog/meta/v6\x00"); got != log.Meta().Checksum {
 		t.Fatalf("metadata checksum=%q want=%q", log.Meta().Checksum, got)
 	}
-	if got := independentRecordChecksum(t, records[0], "market-maker/eventlog/record/v5\x00"); got != records[0].Checksum {
+	if got := independentRecordChecksum(t, records[0], "market-maker/eventlog/record/v6\x00"); got != records[0].Checksum {
 		t.Fatalf("record checksum=%q want=%q", records[0].Checksum, got)
 	}
 }
@@ -590,7 +592,7 @@ func TestRealTimeLifecycleTransitions(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &start, Lifecycle: game.LifecycleCountdown, Result: exchange.Result{State: state}}); err != nil {
 		t.Fatalf("accepted start: %v", err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &countdown, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: state}}); err != nil {
 		t.Fatalf("countdown completion: %v", err)
 	}
@@ -602,7 +604,8 @@ func TestRealTimeLifecycleTransitions(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 5, Action: &resume, ElapsedNanoseconds: 4, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: state}}); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	revision := uint64(1)
+	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101"), ExpectedRevision: &revision}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 6, Action: &quote, ElapsedNanoseconds: 5, Lifecycle: game.LifecycleCompleted, Result: exchange.Result{State: exchange.State{IsOver: true}}}); err != nil {
 		t.Fatalf("completing quote: %v", err)
 	}
@@ -650,7 +653,7 @@ func TestCountdownLifecycleRejectsMarketElapsedTime(t *testing.T) {
 			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 				t.Fatal(err)
 			}
-		}, action: realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem}, lifecycle: game.LifecycleRunning},
+		}, action: realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}}, lifecycle: game.LifecycleRunning},
 		{name: "pause", prepare: func(t *testing.T, log *Log) {
 			start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 			if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
@@ -707,11 +710,12 @@ func TestRealTimeRejectsBackwardElapsedAppendAndColdOpen(t *testing.T) {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 		t.Fatal(err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}
-	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	revision := uint64(1)
+	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99"), Ask: price(t, "101"), ExpectedRevision: &revision}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 3, Action: &quote, ElapsedNanoseconds: 2, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}
@@ -1684,6 +1688,61 @@ func newRealTimeTestLog(t *testing.T) *Log {
 	return log
 }
 
+func TestSchema5RealTimeLogRetainsFrozenGrammar(t *testing.T) {
+	definition, ok := scenario.Get("first-spread-v1")
+	if !ok {
+		t.Fatal("missing first scenario")
+	}
+	root := t.TempDir()
+	snapshot := definition.Snapshot()
+	log, err := CreateRealTime(root, "game-1", "local", "create-1", definition.Config, &snapshot, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := log.Meta()
+	meta.Schema = realTimeSchema5
+	meta.Checksum, err = metadataChecksum(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(log.Path(), "meta.json"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 0 || legacy.Meta().Schema != realTimeSchema5 {
+		t.Fatalf("legacy schema=%d records=%d err=%v", legacy.Meta().Schema, len(records), err)
+	}
+	start := durableTestAction(t, realtime.Action{ID: "start", Kind: realtime.ActionStartSession, Source: realtime.SourceParticipant, Payload: realtime.StartSessionPayload{Bid: price(t, "99"), Ask: price(t, "101")}})
+	if _, err := legacy.Append(Record{Schema: realTimeSchema5, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
+		t.Fatal(err)
+	}
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	if _, err := legacy.Append(Record{Schema: realTimeSchema5, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
+		t.Fatal(err)
+	}
+	quote := durableTestAction(t, realtime.Action{ID: "quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99.5"), Ask: price(t, "100.5")}})
+	if _, err := legacy.Append(Record{Schema: realTimeSchema5, Version: 3, Action: &quote, Lifecycle: game.LifecycleRunning, Result: exchange.Result{State: exchange.State{Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	revision := uint64(0)
+	newQuote := durableTestAction(t, realtime.Action{ID: "new-quote", Kind: realtime.ActionUpdateQuote, Source: realtime.SourceParticipant, Payload: realtime.UpdateQuotePayload{Bid: price(t, "99.6"), Ask: price(t, "100.4"), ExpectedRevision: &revision}})
+	if _, err := legacy.Append(Record{Schema: realTimeSchema5, Version: 4, Action: &newQuote, Lifecycle: game.LifecycleRunning}); err == nil {
+		t.Fatal("schema 5 accepted quote revision")
+	}
+	quit := durableTestAction(t, realtime.Action{ID: "quit", Kind: realtime.ActionQuitSession, Source: realtime.SourceParticipant})
+	if _, err := legacy.Append(Record{Schema: realTimeSchema5, Version: 4, Action: &quit, Lifecycle: game.LifecycleCompleted, Result: exchange.Result{State: exchange.State{IsOver: true}}}); err == nil {
+		t.Fatal("schema 5 accepted quit")
+	}
+	reopened, records, err := Open(root, "game-1")
+	if err != nil || len(records) != 3 || reopened.Meta().Schema != realTimeSchema5 {
+		t.Fatalf("reopened schema=%d records=%d err=%v", reopened.Meta().Schema, len(records), err)
+	}
+}
+
 func durableTestAction(t *testing.T, action realtime.Action) realtime.DurableAction {
 	t.Helper()
 	durable, err := realtime.EncodeAction(action)
@@ -1700,7 +1759,7 @@ func runningRealTimeTestLog(t *testing.T) *Log {
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 1, Action: &start, Lifecycle: game.LifecycleCountdown}); err != nil {
 		t.Fatal(err)
 	}
-	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem})
+	countdown := durableTestAction(t, realtime.Action{ID: "system/countdown", Kind: realtime.ActionCountdownComplete, Source: realtime.SourceSystem, Payload: realtime.CountdownCompletePayload{Bid: price(t, "99"), Ask: price(t, "101")}})
 	if _, err := log.Append(Record{Schema: RealTimeSchemaVersion, Version: 2, Action: &countdown, Lifecycle: game.LifecycleRunning}); err != nil {
 		t.Fatal(err)
 	}

@@ -252,7 +252,7 @@ func metricMethod(method string) string {
 
 func metricCommand(command string) string {
 	switch command {
-	case "create_game", "submit_quote", "quit":
+	case "create_game", "submit_quote", "start_session", "update_quote", "pause_session", "resume_session", "quit":
 		return command
 	default:
 		return "unknown"
