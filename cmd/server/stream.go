@@ -19,6 +19,7 @@ const (
 	disconnectGracePeriod = 5 * time.Second
 	streamHeartbeatPeriod = 15 * time.Second
 	streamBufferSize      = 16
+	streamBackfillLimit   = 256
 )
 
 type streamMessage struct {
@@ -48,6 +49,11 @@ type controllerState struct {
 	lastError       error
 }
 
+var (
+	errStreamUnavailable = errors.New("real-time stream is unavailable")
+	errStreamCursorAhead = errors.New("Last-Event-ID is beyond the durable action boundary")
+)
+
 func parseStreamCursor(value string) (uint64, error) {
 	if value == "" {
 		return 0, nil
@@ -62,20 +68,24 @@ func parseStreamCursor(value string) (uint64, error) {
 	return cursor, nil
 }
 
-func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubscriber, streamMessage, []streamMessage, error) {
+func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubscriber, streamMessage, error) {
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.mode != game.PlayModeRealTime || entry.realTime == nil || entry.storageFailed {
-		return nil, streamMessage{}, nil, errors.New("real-time stream is unavailable")
+		return nil, streamMessage{}, errStreamUnavailable
 	}
 	current := entry.replay.DurableRecords
 	if cursor > current {
-		return nil, streamMessage{}, nil, errors.New("Last-Event-ID is beyond the durable action boundary")
+		return nil, streamMessage{}, errStreamCursorAhead
+	}
+	if current-cursor > streamBackfillLimit {
+		cursor = current
 	}
 	entry.controller.nextGeneration++
 	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration, ready: false}
 	if entry.controller.active != nil {
 		entry.controller.active.close()
+		entry.metrics.observeStreamClosed()
 	}
 	entry.controller.active = subscriber
 	entry.metrics.observeStreamConnected()
@@ -86,14 +96,17 @@ func (entry *exchangeEntry) streamHandoff(id string, cursor uint64) (*streamSubs
 
 	state := entry.realTimeStateResponseLocked(id)
 	snapshot := streamMessage{Sequence: cursor, Event: "snapshot", Data: state}
-	backfill := make([]streamMessage, 0, current-cursor+1)
+	backfill := make([]streamMessage, 0)
 	if cursor < current {
 		for sequence := cursor + 1; sequence <= current; sequence++ {
 			backfill = append(backfill, streamMessageForState(sequence, state))
+			if sequence == current {
+				break
+			}
 		}
 	}
 	subscriber.pending = backfill
-	return subscriber, snapshot, backfill, nil
+	return subscriber, snapshot, nil
 }
 
 func (entry *exchangeEntry) drainPendingControllerMessages(subscriber *streamSubscriber) ([]streamMessage, bool) {
@@ -121,6 +134,7 @@ func (entry *exchangeEntry) connectController() (*streamSubscriber, error) {
 	subscriber := &streamSubscriber{ch: make(chan streamMessage, streamBufferSize), done: make(chan struct{}), generation: entry.controller.nextGeneration, ready: true}
 	if entry.controller.active != nil {
 		entry.controller.active.close()
+		entry.metrics.observeStreamClosed()
 	}
 	entry.controller.active = subscriber
 	entry.metrics.observeStreamConnected()
@@ -138,12 +152,19 @@ func (entry *exchangeEntry) disconnectController(subscriber *streamSubscriber) {
 		return
 	}
 	entry.controller.active = nil
-	entry.controller.graceGeneration = subscriber.generation
-	entry.controller.graceTimer = time.AfterFunc(disconnectGracePeriod, func() {
-		entry.expireControllerGrace(subscriber.generation)
-	})
 	entry.metrics.observeStreamClosed()
+	entry.armDisconnectGraceLocked(subscriber.generation)
 	entry.mu.Unlock()
+}
+
+func (entry *exchangeEntry) armDisconnectGraceLocked(generation uint64) {
+	if entry.realTime == nil || entry.realTime.Lifecycle != game.LifecycleRunning {
+		return
+	}
+	entry.controller.graceGeneration = generation
+	entry.controller.graceTimer = time.AfterFunc(disconnectGracePeriod, func() {
+		entry.expireControllerGrace(generation)
+	})
 }
 
 func (entry *exchangeEntry) expireControllerGrace(generation uint64) {
@@ -186,10 +207,8 @@ func (entry *exchangeEntry) publishStreamLocked(message streamMessage) {
 		subscriber := entry.controller.active
 		subscriber.close()
 		entry.controller.active = nil
-		entry.controller.graceGeneration = subscriber.generation
-		entry.controller.graceTimer = time.AfterFunc(disconnectGracePeriod, func() {
-			entry.expireControllerGrace(subscriber.generation)
-		})
+		entry.metrics.observeStreamClosed()
+		entry.armDisconnectGraceLocked(subscriber.generation)
 	}
 }
 
@@ -228,10 +247,10 @@ func (s *exchangeService) handleExchangeStream(w http.ResponseWriter, r *http.Re
 		writeAPIError(w, http.StatusBadRequest, "invalid_cursor", err.Error())
 		return
 	}
-	subscriber, snapshot, _, err := entry.streamHandoff(id, cursor)
+	subscriber, snapshot, err := entry.streamHandoff(id, cursor)
 	if err != nil {
 		status := http.StatusConflict
-		if strings.Contains(err.Error(), "beyond") {
+		if errors.Is(err, errStreamCursorAhead) {
 			status = http.StatusBadRequest
 		}
 		writeAPIError(w, status, "invalid_cursor", err.Error())

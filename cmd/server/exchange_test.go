@@ -425,6 +425,49 @@ func TestRealTimeControllerPublishesCommittedStateAndReplacesStaleStream(t *test
 	}
 }
 
+func TestRealTimeDisconnectDoesNotArmGraceWhenSessionIsNotRunning(t *testing.T) {
+	for _, lifecycle := range []game.LifecycleState{game.LifecyclePreparing, game.LifecycleCountdown, game.LifecyclePaused, game.LifecycleCompleted} {
+		t.Run(string(lifecycle), func(t *testing.T) {
+			entry := &exchangeEntry{mode: game.PlayModeRealTime, realTime: &realTimeState{Lifecycle: lifecycle}, metrics: newMetrics()}
+			subscriber, err := entry.connectController()
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry.disconnectController(subscriber)
+			entry.mu.Lock()
+			defer entry.mu.Unlock()
+			if entry.controller.graceTimer != nil {
+				t.Fatal("disconnect grace was armed for non-running session")
+			}
+		})
+	}
+}
+
+func TestRealTimeControllerReplacementClosesThePreviousStream(t *testing.T) {
+	metrics := newMetrics()
+	entry := &exchangeEntry{mode: game.PlayModeRealTime, realTime: &realTimeState{Lifecycle: game.LifecycleRunning}, metrics: metrics}
+	first, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := entry.connectController()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { second.close(); entry.disconnectController(second) }()
+	select {
+	case <-first.done:
+	case <-time.After(time.Second):
+		t.Fatal("previous stream remained open")
+	}
+	metrics.mu.Lock()
+	closed := metrics.streamClosed
+	metrics.mu.Unlock()
+	if closed != 1 {
+		t.Fatalf("closed streams=%d", closed)
+	}
+}
+
 func TestParseStreamCursorRequiresCanonicalUnsignedInteger(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -482,21 +525,21 @@ func TestRealTimeStreamHandoffBackfillsCommittedActionBoundaries(t *testing.T) {
 	if current < 2 {
 		t.Fatalf("durable actions=%d", current)
 	}
-	subscriber, snapshot, backfill, err := entry.streamHandoff(testGameID, 1)
+	subscriber, snapshot, err := entry.streamHandoff(testGameID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { subscriber.close(); entry.disconnectController(subscriber) }()
-	if snapshot.Sequence != 1 || len(backfill) != int(current-1) {
-		t.Fatalf("snapshot=%+v backfill=%d current=%d", snapshot, len(backfill), current)
+	if snapshot.Sequence != 1 || len(subscriber.pending) != int(current-1) {
+		t.Fatalf("snapshot=%+v backfill=%d current=%d", snapshot, len(subscriber.pending), current)
 	}
-	for index, message := range backfill {
+	for index, message := range subscriber.pending {
 		want := uint64(index) + 2
 		if message.Sequence != want || message.Event != "state" {
 			t.Fatalf("index=%d message=%+v", index, message)
 		}
 	}
-	if _, _, _, err := entry.streamHandoff(testGameID, current+1); err == nil {
+	if _, _, err := entry.streamHandoff(testGameID, current+1); err == nil {
 		t.Fatal("future cursor was accepted")
 	}
 }

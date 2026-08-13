@@ -295,7 +295,8 @@ let scenarios = [], selectedScenarioID = null;
 let catalogReady = false, catalogLoading = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, retryHydrationID = null, restorationState = null;
 let turnAudits = [], auditGeneration = 0;
 let replacementApproved = false, syncRequired = false;
-let realtimeMode = false, stream = null, streamReconnectTimer = null, streamReconnectAttempt = 0, lastStreamSequence = 0;
+let realtimeMode = false, stream = null, lastStreamSequence = 0, streamSyncPending = false, streamSyncQueued = false, streamSyncRetryTimer = null;
+let streamPendingSequence = 0;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -517,18 +518,35 @@ function setConnectionState(state, message) {
   element.textContent = message || '';
 }
 function closeRealtimeStream() {
+  if (streamSyncRetryTimer) { clearTimeout(streamSyncRetryTimer); streamSyncRetryTimer = null; }
   if (stream) { stream.close(); stream = null; }
 }
+function synchronizeRealtimeState() {
+  if (!gameId) return;
+  if (streamSyncPending) { streamSyncQueued = true; return; }
+  streamSyncPending = true;
+  hydrateGameWithoutFocus(gameId).then(result => {
+    if (result.status === 'hydrated') {
+      lastStreamSequence = Math.max(lastStreamSequence, streamPendingSequence);
+      streamPendingSequence = 0;
+    } else {
+      if (!streamSyncRetryTimer) streamSyncRetryTimer = setTimeout(() => { streamSyncRetryTimer = null; synchronizeRealtimeState(); }, 250);
+    }
+  }).finally(() => {
+    streamSyncPending = false;
+    if (streamSyncQueued) { streamSyncQueued = false; synchronizeRealtimeState(); }
+  });
+}
 function openRealtimeStream() {
-  if (!realtimeMode || !gameId || isOver || typeof EventSource === 'undefined') return;
+  if (!realtimeMode || !gameId || isOver || stream || typeof EventSource === 'undefined') return;
   closeRealtimeStream();
   stream = new EventSource(`/api/v2/games/${gameId}/stream`);
   stream.onopen = () => setConnectionState('connected', 'Connected.');
   const synchronize = event => {
     const sequence = Number(event.lastEventId || 0);
     if (sequence && sequence <= lastStreamSequence) return;
-    if (sequence) lastStreamSequence = sequence;
-    hydrateGameWithoutFocus(gameId);
+    if (sequence) streamPendingSequence = Math.max(streamPendingSequence, sequence);
+    synchronizeRealtimeState();
   };
   stream.onmessage = synchronize;
   stream.addEventListener('snapshot', synchronize);
@@ -1053,7 +1071,9 @@ function reviewHistory() {
   heading.focus(); heading.scrollIntoView({behavior:reducedMotion ? 'auto' : 'smooth', block:'center'});
 }
 function commitHydration(id, staged, moveFocus) {
+  const continuingRealtimeGame = realtimeMode && gameId === id;
   gameId = id; version = staged.state.version; isOver = staged.state.isOver; startingEquityFixed = staged.startingEquity; realtimeMode = staged.mode === 'real_time';
+  if (!continuingRealtimeGame) lastStreamSequence = 0;
   history = staged.history; turnAudits = staged.audits; auditGeneration++;
   pendingCommand = retryCommand = retryQuitCommand = null; retryHydrationID = null; syncRequired = false;
   const saved = store('mmg.game_id', id); removeStored('mmg.starting_equity');
@@ -1068,7 +1088,7 @@ function commitHydration(id, staged, moveFocus) {
   }
   if (!staged.state.isOver && moveFocus) $('active-lesson-title').focus();
   $('operation-status').textContent = 'Lesson ready.';
-  if (realtimeMode) { closeRealtimeStream(); openRealtimeStream(); }
+  if (realtimeMode && !continuingRealtimeGame) { closeRealtimeStream(); openRealtimeStream(); }
   if (!saved) alert('Canonical state loaded, but browser storage is unavailable. Keep this tab open to continue.');
 }
 
