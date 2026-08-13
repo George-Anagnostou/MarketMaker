@@ -243,7 +243,7 @@ SSE is used for committed server-to-browser updates; player commands continue ov
 
 - Every data message has a monotonically increasing durable cursor.
 - Publication occurs only after the corresponding log append is synced.
-- `Last-Event-ID` or an explicit cursor resumes without gaps.
+- `Last-Event-ID` or an explicit cursor resumes without gaps. The stream cursor identifies committed action boundaries; detailed exchange events remain available through the paginated audit endpoint.
 - If a requested cursor is too old or invalid, the client rehydrates canonical state and resumes from its boundary.
 - Heartbeats detect dead local controllers and keep intermediaries from considering the stream idle.
 - Subscribers have bounded buffers. Slow consumers are disconnected and recover by cursor rather than blocking the sequencer.
@@ -352,7 +352,9 @@ Implementation through the focused Phase 5 HTTP/state boundary is complete:
 schema 6 persists revision-aware actions, the live sequencer runs countdown and
 deterministic market activity, interrupted active solo games recover paused
 without counting downtime, and graceful shutdown durably pauses loaded active
-games. SSE, disconnect grace, and browser controls remain deferred.
+games. The controller stream, five-second disconnect grace, durable disconnect
+auto-pause, reconnect hydration, and browser connection status are now included;
+full real-time live-desk controls remain deferred.
 
 ### Phase 0: Specification And Compatibility Baseline
 
@@ -404,11 +406,11 @@ Exit criterion: interruption and replay tests pass at every implemented action b
 ### Phase 5: HTTP Commands And SSE
 
 1. Expose real-time start, update, pause, resume, quit, state, and audit behavior. **HTTP commands and canonical state complete; stream deferred.**
-2. Implement cursor handoff, heartbeat, bounded subscribers, backfill, and disconnect grace.
+2. Implement cursor handoff, heartbeat, bounded subscribers, backfill, and disconnect grace. **Complete for committed action boundaries; detailed event audit remains on the paginated `/events` endpoint.**
 3. Preserve the current turn-based API path and mode-gate every command.
 4. Add metrics for schedule lateness, queue delay, connected streams, auto-pauses, and dropped slow consumers without unbounded labels.
 
-Exit criterion: an API client can complete, disconnect from, recover, and exactly replay First Spread.
+Exit criterion: an API client can complete, disconnect from, recover, and exactly replay First Spread. **Disconnect recovery path complete.**
 
 ### Phase 6: First Spread Browser Slice
 

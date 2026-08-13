@@ -295,6 +295,8 @@ let scenarios = [], selectedScenarioID = null;
 let catalogReady = false, catalogLoading = false, startingSession = false, sessionEpoch = 0, startAttempt = 0, retryCreateRequest = null, retryHydrationID = null, restorationState = null;
 let turnAudits = [], auditGeneration = 0;
 let replacementApproved = false, syncRequired = false;
+let realtimeMode = false, stream = null, lastStreamSequence = 0, streamSyncPending = false, streamSyncQueued = false, streamSyncRetryTimer = null;
+let streamPendingSequence = 0;
 const $ = id => document.getElementById(id);
 const number = value => Number(value);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -450,7 +452,9 @@ function validateStateEnvelope(data, id) {
     latestTurn = plain(data.latest_turn, 'latest_turn'); safeInteger(latestTurn.turn, 'latest_turn.turn', 1); validateSummary(latestTurn.summary, 'latest_turn.summary'); validateCoaching(latestTurn.coaching, 'latest_turn.coaching');
     if (latestTurn.turn > state.turn) throw new Error('latest_turn is ahead of state');
   }
-  return {data, state, startingEquity, eventsThrough, scenario, latestTurn, coaching:validateCoaching(data.coaching), recap:validateRecap(data.recap)};
+  const mode = data.mode === undefined ? 'turn_based' : stringField(data.mode, 'mode');
+  if (!['turn_based', 'real_time'].includes(mode)) throw new Error('mode is invalid');
+  return {data, state, startingEquity, eventsThrough, scenario, latestTurn, mode, realTime:data.real_time || null, coaching:validateCoaching(data.coaching), recap:validateRecap(data.recap)};
 }
 function validateCommandEnvelope(data, id, command) {
   data = plain(data, 'command response');
@@ -506,6 +510,48 @@ function syncQuoteControls() {
   $('retry-sync').hidden = !syncRequired; $('retry-sync').disabled = restoring;
   $('play-again').disabled = Boolean(pendingCommand) || startingSession || restoring || unresolved;
   $('review-history').disabled = Boolean(pendingCommand) || startingSession || restoring;
+}
+function setConnectionState(state, message) {
+  const element = $('connection-status');
+  element.hidden = !message;
+  element.dataset.state = state;
+  element.textContent = message || '';
+}
+function closeRealtimeStream() {
+  if (streamSyncRetryTimer) { clearTimeout(streamSyncRetryTimer); streamSyncRetryTimer = null; }
+  if (stream) { stream.close(); stream = null; }
+}
+function synchronizeRealtimeState() {
+  if (!gameId) return;
+  if (streamSyncPending) { streamSyncQueued = true; return; }
+  streamSyncPending = true;
+  hydrateGameWithoutFocus(gameId).then(result => {
+    if (result.status === 'hydrated') {
+      lastStreamSequence = Math.max(lastStreamSequence, streamPendingSequence);
+      streamPendingSequence = 0;
+    } else {
+      if (!streamSyncRetryTimer) streamSyncRetryTimer = setTimeout(() => { streamSyncRetryTimer = null; synchronizeRealtimeState(); }, 250);
+    }
+  }).finally(() => {
+    streamSyncPending = false;
+    if (streamSyncQueued) { streamSyncQueued = false; synchronizeRealtimeState(); }
+  });
+}
+function openRealtimeStream() {
+  if (!realtimeMode || !gameId || isOver || stream || typeof EventSource === 'undefined') return;
+  closeRealtimeStream();
+  stream = new EventSource(`/api/v2/games/${gameId}/stream`);
+  stream.onopen = () => setConnectionState('connected', 'Connected.');
+  const synchronize = event => {
+    const sequence = Number(event.lastEventId || 0);
+    if (sequence && sequence <= lastStreamSequence) return;
+    if (sequence) streamPendingSequence = Math.max(streamPendingSequence, sequence);
+    synchronizeRealtimeState();
+  };
+  stream.onmessage = synchronize;
+  stream.addEventListener('snapshot', synchronize);
+  stream.addEventListener('state', synchronize);
+  stream.onerror = () => setConnectionState('reconnecting', 'Connection lost. Reconnecting and synchronizing state…');
 }
 
 function setState(state, summary, recap) {
@@ -835,7 +881,7 @@ async function startNewGame(request) {
   if (!request && !retryCreateRequest && gameId && !isOver && !replacementApproved && !confirm('Start a new lesson? This replaces the current session in the desk.')) return {status:'ignored'};
   const retainedCreate = request || retryCreateRequest;
   if (!retainedCreate && !selectedScenarioID) { alert('Choose a lesson before starting.'); return {status:'ignored'}; }
-  const create = retainedCreate || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID};
+  const create = retainedCreate || {game_id:newID(), command_id:newID(), scenario_id:selectedScenarioID, ...(realtimeMode ? {mode:'real_time'} : {})};
   replacementApproved = false;
   const attempt = ++startAttempt; startingSession = true; retryCreateRequest = create;
   $('operation-status').textContent = 'Starting lesson.';
@@ -1025,7 +1071,9 @@ function reviewHistory() {
   heading.focus(); heading.scrollIntoView({behavior:reducedMotion ? 'auto' : 'smooth', block:'center'});
 }
 function commitHydration(id, staged, moveFocus) {
-  gameId = id; version = staged.state.version; isOver = staged.state.isOver; startingEquityFixed = staged.startingEquity;
+  const continuingRealtimeGame = realtimeMode && gameId === id;
+  gameId = id; version = staged.state.version; isOver = staged.state.isOver; startingEquityFixed = staged.startingEquity; realtimeMode = staged.mode === 'real_time';
+  if (!continuingRealtimeGame) lastStreamSequence = 0;
   history = staged.history; turnAudits = staged.audits; auditGeneration++;
   pendingCommand = retryCommand = retryQuitCommand = null; retryHydrationID = null; syncRequired = false;
   const saved = store('mmg.game_id', id); removeStored('mmg.starting_equity');
@@ -1034,8 +1082,13 @@ function commitHydration(id, staged, moveFocus) {
   if (turnAudits.length) renderAudit(turnAudits[turnAudits.length - 1]);
   else { $('audit-empty').hidden = false; $('audit-detail').hidden = true; $('audit-status').textContent = 'No customer flow yet'; }
   $('gamesummary').hidden = true; showGameStage(); setState(staged.state, staged.latestTurn?.summary, staged.recap); renderTopCoaching(staged.coaching, staged.state);
+  if (realtimeMode && staged.realTime?.lifecycle === 'paused') {
+    const reason = staged.realTime.pause_reason === 'disconnect_grace_expired' ? 'The connection was lost for more than five seconds. The market is paused.' : 'The real-time market is paused.';
+    setConnectionState('paused', `${reason} Reconnect complete. Resume explicitly when ready.`);
+  }
   if (!staged.state.isOver && moveFocus) $('active-lesson-title').focus();
   $('operation-status').textContent = 'Lesson ready.';
+  if (realtimeMode && !continuingRealtimeGame) { closeRealtimeStream(); openRealtimeStream(); }
   if (!saved) alert('Canonical state loaded, but browser storage is unavailable. Keep this tab open to continue.');
 }
 
@@ -1081,6 +1134,7 @@ async function initialize() {
   if (result?.status === 'rejected') await resumeGame();
   await catalog;
 }
+if (typeof window !== 'undefined') window.addEventListener('beforeunload', closeRealtimeStream);
 function seedTestModel(id, rawState, baseline) {
   const state = uiState(rawState); gameId = id; version = state.version; isOver = state.isOver; startingEquityFixed = requireFixed(baseline, 8, 'baseline');
   history = []; turnAudits = []; pendingCommand = retryCommand = retryQuitCommand = null; restorationState = null; syncRequired = false; setState(state); showGameStage(); return state;
